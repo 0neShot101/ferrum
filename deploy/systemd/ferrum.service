@@ -1,0 +1,37 @@
+[Unit]
+Description=Ferrum APT Mirror Gateway
+After=network-online.target systemd-timesyncd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ferrum
+Group=ferrum
+ExecStart=/usr/local/bin/ferrum serve --config /etc/ferrum/gateway.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillMode=mixed
+
+# Resource enforcement (PLAN.md §7, §8, §9)
+MemoryMax=6G
+TasksMax=256
+LimitNOFILE=65536
+LimitCORE=0
+
+# Hardening (PLAN.md §7)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/ferrum
+
+[Install]
+WantedBy=multi-user.target

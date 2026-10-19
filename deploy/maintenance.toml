@@ -1,0 +1,17 @@
+# State, provider, suites and budgets must match gateway.toml.
+state_directory = '/var/lib/ferrum/state'
+
+[provider]
+endpoint = 'https://s3.us-central-1.idrivee2.com'
+region = 'us-central-1'
+bucket = 'ferrum'
+package_prefix = 'linux-packages/'
+checkpoint_prefix = 'linux-checkpoints/'
+credentials_file = '/var/lib/ferrum/private/provider.env'
+shared_nonisolated = true
+
+[budget]
+storage_bytes = 1099511627776
+storage_control_bytes = 107374182400
+monthly_download_bytes = 1099511627776
+download_control_bytes = 107374182400

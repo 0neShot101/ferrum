@@ -1,0 +1,52 @@
+# Replace public_host and provider account settings before deployment.
+mode = 'public-durable'
+
+[listen]
+public = '127.0.0.1:8080'
+admin = '127.0.0.1:9090'
+public_host = 'ferrum.oneshot.wtf'
+
+[verifier]
+binary = '/usr/local/bin/ferrum-verifier'
+timeout_seconds = 30
+
+[durable]
+state_dir = '/var/lib/ferrum/state'
+# Curate active suites so the hot working set fits inside the 200 GiB local NVMe spool
+# (for example: Debian trixie, Ubuntu noble, Proxmox VE/PBS, and Arch Linux).
+# Avoid enabling suites = ['all'] (106 suites) unless local cache and S3 budgets are scaled accordingly.
+
+[durable.provider]
+endpoint = 'https://s3.us-central-1.idrivee2.com'
+region = 'us-central-1'
+bucket = 'ferrum'
+package_prefix = 'linux-packages/'
+checkpoint_prefix = 'linux-checkpoints/'
+credentials_file = '/var/lib/ferrum/private/provider.env'
+shared_nonisolated = true
+
+[durable.keyrings]
+debian = '/usr/share/keyrings/debian-archive-keyring.gpg'
+ubuntu = '/etc/ferrum/keyrings/ubuntu-archive-keyring.gpg'
+# archlinux = '/etc/ferrum/keyrings/archlinux-keyring.gpg'
+# chaoticaur = '/etc/ferrum/keyrings/chaotic-keyring.gpg'
+# cachyos = '/etc/ferrum/keyrings/cachyos-keyring.gpg'
+# archlinuxcn = '/etc/ferrum/keyrings/archlinuxcn-keyring.gpg'
+# endeavouros = '/etc/ferrum/keyrings/endeavouros-keyring.gpg'
+# almalinux = '/etc/ferrum/keyrings/almalinux-keyring.gpg'
+# rockylinux = '/etc/ferrum/keyrings/rockylinux-keyring.gpg'
+# docker = '/etc/ferrum/keyrings/docker-archive-keyring.gpg'
+# tailscale = '/etc/ferrum/keyrings/tailscale-archive-keyring.gpg'
+# postgresql = '/etc/ferrum/keyrings/postgresql-archive-keyring.gpg'
+# grafana = '/etc/ferrum/keyrings/grafana-archive-keyring.gpg'
+[durable.budget]
+mode = 'existing'
+storage_bytes = 1099511627776
+storage_control_bytes = 107374182400
+monthly_download_bytes = 1099511627776
+download_control_bytes = 107374182400
+
+[limits]
+# Raise upstream fill concurrency and admission wait for public cold-burst resilience.
+concurrent_fills = 32
+admission_wait_seconds = 10
