@@ -1,0 +1,50 @@
+[package]
+name = "ferrum-storage"
+description = "Ferrum local object spool: exclusive-create temporaries, bounded hash/write, fsync/rename install and byte accounting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+test-harness = ["rustix/time"]
+
+[dependencies]
+ferrum-apt.workspace = true
+aws-sdk-s3.workspace = true
+aws-smithy-http-client.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
+bytes.workspace = true
+bzip2.workspace = true
+fd-lock.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+http-body.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+xz2.workspace = true
+xmlparser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "policy_replay"
+required-features = ["test-harness"]

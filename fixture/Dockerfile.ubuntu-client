@@ -1,0 +1,10 @@
+# Stock Ubuntu APT plus its real desktop metadata acquisition configuration.
+# This is a disposable verification client, never a gateway/runtime image.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends appstream apt-config-icons command-not-found ca-certificates \
+    && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,32 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: FerrumTampered
+Label: FerrumTest
+Suite: ferrum-test
+Codename: ferrum-test
+Date: Sat, 17 Oct 2026 18:22:39 UTC
+Valid-Until: Fri, 17 Oct 2036 18:22:39 UTC
+Architectures: amd64
+Components: main
+Description: Ferrum private proof fixture repository
+MD5Sum:
+ 5573b246788812dab4287381174069bc              840 main/binary-amd64/Packages
+ c8044240c26ff494918aedc39da778f9              422 main/binary-amd64/Packages.gz
+ d68a1f2c0668069986ec4129e7f0f5f5               94 main/binary-amd64/Release
+SHA256:
+ 7d11ae9ede3d782750e2545f4b333ced99e3da3469678c392c3bf21ef80764cf              840 main/binary-amd64/Packages
+ cda2a4c4665da2f593e7aed317ab5090fa0065641aae5d79a11e901b87a4e1ac              422 main/binary-amd64/Packages.gz
+ e8f1c25fef152e56b517e68faa035e0656b3192aa4591e473172f48ac6b01a0d               94 main/binary-amd64/Release
+SHA512:
+ 5033cd1d9f7cc6ecf9f9e33d94750f127a83b0779571bd372559dbd2a5e683262d710dc1fbbe72f521f5a4882ab6d63f6063e5eb6e7e4b1713cd6f493795b83e              840 main/binary-amd64/Packages
+ aec8977db19c82d147f99dbff514c4065c5dadd7e8850af6cc425ee7effe2f944081350a6b6296e06c5f616d7a571491f72824c98c6a948af1194267f3956192              422 main/binary-amd64/Packages.gz
+ c9e35d90c82171b3e6977cdcfe49724fc46f4ddc96192300f682f368cec003317e3fdcbb55833ec173bd448bcc4e3e352da3f7b5cda527ba05720652c90182dd               94 main/binary-amd64/Release
+Acquire-By-Hash: yes
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQTNR+cRkouoE34PwyXRYSeaQGQ6MQUCatO88AAKCRDRYSeaQGQ6
+Mbe9AQC2usmz+x6PIjUE6g2ybgLR0B2+1SkBsAjHUFQrbYkoZgEAm96UZSBfVCF9
+o0CBE9AdRBmnpW2yY8SrAAfu7ylWfQw=
+=gVrU
+-----END PGP SIGNATURE-----

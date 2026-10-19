@@ -1,0 +1,25 @@
+Package: ferrum-fixture
+Version: 1.0
+Architecture: all
+Maintainer: Ferrum Test <fixture@ferrum.invalid>
+Installed-Size: 12
+Filename: pool/main/f/ferrum-fixture/ferrum-fixture_1.0_all.deb
+Size: 1234
+SHA256: bbf3d2c1ae800e53631d807f7818799a9de281f178f408658e392907a2036e62
+Section: misc
+Priority: optional
+Description: Ferrum private proof fixture package
+ Installs /usr/bin/ferrum-fixture, which prints ferrum-fixture-ok.
+
+Package: ferrum-pacer
+Version: 1.0
+Architecture: all
+Maintainer: Ferrum Test <fixture@ferrum.invalid>
+Installed-Size: 1030
+Filename: pool/main/f/ferrum-pacer/ferrum-pacer_1.0_all.deb
+Size: 1050000
+SHA256: 8262f30ecf25c2c27f2f139f62e31e06dde76fe4f3a0a02b8348865969fd1ec7
+Section: misc
+Priority: optional
+Description: Ferrum paced retry-window fixture package
+ Carries an incompressible payload for the paced-body case.

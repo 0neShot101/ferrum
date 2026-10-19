@@ -1,0 +1,6 @@
+Types: deb
+URIs: http://127.0.0.1:8080/fixture/
+Suites: ferrum-test
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ferrum-fixture.gpg

@@ -1,0 +1,44 @@
+# Ferrum gateway configuration for the private local-only fixture (PLAN.md B04).
+# Paths are relative to this file's directory. Repository identity and the origin
+# URL (http://127.0.0.1:18080/fixture/) are constants of the private-fixture mode.
+# Normal builds have no unsigned-view or alternate-origin configuration keys.
+# Limits may be lowered, never raised above the RFC fixture/resource bounds.
+# The synchronizer reserves 128 MiB within managed_ceiling_bytes for its bounded
+# signed-input/provisional-output scratch files; installed blobs share the rest.
+# Existing spool/scratch directories require Ferrum's ownership markers, and
+# startup refuses unrelated files rather than deleting user data.
+mode = "private-fixture"
+
+[listen]
+public = "127.0.0.1:8080"
+admin = "127.0.0.1:9090"
+
+[fixture]
+keyring = "public/ferrum-fixture.gpg"
+work_dir = "run"
+
+[verifier]
+binary = "ferrum-verifier"
+timeout_seconds = 30
+
+[limits]
+managed_ceiling_bytes = 268435456
+max_object_bytes = 67108864
+waiter_timeout_seconds = 30
+producer_deadline_seconds = 600
+concurrent_fills = 8
+waiters_per_object = 64
+active_bodies = 256
+request_slots = 1024
+reader_buffer_bytes = 262144
+connect_timeout_seconds = 3
+response_header_timeout_seconds = 10
+read_idle_timeout_seconds = 30
+admission_wait_seconds = 2
+source_attempts = 2
+failure_backoff_seconds = 30
+failure_map_entries = 10000
+sync_interval_seconds = 300
+active_lease_hours = 24
+body_write_idle_seconds = 30
+body_lifetime_seconds = 900

@@ -1,0 +1,31 @@
+[package]
+name = "ferrum-apt"
+description = "Ferrum APT trust roots, authenticated descriptors, bounded control-file parsing and repository paths"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+bzip2.workspace = true
+flate2.workspace = true
+ruzstd.workspace = true
+xz2.workspace = true
+xmlparser.workspace = true
+deb822-fast.workspace = true
+hex.workspace = true
+percent-encoding.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "time", "fs"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

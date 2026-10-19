@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# Authentication vectors must retain their exact bytes on every platform.
+crates/ferrum-apt/tests/data/* -text
+crates/ferrum-apt/tests/data/generate.sh text eol=lf
+*.gpg binary
