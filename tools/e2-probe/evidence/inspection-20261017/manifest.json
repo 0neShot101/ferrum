@@ -1,0 +1,300 @@
+{
+  "schema_version": 2,
+  "prefix": "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/",
+  "budget_profile": "qualification256_512",
+  "checkpoint_prefix": "linux-checkpoints/_ferrum-probe/322e437712304627b57593de979da154/",
+  "faults": {
+    "injected_429": "delivered_locally_without_provider_request",
+    "injected_503": "delivered_locally_without_provider_request",
+    "injected_timeout": "delivered_locally_without_provider_request",
+    "multipart_complete_lost_response": "reconciled_by_owned_head_size_full_sha256"
+  },
+  "bucket": "s3-andrew",
+  "upload_reserved": 162886293,
+  "download_reserved": 162558964,
+  "objects": {
+    "linux-checkpoints/_ferrum-probe/322e437712304627b57593de979da154/independent": {
+      "owned": true,
+      "clean": true,
+      "size": 97,
+      "sha256": "bd9892ec6981f506768f6bc64b0fef42026399e4eddfaa4ab6536eb279fefa92",
+      "candidates": [
+        {
+          "size": 97,
+          "sha256": "bd9892ec6981f506768f6bc64b0fef42026399e4eddfaa4ab6536eb279fefa92"
+        }
+      ]
+    },
+    "linux-checkpoints/_ferrum-probe/322e437712304627b57593de979da154/state": {
+      "owned": true,
+      "clean": true,
+      "size": 93,
+      "sha256": "02689b837be8bb2a846b0d622a7a86d06907c1f1d30ad7c17afd73578467454e",
+      "candidates": [
+        {
+          "size": 93,
+          "sha256": "02689b837be8bb2a846b0d622a7a86d06907c1f1d30ad7c17afd73578467454e"
+        },
+        {
+          "size": 96,
+          "sha256": "9c2b3b5079c34c463fcdc2784968c84ff58d7b23e682d8283e271a8c4824c467"
+        },
+        {
+          "size": 94,
+          "sha256": "af5fb40bda2aeb104ba50ec147ed82ea3130ae5b3844d7006d947084aca6b329"
+        },
+        {
+          "size": 92,
+          "sha256": "408302a060761730bf1b306a976d68ed61c69e002849e6a0c89b77ac205ab02e"
+        },
+        {
+          "size": 92,
+          "sha256": "547854fbf182264afba88e5516c6853a904dd02c1c3c48c4298cf537d540d13c"
+        },
+        {
+          "size": 92,
+          "sha256": "f0c13669867f8e163acadb12f57d5a8779884a8c5438aea3d7e875d3133bd053"
+        }
+      ]
+    },
+    "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/abort": {
+      "owned": false,
+      "clean": true,
+      "size": 5242880,
+      "sha256": "16b632f11cf950dda67dc4c184a3f9e0aa1ffa4c18927bb8977e7da97ca25bca",
+      "candidates": []
+    },
+    "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/conditional": {
+      "owned": true,
+      "clean": true,
+      "size": 8193,
+      "sha256": "7e3691790cd64b19d4edb1a80e988214515abeb53aa0f34ffbfe4b4bf405d120",
+      "candidates": []
+    },
+    "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/multipart": {
+      "owned": true,
+      "clean": true,
+      "size": 83886080,
+      "sha256": "4c484d67e62d5b67613f98841ed5e6f9598ac94d7cc55332c314bcc165ac435c",
+      "candidates": []
+    },
+    "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/small": {
+      "owned": true,
+      "clean": true,
+      "size": 4097,
+      "sha256": "a16560d668b843fb3be99ace41dbd18471f342bd3255a1d21204b35e43f74436",
+      "candidates": []
+    },
+    "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/threshold": {
+      "owned": true,
+      "clean": true,
+      "size": 67108864,
+      "sha256": "98dc891b284e4d84ac25b0c0a24fdbe39a7f0dbd643ad5e8aa06e02fc6258254",
+      "candidates": []
+    },
+    "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/zero": {
+      "owned": true,
+      "clean": true,
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "candidates": []
+    }
+  },
+  "uploads": [
+    {
+      "key": "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/multipart",
+      "id": "32767.10e099ba-5726-4f07-987d-1d2ee0c5f09c",
+      "resolved": true
+    },
+    {
+      "key": "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/abort",
+      "id": "32767.d960995a-4443-4c79-91a4-4cae20504c8c",
+      "resolved": true
+    }
+  ],
+  "pending_creates": [],
+  "events": 451,
+  "outcome": "qualification_matrix_pass_cleaned_review_report",
+  "capabilities": {
+    "ambiguous_completion_reconciliation": {
+      "kind": "capability",
+      "operation": "ambiguous_completion_reconciliation",
+      "outcome": "pass",
+      "resubmitted_complete": false,
+      "resubmitted_parts": false,
+      "source": "INJECTED_response_loss_real_provider_reconciliation"
+    },
+    "blob_conditions_and_overwrite": {
+      "kind": "capability",
+      "operation": "blob_conditions_and_overwrite",
+      "outcome": "pass"
+    },
+    "checkpoint_concurrent_same_token": {
+      "credential_profile": "shared_NONISOLATED",
+      "kind": "capability",
+      "operation": "checkpoint_concurrent_same_token",
+      "outcome": "pass",
+      "rejected_412_updates": 1,
+      "sequence": 3,
+      "successful_updates": 1,
+      "winner": "race-a"
+    },
+    "checkpoint_conditional_create": {
+      "kind": "capability",
+      "operation": "checkpoint_conditional_create",
+      "outcome": "pass"
+    },
+    "checkpoint_duplicate_412_unchanged": {
+      "kind": "capability",
+      "operation": "checkpoint_duplicate_412_unchanged",
+      "outcome": "pass"
+    },
+    "checkpoint_matching_if_match": {
+      "kind": "capability",
+      "operation": "checkpoint_matching_if_match",
+      "outcome": "pass"
+    },
+    "checkpoint_prefix_and_key_logical_independence": {
+      "kind": "capability",
+      "operation": "checkpoint_prefix_and_key_logical_independence",
+      "outcome": "pass",
+      "permission_isolation_claim": false
+    },
+    "checkpoint_stale_if_match": {
+      "kind": "capability",
+      "operation": "checkpoint_stale_if_match",
+      "outcome": "pass"
+    },
+    "checksum_alternate_encodings": {
+      "kind": "capability",
+      "operation": "checksum_alternate_encodings",
+      "outcome": "unrun",
+      "reason": "only locked WhenRequired checksum settings are selected; alternate encodings are not a qualification requirement or inferred compatible"
+    },
+    "denied_credential_403": {
+      "access_key_id": "FERRUMINTENTIONALLYINVALID",
+      "class": "AuthenticationRejected403",
+      "criterion": "denied-credential authentication403 only",
+      "existing_owned_target": "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/small",
+      "identity": "invalid-sentinel-authentication-probe",
+      "kind": "capability",
+      "operation": "denied_credential_403",
+      "outcome": "pass",
+      "permission_isolation_claim": false,
+      "provider_code_evidence_operation": "get_invalid_sentinel",
+      "source": "provider_sdk",
+      "valid_scoped_credential_authorization_denial": false
+    },
+    "injected_429": {
+      "class": "Throttled",
+      "kind": "capability",
+      "operation": "injected_429",
+      "outcome": "pass",
+      "provider_error_observed": false,
+      "sdk_retries": 0,
+      "source": "INJECTED_local_transport"
+    },
+    "injected_503": {
+      "class": "Unavailable",
+      "kind": "capability",
+      "operation": "injected_503",
+      "outcome": "pass",
+      "provider_error_observed": false,
+      "sdk_retries": 0,
+      "source": "INJECTED_local_transport"
+    },
+    "injected_timeout": {
+      "class": "Timeout",
+      "kind": "capability",
+      "operation": "injected_timeout",
+      "outcome": "pass",
+      "provider_error_observed": false,
+      "sdk_retries": 0,
+      "source": "INJECTED_local_transport"
+    },
+    "list_parts_paginated": {
+      "key": "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/multipart",
+      "kind": "capability",
+      "operation": "list_parts_paginated",
+      "outcome": "pass",
+      "pages": 3,
+      "parts": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    "list_parts_single": {
+      "key": "linux-packages/_ferrum-probe/322e437712304627b57593de979da154/abort",
+      "kind": "capability",
+      "operation": "list_parts_single",
+      "outcome": "pass",
+      "pages": 1,
+      "parts": [
+        1
+      ]
+    },
+    "list_v2_paginated": {
+      "consistency_guarantee": false,
+      "count": 5,
+      "deletion_authority": false,
+      "kind": "capability",
+      "operation": "list_v2_paginated",
+      "outcome": "pass",
+      "pages": 3
+    },
+    "missing_get_404": {
+      "kind": "capability",
+      "operation": "missing_get_404",
+      "outcome": "pass"
+    },
+    "multipart_abort_and_reconciliation": {
+      "kind": "capability",
+      "operation": "multipart_abort_and_reconciliation",
+      "outcome": "pass"
+    },
+    "multipart_complete_and_readback": {
+      "kind": "capability",
+      "operation": "multipart_complete_and_readback",
+      "outcome": "pass",
+      "sha256": "4c484d67e62d5b67613f98841ed5e6f9598ac94d7cc55332c314bcc165ac435c",
+      "size": 83886080
+    },
+    "multipart_two_part_concurrency": {
+      "kind": "capability",
+      "operation": "multipart_two_part_concurrency",
+      "outcome": "unrun",
+      "reason": "sequential file-backed parts remain within production maximum of two; no throughput claim"
+    },
+    "provider_timeout_429_5xx_natural": {
+      "kind": "capability",
+      "operation": "provider_timeout_429_5xx_natural",
+      "outcome": "unrun",
+      "reason": "no naturally observed provider failure is claimed; separate local transport injections exercise error classification without abuse traffic"
+    },
+    "range": {
+      "kind": "capability",
+      "operation": "range",
+      "outcome": "pass",
+      "returned_length": 1000
+    },
+    "single_put_exact_64MiB": {
+      "kind": "capability",
+      "operation": "single_put_exact_64MiB",
+      "outcome": "pass",
+      "size": 67108864
+    },
+    "small_put_head_get": {
+      "kind": "capability",
+      "operation": "small_put_head_get",
+      "outcome": "pass"
+    },
+    "zero_put_head_get": {
+      "kind": "capability",
+      "operation": "zero_put_head_get",
+      "outcome": "pass"
+    }
+  }
+}

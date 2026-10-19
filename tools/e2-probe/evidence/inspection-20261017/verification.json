@@ -1,0 +1,16 @@
+{
+  "command": "ferrum-e2-probe inspect --env-file ABSOLUTE_PROTECTED_CREDENTIAL_FILE --run-dir EXISTING_B02_JOURNAL --approve-disposable-probe",
+  "exit": 0,
+  "tests_passed": 15,
+  "clippy": "--locked --all-targets -- -D warnings passed",
+  "build": "--locked --release passed outside serving VM",
+  "binary_sha256": "b8c5fc651077533675aad2ece6b389dbcb2b1950d764426783f2cef33b0c0a4d",
+  "lockfile_sha256": "3a5914853f8c2f217b3f3dd37895e463a0788e3b3e279d4d939f3465cb5c052e",
+  "versioning": {"http_status": 200, "status": "unset"},
+  "lifecycle": {"http_status": 404, "code": "NoSuchLifecycleConfiguration"},
+  "body_bytes": {"uploaded": 0, "downloaded": 413},
+  "additional_reserved_bytes": {"upload": 131072, "download": 262144},
+  "combined_b02_inspection_b05_reserved_bytes": {"upload": 163477481, "download": 165508084},
+  "cleanup": "Temporary executables removed on VM and development host; evidence and existing durable allowance retained",
+  "limits": "Read-only point-in-time configuration observation. No object or configuration writes, no LIST, no permission-isolation/admin-authority/billing/future-drift or deployment approval claim."
+}

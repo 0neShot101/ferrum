@@ -1,0 +1,31 @@
+{
+  "verdict": "B02 selected-profile compatibility passed; not deployment approval",
+  "credential_profile": "shared_NONISOLATED",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "cargo": "1.99.1 (5f94df478 2026-08-27)",
+  "cargo_lock_sha256": "3a5914853f8c2f217b3f3dd37895e463a0788e3b3e279d4d939f3465cb5c052e",
+  "release_binary_sha256": "0b7beb857443bef2cded1a9f029840a1146a67f732895981a0569db9a9763095",
+  "build_environment": "ferrum-smoke Linux container outside serving VM; 2 CPU, 4 GiB limit",
+  "checks": {"locked_tests_passed": 14, "locked_clippy_all_targets_deny_warnings": "passed", "locked_release_build": "passed", "real_qualify_exit": 0},
+  "runtime_command": "/home/andrew/ferrum-e2-probe-qualification qualify --env-file /home/andrew/.config/ferrum/provider.env --run-dir /home/andrew/ferrum-b02-qualification-256-512 --approve-disposable-probe",
+  "review": "Independent ProviderProbeReview resolved SDK query allowlist and concurrent byte-attribution findings before execution; no verified named-model attribution",
+  "evidence_events": 442,
+  "capabilities_passed": 22,
+  "cleanup": {"object_intents_clean": 8, "upload_ids_resolved": 2, "pending_creates": 0, "vm_payload_and_temporary_executable_removed": true},
+  "upload_limit_bytes": 268435456,
+  "download_limit_bytes": 536870912,
+  "upload_reserved_bytes": 162755221,
+  "download_reserved_bytes": 162296820,
+  "observed_http_upload_body_bytes": 156267736,
+  "observed_http_download_body_bytes": 151052177,
+  "limitations": [
+    "403 was actual InvalidAccessKeyId for intentionally invalid sentinel credentials on an existing owned object; not a valid scoped identity authorization-denial test",
+    "Multipart completion response loss injected after actual provider acceptance; reconciliation used actual HEAD and full SHA-256 GET without completion or part replay",
+    "Timeout, 429 and 503 injected locally; natural provider outages not observed",
+    "Only locked WhenRequired checksum settings qualified; alternate encodings unrun",
+    "Multipart parts sequential, within maximum concurrency; not a throughput qualification",
+    "Provider prefix and administrative permission isolation unverified",
+    "Body-byte counters are not TLS/TCP or provider billing measurements",
+    "No production durability, recovery, public APT or deployment claim"
+  ]
+}

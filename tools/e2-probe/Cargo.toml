@@ -1,0 +1,42 @@
+[package]
+name = "ferrum-e2-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+anyhow = "=1.0.104"
+aws-sdk-s3 = { version = "=1.152.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-smithy-http-client = { version = "=1.5.0", features = ["rustls-aws-lc"] }
+aws-smithy-runtime-api = { version = "=1.19.0", features = ["client", "http-1x"] }
+aws-smithy-types = { version = "=1.8.1", features = ["http-body-1-x", "rt-tokio"] }
+bytes = "=1.12.1"
+http-body = "=1.1.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sha2 = "=0.11.1"
+tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "fs", "io-util", "time", "signal"] }
+url = "=2.5.8"
+xmlparser = "=0.13.6"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+await_holding_lock = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+strip = true

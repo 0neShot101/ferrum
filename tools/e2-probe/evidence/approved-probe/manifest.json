@@ -1,0 +1,199 @@
+{
+  "schema_version": 1,
+  "prefix": "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/",
+  "bucket": "s3-andrew",
+  "upload_reserved": 93024261,
+  "download_reserved": 90993645,
+  "objects": {
+    "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/abort": {
+      "owned": false,
+      "clean": true,
+      "size": 5242880,
+      "sha256": "16b632f11cf950dda67dc4c184a3f9e0aa1ffa4c18927bb8977e7da97ca25bca"
+    },
+    "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/conditional": {
+      "owned": true,
+      "clean": true,
+      "size": 8193,
+      "sha256": "7e3691790cd64b19d4edb1a80e988214515abeb53aa0f34ffbfe4b4bf405d120"
+    },
+    "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/multipart": {
+      "owned": true,
+      "clean": true,
+      "size": 83886080,
+      "sha256": "4c484d67e62d5b67613f98841ed5e6f9598ac94d7cc55332c314bcc165ac435c"
+    },
+    "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/small": {
+      "owned": true,
+      "clean": true,
+      "size": 4097,
+      "sha256": "a16560d668b843fb3be99ace41dbd18471f342bd3255a1d21204b35e43f74436"
+    },
+    "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/zero": {
+      "owned": true,
+      "clean": true,
+      "size": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "uploads": [
+    {
+      "key": "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/multipart",
+      "id": "32767.a12e52a1-bab7-46db-aa89-51ca4a3a2aba",
+      "resolved": true
+    },
+    {
+      "key": "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/abort",
+      "id": "32767.298874dc-a592-43fb-85b7-8cb7fc70d3b0",
+      "resolved": true
+    }
+  ],
+  "pending_creates": [],
+  "events": 260,
+  "outcome": "subset_pass_cleaned_full_b02_open",
+  "capabilities": {
+    "ambiguous_completion_injection": {
+      "kind": "capability",
+      "operation": "ambiguous_completion_injection",
+      "outcome": "unrun",
+      "reason": "completion succeeded normally; no deliberate response loss or provider fault was injected"
+    },
+    "ambiguous_completion_reconciliation": {
+      "kind": "capability",
+      "operation": "ambiguous_completion_reconciliation",
+      "outcome": "unrun",
+      "reason": "not reached or not observed; later pass events replace this entry only after the real operation succeeds"
+    },
+    "blob_conditions_and_overwrite": {
+      "kind": "capability",
+      "operation": "blob_conditions_and_overwrite",
+      "outcome": "pass"
+    },
+    "checkpoint_bucket_isolation": {
+      "kind": "capability",
+      "operation": "checkpoint_bucket_isolation",
+      "outcome": "unrun",
+      "reason": "separate checkpoint bucket, distinct scoped credential and explicit operation approval absent; no other bucket will be contacted"
+    },
+    "checkpoint_concurrent_same_token": {
+      "kind": "capability",
+      "operation": "checkpoint_concurrent_same_token",
+      "outcome": "unrun",
+      "reason": "separate checkpoint bucket, distinct scoped credential and explicit operation approval absent; no other bucket will be contacted"
+    },
+    "checkpoint_conditional_create": {
+      "kind": "capability",
+      "operation": "checkpoint_conditional_create",
+      "outcome": "unrun",
+      "reason": "separate checkpoint bucket, distinct scoped credential and explicit operation approval absent; no other bucket will be contacted"
+    },
+    "checkpoint_matching_if_match": {
+      "kind": "capability",
+      "operation": "checkpoint_matching_if_match",
+      "outcome": "unrun",
+      "reason": "separate checkpoint bucket, distinct scoped credential and explicit operation approval absent; no other bucket will be contacted"
+    },
+    "checkpoint_stale_if_match": {
+      "kind": "capability",
+      "operation": "checkpoint_stale_if_match",
+      "outcome": "unrun",
+      "reason": "separate checkpoint bucket, distinct scoped credential and explicit operation approval absent; no other bucket will be contacted"
+    },
+    "checksum_alternate_encodings": {
+      "kind": "capability",
+      "operation": "checksum_alternate_encodings",
+      "outcome": "unrun",
+      "reason": "only explicit WhenRequired request/response checksum settings are selected; alternatives are not inferred compatible"
+    },
+    "denied_credential_403": {
+      "kind": "capability",
+      "operation": "denied_credential_403",
+      "outcome": "unrun",
+      "reason": "no explicitly denied credential/prefix supplied; no guessed real bucket or intentional denied request"
+    },
+    "list_parts_paginated": {
+      "key": "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/multipart",
+      "kind": "capability",
+      "operation": "list_parts_paginated",
+      "outcome": "pass",
+      "pages": 3,
+      "parts": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    },
+    "list_parts_single": {
+      "key": "linux-packages/_ferrum-probe/9ab8365a1533e43b29e18066184c6f19/abort",
+      "kind": "capability",
+      "operation": "list_parts_single",
+      "outcome": "pass",
+      "pages": 1,
+      "parts": [
+        1
+      ]
+    },
+    "list_v2_paginated": {
+      "consistency_guarantee": false,
+      "count": 4,
+      "deletion_authority": false,
+      "kind": "capability",
+      "operation": "list_v2_paginated",
+      "outcome": "pass",
+      "pages": 2
+    },
+    "missing_get_404": {
+      "kind": "capability",
+      "operation": "missing_get_404",
+      "outcome": "pass"
+    },
+    "multipart_abort_and_reconciliation": {
+      "kind": "capability",
+      "operation": "multipart_abort_and_reconciliation",
+      "outcome": "pass"
+    },
+    "multipart_complete_and_readback": {
+      "kind": "capability",
+      "operation": "multipart_complete_and_readback",
+      "outcome": "pass",
+      "sha256": "4c484d67e62d5b67613f98841ed5e6f9598ac94d7cc55332c314bcc165ac435c",
+      "size": 83886080
+    },
+    "multipart_two_part_concurrency": {
+      "kind": "capability",
+      "operation": "multipart_two_part_concurrency",
+      "outcome": "unrun",
+      "reason": "compatibility probe uses one streamed part at a time; no throughput or production two-part concurrency claim"
+    },
+    "provider_timeout_429_5xx": {
+      "kind": "capability",
+      "operation": "provider_timeout_429_5xx",
+      "outcome": "unrun",
+      "reason": "no naturally observed result yet; no fault injection or abuse load authorized"
+    },
+    "range": {
+      "kind": "capability",
+      "operation": "range",
+      "outcome": "pass",
+      "returned_length": 1000
+    },
+    "single_put_exact_64MiB": {
+      "kind": "capability",
+      "operation": "single_put_exact_64MiB",
+      "outcome": "unrun",
+      "reason": "64MiB +80MiB multipart +abort cannot fit approved100MiB total upload budget; additional approval required"
+    },
+    "small_put_head_get": {
+      "kind": "capability",
+      "operation": "small_put_head_get",
+      "outcome": "pass"
+    },
+    "zero_put_head_get": {
+      "kind": "capability",
+      "operation": "zero_put_head_get",
+      "outcome": "pass"
+    }
+  }
+}

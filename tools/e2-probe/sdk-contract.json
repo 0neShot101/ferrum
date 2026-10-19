@@ -1,0 +1,184 @@
+{
+  "schema_version": 2,
+  "status": "source_release_audit_2026_10_19_historical_provider_evidence_unchanged",
+  "toolchain": "1.99.1",
+  "edition": "2024",
+  "rust_version": "1.99",
+  "sdk_registry_msrv": "1.94.1",
+  "dependency_resolution": "Pinned direct versions retained. Removed the unused AWS SDK legacy rustls feature and its older HTTP/TLS dependency graph; the explicit modern Smithy rustls-aws-lc connector remains selected. Historical provider evidence describes its original lockfile, not a rerun of the current source.",
+  "direct_dependencies": {
+    "anyhow": {
+      "version": "1.0.104",
+      "checksum": "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "aws-sdk-s3": {
+      "version": "1.152.0",
+      "checksum": "004d5acbd6850ab58789a43822e0a2ef23927a46b012c17f8fa51253103db9f8",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "aws-smithy-http-client": {
+      "version": "1.5.0",
+      "checksum": "51c89cc3f1f281d659a67a519a1b5c6d445b5ce09fa7e5aee40c2c2707e9509d",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "aws-smithy-runtime-api": {
+      "version": "1.19.0",
+      "checksum": "c0730c16f91124c6a2abb4932c77e299288b3dd9f967ea2e9ec48cc6731e87a4",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "aws-smithy-types": {
+      "version": "1.8.1",
+      "checksum": "69bb407740a197147da48238ecc94498493c9e85445732360cec180296ca45f1",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "bytes": {
+      "version": "1.12.1",
+      "checksum": "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "http-body": {
+      "version": "1.1.0",
+      "checksum": "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "serde": {
+      "version": "1.0.229",
+      "checksum": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "serde_json": {
+      "version": "1.0.154",
+      "checksum": "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "sha2": {
+      "version": "0.11.1",
+      "checksum": "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "tokio": {
+      "version": "1.53.3",
+      "checksum": "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "url": {
+      "version": "2.5.8",
+      "checksum": "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    },
+    "xmlparser": {
+      "version": "0.13.6",
+      "checksum": "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index"
+    }
+  },
+  "lockfile_sha256": "5f06898fc005201cba695b90bf469b50c5802376fbab0890a95d4459d1bb3207",
+  "configuration": {
+    "behavior_version": "2026-01-12",
+    "endpoint": "https://s3.us-central-1.idrivee2.com",
+    "region": "us-central-1",
+    "bucket": "s3-andrew",
+    "approved_package_root": "linux-packages/_ferrum-probe/",
+    "approved_checkpoint_root": "linux-checkpoints/_ferrum-probe/",
+    "correlated_run_suffix": "same unpredictable32lowercase-hex-character run marker followed by slash under both roots",
+    "credential_profile": "shared_NONISOLATED",
+    "permission_isolation_claim": false,
+    "force_path_style": true,
+    "request_checksum_calculation": "WhenRequired",
+    "response_checksum_validation": "WhenRequired",
+    "sdk_attempts": 1,
+    "application_upload_get_retries": 0,
+    "credentials": "runtime-only private file, no default AWS chain or shell source",
+    "budget_profiles": {
+      "run": {
+        "manifest_schema": 1,
+        "profile": "legacy_blob100_200",
+        "upload_limit_bytes": 104857600,
+        "download_limit_bytes": 209715200,
+        "cleanup_reserve_bytes_per_direction": 4194304
+      },
+      "qualify": {
+        "manifest_schema": 2,
+        "profile": "qualification256_512",
+        "upload_limit_bytes": 268435456,
+        "download_limit_bytes": 536870912,
+        "cleanup_reserve_bytes_per_direction": 16777216,
+        "requires_fresh_artifact_directory": true
+      }
+    },
+    "cleanup": "Uses retained manifest schema/profile/counters; old absent profile fields mean legacy100/200 only; incompatible schema/profile fails closed without migration or allowance reset",
+    "control_allowance_bytes_per_direction_per_request": 65536,
+    "body_buffer_bytes": 262144,
+    "multipart_part_bytes": 16777216,
+    "multipart_total_bytes": 83886080,
+    "abort_part_bytes": 5242880,
+    "single_put_threshold_bytes": 67108864,
+    "checkpoint_max_bytes": 4096,
+    "checkpoint_keys_per_run": 2,
+    "checkpoint_candidates_per_key_max": 8,
+    "manifest_objects_max": 9,
+    "retained_upload_ids_max": 8,
+    "listing_page_max": 8,
+    "concurrent_part_uploads": 1
+  },
+  "open_prerequisites": {
+    "provider_execution": "Historical qualification and inspection evidence remains under evidence/. The source-release cleanup has not repeated provider operations; changes to provider identity or deployment require separate capability qualification.",
+    "denied_credential_criterion": "The general B02 denied-credential403 is exercised by an intentionally invalid sentinel on an existing owned positive-control object. This is authentication rejection, never valid scoped-credential authorization denial or isolation evidence; exact provider status/code and sentinel identity are recorded.",
+    "isolated_profile": "Not selected or claimed. Cross-prefix and same-prefix DELETE permission denials and administrative effective-policy evidence remain unverified; shared NONISOLATED qualification does not waive deployment risk acceptance.",
+    "versioning": "No version-specific deletion approval; observed non-null version IDs retain manifest and block cleanup",
+    "deployment": "G-DEPLOY profile selection/risk acceptance and public-production approval remain separate and unrun",
+    "dependency_audit": "OSV querybatch on 2026-10-19 reported no advisories for the 357 unique registry package/version pairs across all three current lockfiles. This is a point-in-time advisory check, not a security or third-party-license guarantee."
+  },
+  "qualification_behavior": {
+    "blob": "Real zero/small/64MiB single PUT+HEAD+fullSHA256GET, Range,404,conditional overwrite,80MiB multipart five16MiBparts with paginatedListParts,5MiB abort and scoped orphan discovery/paginatedListV2",
+    "checkpoint": "Disposable sibling-prefix keys; IfNoneMatch create and duplicate412 unchanged; matchingIfMatch update and stale412 unchanged; concurrent identical ETag updates with exactly one SDK success and one actual412; bounded direct GET matches winning sequence/content; independent checkpoint/package positive controls unchanged",
+    "ownership": "Fixed keys only; intent and checkpoint candidate descriptors are durable before mutation; run metadata required; conditional cleanup uses owned HEAD ETag and verifies absence; retained upload IDs must match recorded key; discovery never grants deletion authority",
+    "wire_boundary": "Exact TLS host/bucket/path-style, package vs checkpoint operation identities, fixed correlated run keys, method/query/range/conditional/header allowlists, durable reservation before connector; no bucket policy/ACL/versioning/lifecycle/administrative calls",
+    "concurrency": "Only two identical-size same-target checkpoint CAS permits may coexist. Both are durably reserved before polling either SDK future and neither is cleared until both settle; sequential operations retain single-use permits. Concurrent per-attempt byte fields are explicitly unavailable, with one nonadditive pair aggregate and exact process totals instead of double-counted intervals",
+    "ambiguous_completion": "One real Complete is sent. HTTP wrapper consumes bounded actual response to EOF, validates successful CompleteMultipartUploadResultXML+ETag (HTTP200Error is not success), durably records post-acceptance suppression and returns INJECTEDtimeout before SDK sees acknowledgment. Existing error path reconciles HEAD ownership+size and fullSHA256GET, never resends Complete or parts",
+    "fault_injection": "Local pre-provider transport timeout/429/503 are labelled INJECTED and exercise real SDK classification with retries disabled. Actual provider HTTP evidence and natural errors are separately labelled; no naturally observed timeout/429/5xx pass is fabricated",
+    "recovery": "Counters and candidate/fault state survive cleanup restart. Lost Create without known uploadID, unknown listed IDs, unrecognized candidate bytes, non-null versions, corrupt manifests, or exhausted retained allowance fail closed and preserve evidence; cleanup cannot mint a fresh allowance"
+  },
+  "historical_approved_probe": {
+    "evidence_path": "evidence/approved-probe",
+    "immutable_allowance_upload_bytes": 104857600,
+    "immutable_allowance_download_bytes": 209715200,
+    "scope": "Earlier bounded blob subset passed and cleaned; not the new qualification matrix",
+    "prior_lockfile_sha256": "ac287b393ab4935e1efa1a7023cae75ebb26863e23eb8f76c567a22e7874f807"
+  },
+  "sources": [
+    {
+      "url": "https://index.crates.io/aw/s-/aws-sdk-s3",
+      "finding": "latest non-yanked1.152.0; rust_version1.94.1; checksum matches lockfile"
+    },
+    {
+      "url": "https://docs.rs/aws-sdk-s3/1.152.0/aws_sdk_s3/config/struct.Builder.html",
+      "finding": "explicit endpoint/region/credentials/path-style/retry/timeout/checksum configuration"
+    },
+    {
+      "url": "https://docs.rs/aws-sdk-s3/1.152.0/aws_sdk_s3/config/enum.RequestChecksumCalculation.html",
+      "finding": "WhenRequired only calculates modeled-required or explicitly requested flexible checksums"
+    },
+    {
+      "url": "https://docs.rs/aws-sdk-s3/1.152.0/aws_sdk_s3/config/struct.BehaviorVersion.html",
+      "finding": "v2026_01_12 current behavior; explicit RetryConfig disabled overrides its default retry behavior"
+    },
+    {
+      "url": "https://docs.rs/aws-smithy-types/1.8.1/aws_smithy_types/byte_stream/struct.FsBuilder.html",
+      "finding": "file-backed offset/exact-length bounded upload bodies"
+    },
+    {
+      "url": "https://docs.rs/aws-smithy-runtime-api/1.19.0/aws_smithy_runtime_api/client/http/trait.HttpConnector.html",
+      "finding": "HTTP body bounds enforced around actual SDK connector, not a fake provider implementation"
+    },
+    {
+      "url": "https://www.idrive.com/s3-storage-e2/s3-compatible-api",
+      "finding": "documented PUT If-Match/If-None-Match and412 plus multipart/list operations; documentation is not measured compatibility"
+    },
+    {
+      "url": "https://docs.rs/aws-sdk-s3/1.152.0/aws_sdk_s3/operation/delete_object/builders/struct.DeleteObjectFluentBuilder.html",
+      "finding": "If-Match conditional delete is modeled; versioned delete markers are not removal of prior versions"
+    }
+  ]
+}
