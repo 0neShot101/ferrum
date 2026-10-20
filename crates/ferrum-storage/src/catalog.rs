@@ -16,6 +16,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 const PAGE: i64 = 128;
 const APPLICATION_ID: u32 = 0x4645_5252;
+const SCHEMA_VERSION: u32 = 5;
 const SCHEMA: [(&str, &str); 3] = [
     (
         "objects",
@@ -184,7 +185,7 @@ fn open_connection(path: &Path, writer: bool, fresh: bool) -> Result<Connection,
     connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;")?;
     if writer {
         let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != if fresh { 0 } else { version } || version > 4 || (!fresh && version == 0) {
+        if (fresh && version != 0) || version > SCHEMA_VERSION || (!fresh && version == 0) {
             return Err(CatalogError::InvalidState);
         }
         if fresh {
@@ -207,15 +208,18 @@ fn open_connection(path: &Path, writer: bool, fresh: bool) -> Result<Connection,
             for (_, sql) in publication::SCHEMA.iter().chain(publication::AUX_SCHEMA) {
                 transaction.execute_batch(sql)?;
             }
+            for (_, sql) in crate::capture::PACKAGE_SIGNATURE_SCHEMA {
+                transaction.execute_batch(sql)?;
+            }
             transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", 4)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
         // Validate every known old table, index, trigger and invariant before
         // opening the exclusive migration transaction. No counter, reservation,
         // receipt or checkpoint is reconstructed or reset by this migration.
-        validate_catalog(&connection, if fresh { 4 } else { version })?;
-        if !fresh && version < 4 {
+        validate_catalog(&connection, if fresh { SCHEMA_VERSION } else { version })?;
+        if !fresh && version < SCHEMA_VERSION {
             let transaction =
                 connection.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
             if version == 1 {
@@ -238,14 +242,20 @@ fn open_connection(path: &Path, writer: bool, fresh: bool) -> Result<Connection,
                     [],
                 )?;
             }
-            // Ownership is deliberately unknown after an upgrade. Only explicit
-            // initialization or audited fixed-provider adoption can grant it.
-            for (_, sql) in crate::budget::provider::SCHEMA {
+            if version < 4 {
+                // Ownership is deliberately unknown after an upgrade. Only explicit
+                // initialization or audited fixed-provider adoption can grant it.
+                for (_, sql) in crate::budget::provider::SCHEMA {
+                    transaction.execute_batch(sql)?;
+                }
+            }
+            for (_, sql) in crate::capture::PACKAGE_SIGNATURE_SCHEMA {
                 transaction.execute_batch(sql)?;
             }
-            transaction.pragma_update(None, "user_version", 4)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            validate_catalog(&transaction, SCHEMA_VERSION)?;
             transaction.commit()?;
-            validate_catalog(&connection, 4)?;
+            validate_catalog(&connection, SCHEMA_VERSION)?;
         }
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=65536; PRAGMA max_page_count=2097152;")?;
     } else {
@@ -272,6 +282,9 @@ fn validate_catalog(connection: &Connection, version: u32) -> Result<(), Catalog
     }
     if version >= 4 {
         tables.extend(crate::budget::provider::SCHEMA.iter().copied());
+    }
+    if version >= 5 {
+        tables.extend(crate::capture::PACKAGE_SIGNATURE_SCHEMA.iter().copied());
     }
     for (name, expected) in tables.iter().chain(&auxiliary) {
         let actual: String = connection.query_row(
@@ -363,6 +376,8 @@ pub(crate) struct Resident {
     pub state: i64,
     pub durable: bool,
     pub generation_references: u64,
+    /// Local deletion eligibility only: derived metadata, uncaptured provisional
+    /// bytes, or exact remotely verified receipt staging. Never serving authority.
     pub reconstructible: bool,
 }
 
@@ -480,7 +495,7 @@ impl Catalog {
         self.reader().call(move |connection| {
             let object = connection
                 .query_row(
-                    "SELECT digest,size,class,resident,upload_state,generation_references,EXISTS(SELECT 1 FROM derived_residency d WHERE d.digest=objects.digest) AND NOT EXISTS(SELECT 1 FROM capture_blobs b WHERE b.digest=objects.digest) FROM objects WHERE digest=?1",
+                    "SELECT digest,size,class,resident,upload_state,generation_references,EXISTS(SELECT 1 FROM derived_residency d WHERE d.digest=objects.digest) AND (NOT EXISTS(SELECT 1 FROM capture_blobs b WHERE b.digest=objects.digest) OR EXISTS(SELECT 1 FROM capture_paths p WHERE p.digest=objects.digest AND p.receipt_verified=1)) FROM objects WHERE digest=?1",
                     [identity.sha256.to_hex()],
                     resident_row,
                 )
@@ -497,7 +512,7 @@ impl Catalog {
 
     pub(crate) fn residents(&self, after: Option<String>) -> Result<Vec<Resident>, CatalogError> {
         self.reader().call(move |connection| {
-            let mut statement = connection.prepare("SELECT digest,size,class,resident,upload_state,generation_references,EXISTS(SELECT 1 FROM derived_residency d WHERE d.digest=objects.digest) AND NOT EXISTS(SELECT 1 FROM capture_blobs b WHERE b.digest=objects.digest) FROM objects WHERE resident<>0 AND digest>?1 ORDER BY digest LIMIT ?2")?;
+            let mut statement = connection.prepare("SELECT digest,size,class,resident,upload_state,generation_references,EXISTS(SELECT 1 FROM derived_residency d WHERE d.digest=objects.digest) AND (NOT EXISTS(SELECT 1 FROM capture_blobs b WHERE b.digest=objects.digest) OR EXISTS(SELECT 1 FROM capture_paths p WHERE p.digest=objects.digest AND p.receipt_verified=1)) FROM objects WHERE resident<>0 AND digest>?1 ORDER BY digest LIMIT ?2")?;
             let rows = statement.query_map(params![after.unwrap_or_default(), PAGE], resident_row)?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(CatalogError::from)
@@ -591,23 +606,33 @@ impl Catalog {
         id: String,
         identity: ObjectIdentity,
         class: i64,
+        candidate: bool,
     ) -> Result<(), CatalogError> {
         self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
-            let existing: Option<u64> = transaction
+            let existing: Option<(u64, i64)> = transaction
                 .query_row(
-                    "SELECT size FROM objects WHERE digest=?1",
+                    "SELECT size,resident FROM objects WHERE digest=?1",
                     [identity.sha256.to_hex()],
-                    |row| read_unsigned(row, 0),
+                    |row| Ok((read_unsigned(row, 0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if existing.is_some_and(|size| size != identity.size) {
+            if existing.is_some_and(|(size, _)| size != identity.size) {
                 return Err(CatalogError::InvalidState);
             }
             transaction.execute(
                 "INSERT INTO objects(digest,size,class,resident) VALUES(?1,?2,?3,1) ON CONFLICT(digest) DO UPDATE SET resident=1, class=MIN(objects.class,excluded.class)",
                 params![identity.sha256.to_hex(), signed(identity.size)?, class],
             )?;
+            // Only newly installed, uncaptured bytes receive provisional
+            // deletion eligibility. This marker grants no serving/reconstruction
+            // authority and cannot downgrade a deduplicated trusted object.
+            if candidate && existing.is_none_or(|(_, resident)| resident == 0) && class == 0 {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO derived_residency(digest) SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM capture_blobs WHERE digest=?1)",
+                    [identity.sha256.to_hex()],
+                )?;
+            }
             let changed = transaction.execute(
                 "DELETE FROM reservations WHERE id=?1 AND digest=?2 AND size=?3",
                 params![id, identity.sha256.to_hex(), signed(identity.size)?],
@@ -714,7 +739,7 @@ impl Catalog {
         self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
             let identities = {
-                let mut statement = transaction.prepare("SELECT objects.digest,objects.size,objects.class,objects.resident,objects.upload_state,objects.generation_references,EXISTS(SELECT 1 FROM derived_residency d WHERE d.digest=objects.digest) AND NOT EXISTS(SELECT 1 FROM capture_blobs b WHERE b.digest=objects.digest) FROM objects JOIN generation_pins USING(digest) WHERE generation=?1 ORDER BY digest LIMIT 8")?;
+                let mut statement = transaction.prepare("SELECT objects.digest,objects.size,objects.class,objects.resident,objects.upload_state,objects.generation_references,EXISTS(SELECT 1 FROM derived_residency d WHERE d.digest=objects.digest) AND (NOT EXISTS(SELECT 1 FROM capture_blobs b WHERE b.digest=objects.digest) OR EXISTS(SELECT 1 FROM capture_paths p WHERE p.digest=objects.digest AND p.receipt_verified=1)) FROM objects JOIN generation_pins USING(digest) WHERE generation=?1 ORDER BY digest LIMIT 8")?;
                 let rows = statement.query_map([generation.to_hex()], resident_row)?;
                 rows.map(|row| row.map(|row| row.identity))
                     .collect::<Result<Vec<_>, _>>()?

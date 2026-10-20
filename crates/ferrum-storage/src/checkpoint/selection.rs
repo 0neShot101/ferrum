@@ -84,6 +84,18 @@ mod tests {
         assert!(requests.snapshot().unwrap().is_empty());
         spool
             .catalog_write(|connection| {
+                for index in 0..103 {
+                    connection.execute(
+                        "INSERT INTO suite_checkpoints(repository,suite,floor) VALUES('inventory',?1,'marker')",
+                        [format!("suite-{index}")],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(publisher.retained_suites().unwrap().len(), 106);
+        spool
+            .catalog_write(|connection| {
                 for index in 0..MAX_SUITES {
                     connection.execute(
                         "INSERT INTO suite_checkpoints(repository,suite,floor) VALUES('extra',?1,'marker')",

@@ -30,13 +30,16 @@ pub fn cpu_gate() -> std::sync::Arc<tokio::sync::Semaphore> {
 }
 
 /// Exact helper protocol supported by this client; stock sqv is not compatible.
-const PROTOCOL_VERSION: &str = "0.1.0";
+const PROTOCOL_VERSION: &str = "0.2.0";
 
 /// Bytes of stderr (and `--version` stdout) retained for diagnostics.
 const CAPTURE_CAP: usize = 64 * 1024;
 
 /// Release, InRelease, detached signature and keyring input ceiling (§2).
 const INPUT_CAP: u64 = 32 * 1024 * 1024;
+
+/// Only detached package data may use the admitted package ceiling of 8 GiB.
+const PACKAGE_CAP: u64 = 8 * 1024 * 1024 * 1024;
 const PRLIMIT: &str = "/usr/bin/prlimit";
 
 /// Why verification could not establish trust.
@@ -54,6 +57,10 @@ pub enum SignatureError {
     OutputTooLarge,
     #[error("signature verifier input is not a regular file within the 32 MiB limit: {0}")]
     InputTooLarge(PathBuf),
+    #[error(
+        "package signature input must be a regular file of exactly {expected_size} bytes within the 8 GiB limit: {path}"
+    )]
+    PackageInput { path: PathBuf, expected_size: u64 },
     #[error("signature verifier diagnostic output reached its 64 KiB limit")]
     DiagnosticsTooLarge,
     #[error("signature verification cancelled")]
@@ -82,7 +89,7 @@ impl SignatureVerifier {
     /// Capability-checks the helper under the same resource limits as verification.
     ///
     /// Linux and util-linux's `prlimit` are runtime prerequisites. The wrapper
-    /// must successfully apply hard/soft limits and execute helper protocol 0.1.0.
+    /// must successfully apply hard/soft limits and execute helper protocol 0.2.0.
     /// The caller's timeout is capped at the RFC's 30 seconds.
     ///
     /// # Errors
@@ -249,6 +256,51 @@ impl SignatureVerifier {
         .await
     }
 
+    /// Verifies the exact bytes of a detached-signed package, streaming at most
+    /// 8 GiB through the helper. `expected_size` is the admitted package size;
+    /// keyrings and detached signatures retain their separate 32 MiB ceilings.
+    ///
+    /// The caller must retain immutable private inputs in `guard`. Cancellation
+    /// kills and reaps the helper before releasing that guard or CPU admission.
+    ///
+    /// # Errors
+    /// Incorrect size, nonregular or changed input, invalid signatures, timeout,
+    /// diagnostics and I/O fail closed. Cleanup failure retains the guard.
+    pub async fn verify_package_owned<G: Send + 'static>(
+        &self,
+        keyring: &Path,
+        data: &Path,
+        signature: &Path,
+        expected_size: u64,
+        guard: G,
+    ) -> Result<(), SignatureError> {
+        let verifier = self.clone();
+        let keyring = keyring.to_owned();
+        let data = data.to_owned();
+        let signature = signature.to_owned();
+        supervise(guard, move |mut cancelled| async move {
+            check_input(&keyring).await?;
+            check_input(&signature).await?;
+            check_package_input(&data, expected_size).await?;
+            let arguments = [
+                OsString::from("--keyring"),
+                keyring.into_os_string(),
+                OsString::from("--signatures"),
+                OsString::from("1"),
+                OsString::from("--package"),
+                OsString::from("--expected-size"),
+                OsString::from(expected_size.to_string()),
+                OsString::from("--signature-file"),
+                signature.into_os_string(),
+                data.into_os_string(),
+            ];
+            verifier
+                .run_expecting_success(&arguments, 0, &mut cancelled)
+                .await
+        })
+        .await
+    }
+
     async fn run_expecting_success(
         &self,
         arguments: &[OsString],
@@ -315,6 +367,21 @@ async fn check_input(path: &Path) -> Result<(), SignatureError> {
     let metadata = tokio::fs::metadata(path).await?;
     if !metadata.is_file() || metadata.len() > INPUT_CAP {
         return Err(SignatureError::InputTooLarge(path.to_owned()));
+    }
+    Ok(())
+}
+
+async fn check_package_input(path: &Path, expected_size: u64) -> Result<(), SignatureError> {
+    let invalid = || SignatureError::PackageInput {
+        path: path.to_owned(),
+        expected_size,
+    };
+    if expected_size > PACKAGE_CAP {
+        return Err(invalid());
+    }
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -472,18 +539,19 @@ mod tests {
 
     #[test]
     fn version_probe_requires_the_exact_helper_protocol() {
-        assert_eq!(parse_version_line("ferrum-verifier 0.1.0\n"), Some("0.1.0"));
-        assert_eq!(parse_version_line("ferrum-verifier 0.1.0"), Some("0.1.0"));
+        assert_eq!(parse_version_line("ferrum-verifier 0.2.0\n"), Some("0.2.0"));
+        assert_eq!(parse_version_line("ferrum-verifier 0.2.0"), Some("0.2.0"));
         for incompatible in [
             "sqv 1.3.0\n",
             "sqv 2.0.0\n",
             "gpgv (GnuPG) 2.4.7\n",
             "ferrum-verifier 0.0.9\n",
-            "ferrum-verifier 0.2.0\n",
-            "ferrum-verifier 0.1.0-extra\n",
+            "ferrum-verifier 0.1.0\n",
+            "ferrum-verifier 0.3.0\n",
+            "ferrum-verifier 0.2.0-extra\n",
             "ferrum-verifier 0.1\n",
-            "ferrum-verifier 0.1.0 additional-output\n",
-            "ferrum-verifier 0.1.0\nunexpected second line\n",
+            "ferrum-verifier 0.2.0 additional-output\n",
+            "ferrum-verifier 0.2.0\nunexpected second line\n",
             "",
         ] {
             assert!(

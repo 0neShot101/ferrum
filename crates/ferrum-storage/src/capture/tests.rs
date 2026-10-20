@@ -35,9 +35,9 @@ pub(crate) fn config(spool: &Spool) -> S3Config {
         std::fs::write(&credentials, b"non-secret scripted fixture").unwrap();
     }
     S3Config {
-        endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-        region: "us-central-1".into(),
-        bucket: "s3-andrew".into(),
+        endpoint: crate::s3::config::DEFAULT_ENDPOINT.into(),
+        region: crate::s3::config::DEFAULT_REGION.into(),
+        bucket: crate::s3::config::DEFAULT_BUCKET.into(),
         package_prefix: "linux-packages/".into(),
         checkpoint_prefix: "linux-checkpoints/".into(),
         credentials_file: credentials,
@@ -188,6 +188,7 @@ async fn authenticated_index_and_capture_capabilities_cannot_cross_disk_owners()
         size: capture.identity().size,
         proof_generation_id: capture.manifest().generation_id.clone(),
         first_capture_time: 1,
+        package_signature: None,
     };
     assert!(matches!(
         manager
@@ -308,6 +309,9 @@ async fn cancelling_one_concurrent_authenticated_alias_does_not_remove_other_adm
         path: RepositoryPath::parse_decoded("pool/main/f/ferrum-fixture/alias_1.0_all.deb")
             .unwrap(),
         identity: capture.identity,
+        package_signature: None,
+        package_objects: None,
+        request_authentication: std::sync::OnceLock::new(),
     };
     let first = manager
         .reserve(&capture, crate::s3::production_now().unwrap())
@@ -349,6 +353,7 @@ async fn invalid_receipt_pointer_never_dispatches_or_promotes_from_metadata() {
         sha256: Sha256Digest::of(b"forged metadata").to_hex(),
         proof_generation_id: capture.manifest().generation_id.clone(),
         first_capture_time: 1,
+        package_signature: None,
     };
     assert!(
         manager
@@ -692,6 +697,7 @@ async fn actual_receipt_and_signed_remote_closure_recover_pending_mapping_but_no
         sha256: capture.identity.sha256.to_hex(),
         proof_generation_id: capture.manifest().generation_id.clone(),
         first_capture_time: 1,
+        package_signature: None,
     };
     let mut responses = vec![response("GET", 200, &serde_json::to_vec(&receipt).unwrap())];
     for artifact in &fixture.manifest.artifacts {
@@ -880,6 +886,9 @@ async fn verified_hits_keep_cross_repository_path_reference_until_its_grace() {
         proof: signed.proof.clone(),
         path: signed.path.clone(),
         identity,
+        package_signature: None,
+        package_objects: None,
+        request_authentication: std::sync::OnceLock::new(),
     };
     let receipt = CaptureReceipt {
         schema_version: 1,
@@ -889,6 +898,7 @@ async fn verified_hits_keep_cross_repository_path_reference_until_its_grace() {
         sha256: identity.sha256.to_hex(),
         proof_generation_id: capture.manifest().generation_id.clone(),
         first_capture_time: 1,
+        package_signature: None,
     };
     let bytes = serde_json::to_vec(&receipt).unwrap();
     let (manager, _, requests) = setup(
@@ -1309,6 +1319,7 @@ async fn stale_authorized_capture_cannot_insert_over_checkpoint_candidate_claim(
         size: identity.size,
         proof_generation_id: capture.manifest().generation_id.clone(),
         first_capture_time: now,
+        package_signature: None,
     };
     assert!(manager.reserve(&capture, clock()).is_err());
     assert!(

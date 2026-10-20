@@ -30,6 +30,7 @@ use tempfile::{TempDir, tempdir};
 const DATA: &[u8] = b"Origin: Ferrum\nSuite: stable\n- dash escaped metadata\n";
 const HOUR: Duration = Duration::from_secs(3600);
 const LIMIT: u64 = 32 * 1024 * 1024;
+const PACKAGE_LIMIT: u64 = 8 * 1024 * 1024 * 1024;
 
 fn creation() -> SystemTime {
     SystemTime::now() - HOUR * 4
@@ -155,6 +156,22 @@ impl Artifact {
             .arg(self.path("data"))
             .output()
             .expect("run verifier");
+        assert!(output.stdout.is_empty(), "verification never emits stdout");
+        assert!(output.stderr.len() <= 64 * 1024, "bounded diagnostics");
+        output
+    }
+
+    fn package(&self, expected_size: u64) -> Output {
+        let output = self
+            .command()
+            .arg("--package")
+            .arg("--expected-size")
+            .arg(expected_size.to_string())
+            .arg("--signature-file")
+            .arg(self.path("sig"))
+            .arg(self.path("data"))
+            .output()
+            .expect("run package verifier");
         assert!(output.stdout.is_empty(), "verification never emits stdout");
         assert!(output.stderr.len() <= 64 * 1024, "bounded diagnostics");
         output
@@ -287,6 +304,7 @@ fn current_exact_subkey_expiry_cannot_use_another_live_subkey() {
     let artifact = Artifact::new(&[&cert], &[signature]);
     historically_valid(&artifact, &cert);
     assert!(!artifact.detached().status.success());
+    assert!(!artifact.package(DATA.len() as u64).status.success());
     write_cleartext(&artifact.path("cleartext"), signer, signed_at);
     historically_valid_cleartext(&artifact, &cert);
     assert!(!artifact.cleartext().status.success());
@@ -445,6 +463,7 @@ fn detached_canonical_text_signatures_cannot_authorize_different_bytes() {
         .expect("text signature");
     let artifact = Artifact::new(&[&cert], &[signed]);
     assert!(!artifact.detached().status.success());
+    assert!(!artifact.package(DATA.len() as u64).status.success());
 }
 
 fn write_cleartext(path: &Path, keypair: KeyPair, signed_at: SystemTime) {
@@ -645,7 +664,7 @@ fn version_is_the_exact_pinned_cli_identity() {
         .output()
         .expect("verifier version");
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"ferrum-verifier 0.1.0\n");
+    assert_eq!(output.stdout, b"ferrum-verifier 0.2.0\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -663,4 +682,170 @@ fn user_environment_cannot_replace_system_policy() {
         .output()
         .expect("environment-independent policy");
     assert!(output.status.success());
+}
+
+fn write_package(artifact: &Artifact, cert: &Cert, length: u64) {
+    let mut data = File::create(artifact.path("data")).expect("package data");
+    let mut signature = File::create(artifact.path("sig")).expect("package signature");
+    let mut signer = Signer::new(Message::new(&mut signature), keypair(cert, true))
+        .expect("package signer")
+        .detached()
+        .creation_time(creation() + HOUR)
+        .build()
+        .expect("build package signer");
+    let chunk = [b'x'; 16 * 1024];
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = usize::try_from(remaining.min(chunk.len() as u64)).expect("chunk length");
+        data.write_all(&chunk[..count])
+            .expect("stream package data");
+        signer
+            .write_all(&chunk[..count])
+            .expect("stream package signature");
+        remaining -= count as u64;
+    }
+    signer.finalize().expect("finalize package signature");
+}
+
+#[test]
+fn package_mode_streams_valid_signatures_above_the_metadata_limit_and_rejects_tampering() {
+    let cert = certificate(false, false);
+    let artifact = Artifact::new(&[&cert], &[]);
+    let length = LIMIT + 1;
+    write_package(&artifact, &cert, length);
+    let output = artifact.package(length);
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(
+        !artifact.detached().status.success(),
+        "metadata mode stays capped at 32 MiB"
+    );
+    File::options()
+        .write(true)
+        .open(artifact.path("data"))
+        .expect("open package for tampering")
+        .write_all(b"y")
+        .expect("change an authenticated byte without changing size");
+    assert!(
+        !artifact.package(length).status.success(),
+        "invalid package signature"
+    );
+}
+
+#[test]
+fn package_mode_requires_the_exact_admitted_size_and_rejects_invalid_modes() {
+    let cert = certificate(false, false);
+    let signed = signature(&cert, true, creation() + HOUR, HashAlgorithm::SHA256);
+    let artifact = Artifact::new(&[&cert], &[signed]);
+    let length = DATA.len() as u64;
+    assert!(artifact.package(length).status.success());
+    for size in [
+        0,
+        length - 1,
+        length + 1,
+        PACKAGE_LIMIT,
+        PACKAGE_LIMIT + 1,
+        u64::MAX,
+    ] {
+        assert!(
+            !artifact.package(size).status.success(),
+            "wrong expected size {size}"
+        );
+    }
+    for options in [
+        vec!["--package"],
+        vec!["--expected-size", "1"],
+        vec!["--package", "--expected-size", "18446744073709551616"],
+        vec!["--package", "--expected-size", "-1"],
+        vec![
+            "--package",
+            "--expected-size",
+            "1",
+            "--cleartext",
+            "--output",
+            "unused",
+        ],
+    ] {
+        let output = artifact
+            .command()
+            .args(options)
+            .arg("--signature-file")
+            .arg(artifact.path("sig"))
+            .arg(artifact.path("data"))
+            .output()
+            .expect("invalid package invocation");
+        assert_eq!(output.status.code(), Some(2), "{:?}", output.stderr);
+    }
+}
+
+#[test]
+fn package_mode_keeps_keyring_and_signature_caps_and_rejects_nonregular_inputs() {
+    let cert = certificate(false, false);
+    let signed = signature(&cert, true, creation() + HOUR, HashAlgorithm::SHA256);
+    for name in ["keys", "sig"] {
+        let artifact = Artifact::new(&[&cert], std::slice::from_ref(&signed));
+        File::options()
+            .write(true)
+            .open(artifact.path(name))
+            .expect("open oversized metadata input")
+            .set_len(LIMIT + 1)
+            .expect("extend metadata input");
+        let output = artifact.package(DATA.len() as u64);
+        assert!(!output.status.success(), "oversized {name} in package mode");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("input:"));
+    }
+    for name in ["keys", "sig", "data"] {
+        let artifact = Artifact::new(&[&cert], std::slice::from_ref(&signed));
+        fs::remove_file(artifact.path(name)).expect("remove regular input");
+        fs::create_dir(artifact.path(name)).expect("nonregular input");
+        assert!(
+            !artifact.package(DATA.len() as u64).status.success(),
+            "nonregular {name}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn package_limit_boundary_uses_sparse_files_without_reading_or_allocating_eight_gibibytes() {
+    let cert = certificate(false, false);
+    let artifact = Artifact::new(&[&cert], &[]);
+    // An invalid signature fails at builder construction, before hashing data.
+    // Sparse lengths exercise the real helper's admission at the exact cap.
+    fs::write(artifact.path("sig"), b"not an OpenPGP signature").expect("malformed signature");
+    let data = File::options()
+        .write(true)
+        .open(artifact.path("data"))
+        .expect("sparse package");
+    data.set_len(PACKAGE_LIMIT).expect("exact package cap");
+    let output = artifact.package(PACKAGE_LIMIT);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("verification:"),
+        "exactly 8 GiB must reach signature verification, not fail input admission: {:?}",
+        output.stderr
+    );
+    data.set_len(PACKAGE_LIMIT + 1)
+        .expect("one byte over package cap");
+    let output = artifact.package(PACKAGE_LIMIT);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("package input:"));
+    let output = artifact.package(PACKAGE_LIMIT + 1);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the claimed size is independently bounded"
+    );
+}
+
+#[test]
+fn package_mode_retains_current_certificate_and_signing_key_trust() {
+    for cert in [
+        certificate(true, false),
+        revoke(certificate(false, false), false, false),
+        revoke(certificate(false, false), true, false),
+    ] {
+        let signed = signature(&cert, true, creation() + HOUR, HashAlgorithm::SHA256);
+        let artifact = Artifact::new(&[&cert], &[signed]);
+        assert!(!artifact.package(DATA.len() as u64).status.success());
+    }
 }

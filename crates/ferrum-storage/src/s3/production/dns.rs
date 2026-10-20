@@ -8,13 +8,8 @@ pub(in crate::s3) struct PublicResolver {
     #[cfg(test)]
     answers: Option<Vec<IpAddr>>,
 }
-impl Default for PublicResolver {
-    fn default() -> Self {
-        Self::new("s3.us-central-1.idrivee2.com".into())
-    }
-}
 impl PublicResolver {
-    pub(super) fn new(host: std::sync::Arc<str>) -> Self {
+    pub(in crate::s3) fn new(host: std::sync::Arc<str>) -> Self {
         Self {
             host,
             #[cfg(test)]

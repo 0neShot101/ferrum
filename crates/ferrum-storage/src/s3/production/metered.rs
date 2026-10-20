@@ -29,6 +29,8 @@ pub(super) struct Metered {
 struct ProviderTarget {
     host: std::sync::Arc<str>,
     bucket_path: String,
+    package_prefix: Box<str>,
+    checkpoint_prefix: Box<str>,
 }
 
 impl ProviderTarget {
@@ -37,6 +39,8 @@ impl ProviderTarget {
         Ok(Self {
             host: endpoint.host_str().ok_or(S3Error::Boundary)?.into(),
             bucket_path: format!("/{}", config.bucket),
+            package_prefix: config.package_prefix.clone().into_boxed_str(),
+            checkpoint_prefix: config.checkpoint_prefix.clone().into_boxed_str(),
         })
     }
 }
@@ -176,9 +180,14 @@ impl HttpConnector for Connector {
                     || !uri
                         .query_pairs()
                         .any(|(name, value)| name == "prefix" && value == key.as_str())
-                    || !super::namespace_suffix(*identity, key)
-                        .map_err(denied)?
-                        .is_empty()
+                    || !super::namespace_suffix(
+                        *identity,
+                        key,
+                        &metered.target.package_prefix,
+                        &metered.target.checkpoint_prefix,
+                    )
+                    .map_err(denied)?
+                    .is_empty()
                 {
                     return Err(denied(S3Error::Boundary));
                 }
@@ -186,7 +195,13 @@ impl HttpConnector for Connector {
                 if uri.path() != path {
                     return Err(denied(S3Error::Boundary));
                 }
-                let suffix = super::namespace_suffix(*identity, key).map_err(denied)?;
+                let suffix = super::namespace_suffix(
+                    *identity,
+                    key,
+                    &metered.target.package_prefix,
+                    &metered.target.checkpoint_prefix,
+                )
+                .map_err(denied)?;
                 super::validate_suffix(*identity, suffix).map_err(denied)?;
             }
             let method = request.method().to_owned();

@@ -16,6 +16,20 @@ impl CaptureManager {
         }
         Ok(self.spool.capture_is_durable(identity)?)
     }
+    /// True when the local catalog records an existing or in-progress remote object
+    /// for `identity`, avoiding a pointless S3 GET when coverage is already reconciled
+    /// and the package has never been captured.
+    pub fn has_remote_candidate(&self, identity: ObjectIdentity) -> Result<bool, CaptureError> {
+        let digest = identity.sha256.to_hex();
+        let pattern = format!("%/v1/objects/sha256/{digest}");
+        Ok(self.spool.durable_catalog()?.read(move |connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM capture_blobs WHERE digest=?1 AND gc_pending=0 UNION SELECT 1 FROM remote_storage WHERE key LIKE ?2 AND committed=1)",
+                params![digest, pattern],
+                |row| row.get(0),
+            )?)
+        })?)
+    }
     /// Restores an already receipted mapping without reserving or incrementing
     /// the package outbox. The actual GET is hashed by the shared spool commit.
     /// A concurrent new unreceipted path may keep the object non-evictable, but
@@ -113,6 +127,7 @@ impl CaptureManager {
         if !self.spool.same_owner(&proof.proof.owner) {
             return Err(CaptureError::Proof);
         }
+        proof.require_package_authentication()?;
         let _path_slot = self
             .store
             .capture_path_slot(proof.repository(), proof.path().as_str(), deadline, cancel)
@@ -187,6 +202,7 @@ impl CaptureManager {
                 sha256: identity.sha256.to_hex(),
                 proof_generation_id: generation,
                 first_capture_time: first,
+                package_signature: proof.package_signature.clone(),
             };
             let actual = super::receipt::read(&self.store, &expected, deadline, cancel).await?;
             let repository = proof.repository().to_owned();
@@ -263,7 +279,15 @@ impl CaptureManager {
             sha256: identity.sha256.to_hex(),
             proof_generation_id: manifest.generation_id.clone(),
             first_capture_time: first,
+            package_signature: proof.package_signature.clone(),
         };
+        self.persist_package_signature(
+            receipt.package_signature.as_ref(),
+            &manifest.scope_id().to_hex(),
+            deadline,
+            cancel,
+        )
+        .await?;
         let observed = super::receipt::put(&self.store, &receipt, deadline, cancel).await?;
         self.store.account_observed(
             OperationIdentity::Object,

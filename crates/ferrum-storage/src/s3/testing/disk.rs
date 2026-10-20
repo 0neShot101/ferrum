@@ -52,6 +52,9 @@ pub struct DiskBackedRemote {
     state: Arc<Mutex<State>>,
     root: Arc<Root>,
     slots: Arc<Semaphore>,
+    endpoint: Arc<str>,
+    host: Arc<str>,
+    bucket: Arc<str>,
     prefixes: Arc<[String; 2]>,
 }
 
@@ -174,10 +177,20 @@ impl fmt::Debug for DiskBackedRemote {
     }
 }
 impl DiskBackedRemote {
-    fn new(root: PathBuf, maximum: u64, prefixes: [String; 2]) -> Result<Self, S3Error> {
-        if maximum == 0 || maximum > MAX_TOTAL {
+    fn new(
+        root: PathBuf,
+        maximum: u64,
+        endpoint: &str,
+        bucket: &str,
+        prefixes: [String; 2],
+    ) -> Result<Self, S3Error> {
+        if maximum == 0 || maximum > MAX_TOTAL || !config::valid_bucket(bucket) {
             return Err(S3Error::Boundary);
         }
+        let host = config::valid_endpoint_and_host(endpoint)?;
+        let canonical_endpoint = url::Url::parse(endpoint)
+            .map_err(|_| S3Error::Boundary)?
+            .to_string();
         let root = config::no_symlink_ancestors(&root)?;
         let parent = root.parent().ok_or(S3Error::Boundary)?;
         if !parent.is_dir() || root.file_name().is_none() {
@@ -200,6 +213,9 @@ impl DiskBackedRemote {
                 sequence: AtomicU64::new(1),
             }),
             slots: Arc::new(Semaphore::new(32)),
+            endpoint: canonical_endpoint.into(),
+            host: host.into(),
+            bucket: bucket.into(),
             prefixes: Arc::new(prefixes),
         })
     }
@@ -246,6 +262,8 @@ impl S3Store {
         let remote = DiskBackedRemote::new(
             root,
             maximum_bytes,
+            &identity.endpoint,
+            &identity.bucket,
             [identity.package_prefix, identity.checkpoint_prefix],
         )?;
         let store = Self::scripted(config, ledger, SharedHttpClient::new(remote.clone()))?;
@@ -350,7 +368,7 @@ impl DiskBackedRemote {
         // URL parsing normalizes dot segments and explicit default ports. Refuse
         // those alternate spellings before parsing; keys never need URL escapes.
         let raw_path = request.uri().split('?').next().unwrap_or_default();
-        if !raw_path.starts_with("https://s3.us-central-1.idrivee2.com/")
+        if !raw_path.starts_with(self.endpoint.as_ref())
             || raw_path.contains('%')
             || raw_path.contains('\\')
             || raw_path.split('/').any(|part| matches!(part, "." | ".."))
@@ -359,7 +377,7 @@ impl DiskBackedRemote {
         }
         let url = url::Url::parse(request.uri()).map_err(|_| remote_error("invalid local URI"))?;
         if url.scheme() != "https"
-            || url.host_str() != Some("s3.us-central-1.idrivee2.com")
+            || url.host_str() != Some(self.host.as_ref())
             || url.port().is_some()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -367,12 +385,14 @@ impl DiskBackedRemote {
         {
             return Err(remote_error("local transport refuses arbitrary endpoint"));
         }
-        let key = if matches!(url.path(), "/s3-andrew" | "/s3-andrew/") {
+        let bucket_root = format!("/{}", self.bucket);
+        let bucket_slash = format!("/{}/", self.bucket);
+        let key = if url.path() == bucket_root || url.path() == bucket_slash {
             String::new()
         } else {
             let key = url
                 .path()
-                .strip_prefix("/s3-andrew/")
+                .strip_prefix(&bucket_slash)
                 .filter(|key| self.owned_key(key))
                 .ok_or_else(|| remote_error("local transport refuses unowned key"))?;
             key.to_owned()
@@ -666,7 +686,8 @@ impl DiskBackedRemote {
                 xml(
                     200,
                     format!(
-                        "<InitiateMultipartUploadResult><Bucket>s3-andrew</Bucket><Key>{}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>",
+                        "<InitiateMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>",
+                        quoted(&self.bucket),
                         quoted(&target.key)
                     ),
                 )
@@ -848,7 +869,8 @@ impl DiskBackedRemote {
             .iter()
             .filter(|(key, _)| key.starts_with(prefix) && after.is_none_or(|after| *key > after));
         let mut text = format!(
-            "<ListBucketResult><Name>s3-andrew</Name><Prefix>{}</Prefix><MaxKeys>{limit}</MaxKeys>",
+            "<ListBucketResult><Name>{}</Name><Prefix>{}</Prefix><MaxKeys>{limit}</MaxKeys>",
+            quoted(&self.bucket),
             quoted(prefix)
         );
         let mut count = 0;
@@ -914,7 +936,8 @@ impl DiskBackedRemote {
         });
         let more = uploads.len() > limit;
         let mut text = format!(
-            "<ListMultipartUploadsResult><Bucket>s3-andrew</Bucket><Prefix>{}</Prefix><MaxUploads>{limit}</MaxUploads><IsTruncated>{more}</IsTruncated>",
+            "<ListMultipartUploadsResult><Bucket>{}</Bucket><Prefix>{}</Prefix><MaxUploads>{limit}</MaxUploads><IsTruncated>{more}</IsTruncated>",
+            quoted(&self.bucket),
             quoted(prefix)
         );
         for (id, upload) in uploads.iter().take(limit) {
@@ -956,7 +979,8 @@ impl DiskBackedRemote {
         };
         let mut parts = upload.parts.iter().filter(|(number, _)| **number > after);
         let mut text = format!(
-            "<ListPartsResult><Bucket>s3-andrew</Bucket><Key>{}</Key><UploadId>{id}</UploadId><PartNumberMarker>{after}</PartNumberMarker><MaxParts>{limit}</MaxParts>",
+            "<ListPartsResult><Bucket>{}</Bucket><Key>{}</Key><UploadId>{id}</UploadId><PartNumberMarker>{after}</PartNumberMarker><MaxParts>{limit}</MaxParts>",
+            quoted(&self.bucket),
             quoted(&target.key)
         );
         let mut last = after;
@@ -1066,7 +1090,8 @@ impl DiskBackedRemote {
         xml(
             200,
             format!(
-                "<CompleteMultipartUploadResult><Bucket>s3-andrew</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+                "<CompleteMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+                quoted(&self.bucket),
                 quoted(&target.key),
                 quoted(&etag)
             ),

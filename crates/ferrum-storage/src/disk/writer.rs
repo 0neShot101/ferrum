@@ -227,7 +227,7 @@ impl SnapshotFile {
                 drop(snapshot._step_allowance);
                 #[cfg(test)]
                 snapshot.spool.0.pause("snapshot-install");
-                let object = install(&snapshot.spool.0, &mut snapshot.temporary, identity)?;
+                let object = install(&snapshot.spool.0, &mut snapshot.temporary, identity, false)?;
                 Ok(SnapshotObject {
                     spool: snapshot.spool,
                     object: Some(object),
@@ -385,6 +385,17 @@ impl SpoolWriter {
     /// directories, then SQL residency. Nothing is readable before all succeed.
     /// Cancellation does not undo a commit already admitted to the I/O pool.
     pub async fn commit(self) -> Result<VerifiedObject, SpoolError> {
+        self.commit_with_retention(false).await
+    }
+
+    /// Commits hash-checked candidate bytes with deletion eligibility, not
+    /// package durability or authenticity. Existing shared objects are unchanged.
+    /// Capture admission atomically revokes this provisional eligibility.
+    pub async fn commit_candidate(self) -> Result<VerifiedObject, SpoolError> {
+        self.commit_with_retention(true).await
+    }
+
+    async fn commit_with_retention(self, candidate: bool) -> Result<VerifiedObject, SpoolError> {
         let Self {
             spool,
             expected,
@@ -410,7 +421,7 @@ impl SpoolWriter {
                 let mut temporary = temporary;
                 #[cfg(test)]
                 owner.pause("commit");
-                install(&owner, &mut temporary, expected)
+                install(&owner, &mut temporary, expected, candidate)
             })
             .await?
     }
@@ -456,6 +467,7 @@ fn install(
     spool: &SpoolInner,
     temporary: &mut TemporaryFile,
     expected: ObjectIdentity,
+    candidate: bool,
 ) -> Result<VerifiedObject, SpoolError> {
     let mut registry = lock_unpoisoned(&spool.installed);
     let mut transaction = InstallGuard {
@@ -472,7 +484,8 @@ fn install(
                 return Err(SpoolError::AdmissionClosed);
             }
             temporary.cleanup()?;
-            if !temporary.reservation.class.metadata()
+            if !candidate
+                && !temporary.reservation.class.metadata()
                 && existing.class.metadata()
                 && let Some(catalog) = spool.catalog()
             {
@@ -547,7 +560,7 @@ fn install(
         let mut reconstructible = false;
         if let (Some(catalog), Some(id)) = (spool.catalog(), &temporary.reservation.id) {
             spool.failpoint("sql-install")?;
-            catalog.install(id.clone(), expected, class.sql())?;
+            catalog.install(id.clone(), expected, class.sql(), candidate)?;
             let row = catalog
                 .object(expected)?
                 .ok_or(crate::catalog::CatalogError::InvalidState)?;

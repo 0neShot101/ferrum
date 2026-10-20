@@ -2,7 +2,7 @@
 //!
 //! Adversarial child processes exercise Linux's real `prlimit`, timeout, reaping
 //! and cleanup boundaries. Real trust verdicts use static vectors under
-//! `tests/data/` and ferrum-verifier 0.1.0 located through `FERRUM_VERIFIER` or
+//! `tests/data/` and ferrum-verifier 0.2.0 located through `FERRUM_VERIFIER` or
 //! `PATH`; without one they fail unless `FERRUM_SKIP_VERIFIER_TESTS=1`.
 #![cfg(target_os = "linux")]
 #![allow(clippy::expect_used, clippy::panic)]
@@ -66,7 +66,7 @@ fn real_helper() -> Option<PathBuf> {
         return None;
     }
     panic!(
-        "ferrum-verifier 0.1.0 not found: build -p ferrum-verifier and put target/debug on PATH, \
+        "ferrum-verifier 0.2.0 not found: build -p ferrum-verifier and put target/debug on PATH, \
          set FERRUM_VERIFIER=/path/to/ferrum-verifier, or explicitly set FERRUM_SKIP_VERIFIER_TESTS=1"
     );
 }
@@ -98,9 +98,10 @@ async fn stock_sqv_and_incompatible_helper_protocols_are_refused_at_startup() {
         "sqv 2.0.0",
         "gpgv (GnuPG) 2.4.7",
         "ferrum-verifier 0.0.9",
-        "ferrum-verifier 0.2.0",
-        "ferrum-verifier 0.1.0-extra",
-        "ferrum-verifier 0.1.0\nunexpected second line",
+        "ferrum-verifier 0.1.0",
+        "ferrum-verifier 0.3.0",
+        "ferrum-verifier 0.2.0-extra",
+        "ferrum-verifier 0.2.0\nunexpected second line",
     ] {
         let binary = fake_verifier(dir.path(), response, "exit 0");
         let error = SignatureVerifier::new(binary, TIMEOUT)
@@ -116,7 +117,7 @@ async fn stock_sqv_and_incompatible_helper_protocols_are_refused_at_startup() {
 #[tokio::test]
 async fn hanging_verifier_is_killed_at_timeout() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", "exec sleep 30");
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", "exec sleep 30");
     let verifier = SignatureVerifier::new(binary, Duration::from_millis(300))
         .await
         .expect("version probe");
@@ -136,7 +137,7 @@ async fn hanging_verifier_is_killed_at_timeout() {
 async fn rejection_reports_status_and_diagnostics() {
     let dir = tempfile::tempdir().expect("tempdir");
     let body = "printf 'rejected by test policy' >&2\nexit 3";
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", body);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", body);
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
         .await
         .expect("version probe");
@@ -159,7 +160,7 @@ async fn cleartext_output_is_bounded_and_provisional_file_always_removed() {
     let scratch = dir.path().join("scratch");
     std::fs::create_dir(&scratch).expect("scratch dir");
     let body = format!("{FIND_OUTPUT}printf '0123456789' > \"$out\" || exit 1\nexit 0");
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", &body);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", &body);
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
         .await
         .expect("version probe");
@@ -185,7 +186,7 @@ async fn cleartext_output_is_bounded_and_provisional_file_always_removed() {
     );
 
     let failing = format!("{FIND_OUTPUT}printf 'partial' > \"$out\"\necho bad >&2\nexit 1");
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", &failing);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", &failing);
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
         .await
         .expect("version probe");
@@ -211,7 +212,7 @@ async fn unbounded_diagnostics_terminate_without_draining_forever() {
     let dir = tempfile::tempdir().expect("tempdir");
     let binary = fake_verifier(
         dir.path(),
-        "ferrum-verifier 0.1.0",
+        "ferrum-verifier 0.2.0",
         "while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; done",
     );
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
@@ -240,7 +241,7 @@ async fn kernel_limit_prevents_output_growth_past_reserved_bytes() {
          wc -c < \"$out\" > '{}'\nexit 1",
         observed.display(),
     );
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", &body);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", &body);
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
         .await
         .expect("version probe");
@@ -265,7 +266,7 @@ async fn verifier_inherits_hard_and_soft_resource_limits() {
     // not command-line text emitted by a mock prlimit.
     let binary = fake_verifier(
         dir.path(),
-        "ferrum-verifier 0.1.0",
+        "ferrum-verifier 0.2.0",
         "{ ulimit -S -v; ulimit -H -v; ulimit -S -t; ulimit -H -t; \
          ulimit -S -f; ulimit -H -f; ulimit -S -c; ulimit -H -c; } >&2\nexit 3",
     );
@@ -315,7 +316,7 @@ async fn kernel_address_space_limit_refuses_an_oversized_allocation() {
         .replace('\'', "'\\''");
     let binary = fake_verifier(
         dir.path(),
-        "ferrum-verifier 0.1.0",
+        "ferrum-verifier 0.2.0",
         &format!(
             "export FERRUM_ADDRESS_SPACE_CHILD=1\n\
              exec '{executable}' --exact address_space_limit_child --nocapture"
@@ -347,7 +348,7 @@ async fn kernel_cpu_limit_terminates_a_spinning_verifier() {
     // without spending the production 30-second CPU allowance.
     let binary = fake_verifier(
         dir.path(),
-        "ferrum-verifier 0.1.0",
+        "ferrum-verifier 0.2.0",
         "ulimit -S -t 1\nwhile :; do :; done",
     );
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
@@ -378,7 +379,7 @@ async fn oversized_inputs_are_refused_before_verifier_execution() {
     let marker = dir.path().join("executed");
     let binary = fake_verifier(
         dir.path(),
-        "ferrum-verifier 0.1.0",
+        "ferrum-verifier 0.2.0",
         &format!("touch '{}'\nexit 0", marker.display()),
     );
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
@@ -439,7 +440,7 @@ async fn timeout_reaps_and_unlinks_before_releasing_scratch_guard() {
         "{FIND_OUTPUT}printf 'partial' > \"$out\"\necho $$ > '{}'\nexec sleep 30",
         pid_file.display(),
     );
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", &body);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", &body);
     let verifier = SignatureVerifier::new(binary, Duration::from_millis(500))
         .await
         .expect("version probe");
@@ -473,7 +474,7 @@ async fn dropping_caller_reaps_and_unlinks_before_releasing_scratch_guard() {
         "{FIND_OUTPUT}printf 'partial' > \"$out\"\necho $$ > '{}'\nexec sleep 30",
         pid_file.display(),
     );
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", &body);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", &body);
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
         .await
         .expect("version probe");
@@ -532,7 +533,7 @@ async fn cleanup_failure_retains_storage_guard_but_releases_reaped_child_cpu_cap
         "{FIND_OUTPUT}if [ -n \"$out\" ]; then\n  mkdir \"$out\" && mkdir \"$out/$$\" || exit 8\n  exit 0\nfi\nmkdir '{}'/\"$$\" || exit 8\nexit 7",
         detached_started.display(),
     );
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", &body);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", &body);
     let verifier = SignatureVerifier::new(binary.clone(), TIMEOUT)
         .await
         .expect("version probe");
@@ -611,8 +612,7 @@ async fn cleanup_failure_retains_storage_guard_but_releases_reaped_child_cpu_cap
     );
 }
 
-#[tokio::test]
-async fn detached_cancellation_reaps_before_releasing_input_guard() {
+async fn input_cancellation(package: bool) {
     struct InputGuard {
         started: PathBuf,
         completed: Option<tokio::sync::oneshot::Sender<bool>>,
@@ -638,7 +638,7 @@ async fn detached_cancellation_reaps_before_releasing_input_guard() {
     // Detached verification forbids regular-file output entirely. A directory
     // communicates the PID without weakening that limit for this test.
     let body = format!("mkdir '{}'/\"$$\"\nexec sleep 30", started.display());
-    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.1.0", &body);
+    let binary = fake_verifier(dir.path(), "ferrum-verifier 0.2.0", &body);
     let verifier = SignatureVerifier::new(binary, TIMEOUT)
         .await
         .expect("version probe");
@@ -648,14 +648,28 @@ async fn detached_cancellation_reaps_before_releasing_input_guard() {
         completed: Some(completed),
     };
     let caller = tokio::spawn(async move {
-        verifier
-            .verify_detached_owned(
-                &data("keyring.gpg"),
-                &data("Release"),
-                &data("Release.gpg"),
-                guard,
-            )
-            .await
+        if package {
+            verifier
+                .verify_package_owned(
+                    &data("keyring.gpg"),
+                    &data("Release"),
+                    &data("Release.gpg"),
+                    std::fs::metadata(data("Release"))
+                        .expect("package size")
+                        .len(),
+                    guard,
+                )
+                .await
+        } else {
+            verifier
+                .verify_detached_owned(
+                    &data("keyring.gpg"),
+                    &data("Release"),
+                    &data("Release.gpg"),
+                    guard,
+                )
+                .await
+        }
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         while is_empty_dir(&started) {
@@ -672,6 +686,16 @@ async fn detached_cancellation_reaps_before_releasing_input_guard() {
             .expect("cleanup completed")
             .expect("input guard released")
     );
+}
+
+#[tokio::test]
+async fn detached_cancellation_reaps_before_releasing_input_guard() {
+    input_cancellation(false).await;
+}
+
+#[tokio::test]
+async fn package_cancellation_reaps_before_releasing_input_guard() {
+    input_cancellation(true).await;
 }
 
 #[tokio::test]
@@ -697,7 +721,7 @@ async fn real_helper_accepts_valid_and_mixed_cleartext_signatures() {
         );
         let parsed = Release::parse(&body, &ParseLimits::default()).expect("authenticated body");
         assert_eq!(parsed.origin, "FerrumTest");
-        assert_eq!(parsed.suite, "ferrum-test");
+        assert_eq!(parsed.suite.as_deref(), Some("ferrum-test"));
         assert!(parsed.acquire_by_hash);
         assert!(
             is_empty_dir(dir.path()),
@@ -764,5 +788,92 @@ async fn real_helper_detached_verification_binds_signature_to_data() {
         )
         .await
         .expect_err("wrong keyring must be rejected");
+    assert!(matches!(error, SignatureError::Rejected { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn package_size_and_metadata_caps_reject_before_helper_execution() {
+    const PACKAGE_CAP: u64 = 8 * 1024 * 1024 * 1024;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let oversized = dir.path().join("oversized");
+    std::fs::File::create(&oversized)
+        .expect("sparse metadata input")
+        .set_len(32 * 1024 * 1024 + 1)
+        .expect("oversized metadata");
+    let marker = dir.path().join("executed");
+    let binary = fake_verifier(
+        dir.path(),
+        "ferrum-verifier 0.2.0",
+        &format!("mkdir '{}'\nexit 7", marker.display()),
+    );
+    let verifier = SignatureVerifier::new(binary, TIMEOUT)
+        .await
+        .expect("version probe");
+    let package = data("Release");
+    let size = std::fs::metadata(&package).expect("package size").len();
+    for expected_size in [size - 1, size + 1, PACKAGE_CAP + 1, u64::MAX] {
+        let error = verifier
+            .verify_package_owned(
+                &data("keyring.gpg"),
+                &package,
+                &data("Release.gpg"),
+                expected_size,
+                (),
+            )
+            .await
+            .expect_err("wrong or excessive package size");
+        assert!(
+            matches!(error, SignatureError::PackageInput { .. }),
+            "{error}"
+        );
+    }
+    for (keyring, signature) in [
+        (oversized.clone(), data("Release.gpg")),
+        (data("keyring.gpg"), oversized),
+    ] {
+        let error = verifier
+            .verify_package_owned(&keyring, &package, &signature, size, ())
+            .await
+            .expect_err("package mode must not widen metadata input limits");
+        assert!(matches!(error, SignatureError::InputTooLarge(_)), "{error}");
+    }
+    assert!(
+        !marker.exists(),
+        "rejected inputs must not execute a helper"
+    );
+}
+
+#[tokio::test]
+async fn real_helper_package_mode_authenticates_only_exact_admitted_bytes() {
+    let Some(verifier) = real_verifier().await else {
+        return;
+    };
+    let package = data("Release");
+    let size = std::fs::metadata(&package).expect("package size").len();
+    verifier
+        .verify_package_owned(
+            &data("keyring.gpg"),
+            &package,
+            &data("Release.gpg"),
+            size,
+            (),
+        )
+        .await
+        .expect("binary package signature");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tampered = dir.path().join("package");
+    let mut body = std::fs::read(package).expect("package vector");
+    body[0] ^= 1;
+    std::fs::write(&tampered, body).expect("same-size tampered package");
+    let error = verifier
+        .verify_package_owned(
+            &data("keyring.gpg"),
+            &tampered,
+            &data("Release.gpg"),
+            size,
+            (),
+        )
+        .await
+        .expect_err("same-size tampering must fail cryptographic verification");
     assert!(matches!(error, SignatureError::Rejected { .. }), "{error}");
 }

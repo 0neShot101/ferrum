@@ -30,7 +30,23 @@ pub struct ProviderIdentity {
 }
 
 impl ProviderIdentity {
-    fn read(connection: &Connection) -> Result<Option<Self>, CatalogError> {
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+    pub fn package_prefix(&self) -> &str {
+        &self.package_prefix
+    }
+    pub fn checkpoint_prefix(&self) -> &str {
+        &self.checkpoint_prefix
+    }
+
+    pub(super) fn read(connection: &Connection) -> Result<Option<Self>, CatalogError> {
         Ok(connection
             .query_row(
                 "SELECT endpoint,bucket,region,package_prefix,checkpoint_prefix FROM remote_provider WHERE id=1",
@@ -184,18 +200,41 @@ impl BudgetLedger {
                     |row| row.get(0),
                 )
                 .optional()?;
-            let prefixes = match qualification {
-                None => (
-                    "linux-packages/".to_owned(),
-                    "linux-checkpoints/".to_owned(),
-                ),
-                Some(Some(run)) if valid_run(&run) => (
-                    format!("linux-packages/_ferrum-b07/{run}/"),
-                    format!("linux-checkpoints/_ferrum-b07/{run}/"),
-                ),
+            let suffix_expected = match qualification {
+                None => None,
+                Some(Some(run)) if valid_run(&run) => Some(format!("_ferrum-b07/{run}/")),
                 _ => return Err(CatalogError::InvalidState),
             };
-            if ineligible || identity.endpoint != "https://s3.us-central-1.idrivee2.com/" || identity.region != "us-central-1" || identity.bucket != "s3-andrew" || identity.package_prefix != prefixes.0 || identity.checkpoint_prefix != prefixes.1 {
+            let (base_pkg, base_chk) = match &suffix_expected {
+                None => (
+                    identity.package_prefix.as_str(),
+                    identity.checkpoint_prefix.as_str(),
+                ),
+                Some(suffix) => match (
+                    identity.package_prefix.strip_suffix(suffix.as_str()),
+                    identity.checkpoint_prefix.strip_suffix(suffix.as_str()),
+                ) {
+                    (Some(pkg), Some(chk)) => (pkg, chk),
+                    _ => return Err(CatalogError::InvalidState),
+                },
+            };
+            let valid_identity = crate::s3::config::valid_endpoint_and_host(&identity.endpoint)
+                .is_ok()
+                && identity.endpoint.ends_with('/')
+                && crate::s3::config::valid_region(&identity.region)
+                && crate::s3::config::valid_bucket(&identity.bucket)
+                && crate::s3::config::valid_prefix(base_pkg)
+                && crate::s3::config::valid_prefix(base_chk)
+                && !crate::s3::config::prefixes_overlap(base_pkg, base_chk);
+            if ineligible || !valid_identity {
+                return Err(CatalogError::InvalidState);
+            }
+            let mismatched_keys: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM (SELECT key FROM remote_storage UNION ALL SELECT key FROM remote_quarantine) WHERE substr(key, 1, length(?1)) <> ?1 AND substr(key, 1, length(?2)) <> ?2)",
+                params![base_pkg, base_chk],
+                |row| row.get(0),
+            )?;
+            if mismatched_keys {
                 return Err(CatalogError::InvalidState);
             }
             identity.insert(&transaction)?;
@@ -234,9 +273,9 @@ mod tests {
 
     fn config(root: &Path) -> S3Config {
         S3Config {
-            endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-            region: "us-central-1".into(),
-            bucket: "s3-andrew".into(),
+            endpoint: crate::s3::config::DEFAULT_ENDPOINT.into(),
+            region: crate::s3::config::DEFAULT_REGION.into(),
+            bucket: crate::s3::config::DEFAULT_BUCKET.into(),
             package_prefix: "linux-packages/".into(),
             checkpoint_prefix: "linux-checkpoints/".into(),
             credentials_file: root.join("unused-credentials"),
@@ -304,6 +343,9 @@ mod tests {
                 for (table, _) in SCHEMA.iter().rev() {
                     transaction.execute_batch(&format!("DROP TABLE {table}"))?;
                 }
+                for (table, _) in crate::capture::PACKAGE_SIGNATURE_SCHEMA {
+                    transaction.execute_batch(&format!("DROP TABLE {table}"))?;
+                }
                 transaction.pragma_update(None, "user_version", 3)?;
                 transaction.commit()?;
                 Ok(())
@@ -313,12 +355,17 @@ mod tests {
         drop(ledger);
         drop(spool);
         let spool = test_support::open_spool(root);
+        let after = history(&spool);
+        let preserved: Vec<_> = after
+            .iter()
+            .filter(|(name, _, _)| before.iter().any(|(old, _, _)| old == name))
+            .cloned()
+            .collect();
         assert_eq!(
-            history(&spool),
-            before,
-            "v3 migration must only add binding metadata"
+            preserved, before,
+            "v3 migration must preserve every existing authority row"
         );
-        (spool, before)
+        (spool, after)
     }
 
     fn audit() -> LegacyProviderAdoption {
@@ -366,7 +413,7 @@ mod tests {
         let state = root.path().join("state");
         let spool = test_support::open_spool(&state);
         let mut configured = config(root.path());
-        configured.endpoint = "https://S3.US-CENTRAL-1.IDRIVEE2.COM:443/".into();
+        configured.endpoint = "https://S3.US-EAST-1.AMAZONAWS.COM:443/".into();
         let identity = configured.provider_identity(None).unwrap();
         let ledger = BudgetLedger::initialize_for_provider(
             spool.clone(),
@@ -438,11 +485,11 @@ mod tests {
         for field in 0..5 {
             let mut arbitrary = identity.clone();
             match field {
-                0 => arbitrary.endpoint = "https://other.example.org/".into(),
-                1 => arbitrary.bucket = "another-bucket".into(),
-                2 => arbitrary.region = "another-region".into(),
+                0 => arbitrary.endpoint = "http://other.example.org/".into(),
+                1 => arbitrary.bucket = "Invalid_Bucket".into(),
+                2 => arbitrary.region = "Invalid_Region".into(),
                 3 => arbitrary.package_prefix = "other-packages/".into(),
-                _ => arbitrary.checkpoint_prefix = "other-checkpoints/".into(),
+                _ => arbitrary.checkpoint_prefix = "linux-packages/".into(),
             }
             assert!(BudgetLedger::adopt_legacy_provider(&spool, &arbitrary, audit()).is_err());
             assert_eq!(history(&spool), before);

@@ -18,11 +18,7 @@ impl Production {
                 Ok(())
             })
             .map_err(database)?;
-        if !self
-            .config
-            .package_prefix
-            .starts_with("linux-packages/_ferrum-b07/")
-        {
+        if !self.config.package_prefix.contains("/_ferrum-b07/") {
             return Ok("ferrum-v1".into());
         }
         let key = key.to_owned();
@@ -101,14 +97,8 @@ impl S3Store {
         cancel: &CancellationToken,
     ) -> Result<u64, S3Error> {
         let store = self.production()?;
-        if !store
-            .config
-            .package_prefix
-            .starts_with("linux-packages/_ferrum-b07/")
-            || !store
-                .config
-                .checkpoint_prefix
-                .starts_with("linux-checkpoints/_ferrum-b07/")
+        if !store.config.package_prefix.contains("/_ferrum-b07/")
+            || !store.config.checkpoint_prefix.contains("/_ferrum-b07/")
         {
             return Err(S3Error::Boundary);
         }
@@ -357,9 +347,9 @@ mod tests {
             ),
         );
         let config = S3Config {
-            endpoint: config::ENDPOINT.into(),
-            region: config::REGION.into(),
-            bucket: config::BUCKET.into(),
+            endpoint: config::DEFAULT_ENDPOINT.into(),
+            region: config::DEFAULT_REGION.into(),
+            bucket: config::DEFAULT_BUCKET.into(),
             package_prefix: "linux-packages/".into(),
             checkpoint_prefix: "linux-checkpoints/".into(),
             credentials_file: directory.path().join("unused-test-credentials"),

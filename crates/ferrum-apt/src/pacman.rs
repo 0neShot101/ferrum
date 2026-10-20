@@ -15,6 +15,10 @@ use crate::index::{IndexError, PackageRecord};
 use crate::path::RepositoryPath;
 use crate::release::{ParseLimits, UnixTime};
 
+pub(crate) mod zstd;
+
+use zstd::{MultiZstdDecoder, is_zstd_magic};
+
 /// Maximum uncompressed tar stream size accepted for a Pacman `.db` archive.
 const MAX_DECOMPRESSED_DB_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum detached OpenPGP signature size accepted from `%PGPSIG%` or `.sig`.
@@ -23,6 +27,23 @@ pub const MAX_PACMAN_SIG_BYTES: usize = 16 * 1024;
 const MAX_CANARY_PACKAGE_BYTES: u64 = 32 * 1024 * 1024;
 /// XZ decoder memory cap matching `ferrum-storage` proof decoding.
 const XZ_DECODER_MEMORY_LIMIT: u64 = 65 * 1024 * 1024;
+
+/// Fixed architecture directory for each CachyOS repository suite.
+pub fn cachyos_suite_arch(suite: &str) -> Option<&'static str> {
+    match suite {
+        "cachyos" => Some("x86_64"),
+        "cachyos-v3" => Some("x86_64_v3"),
+        "cachyos-v4" => Some("x86_64_v4"),
+        _ => None,
+    }
+}
+
+/// Splits a CachyOS repository-relative request using its exact architecture root.
+pub fn split_cachyos_suite_path(path: &str) -> Option<(&str, &str)> {
+    let (architecture, rest) = path.split_once('/')?;
+    let (suite, relative) = rest.split_once('/')?;
+    (cachyos_suite_arch(suite)? == architecture).then_some((suite, relative))
+}
 
 /// Maps a suite-relative Pacman index path (`os/x86_64/<suite>.db` or
 /// `x86_64/chaotic-aur.db`) to its repository-relative package directory prefix
@@ -38,9 +59,7 @@ pub fn pacman_package_prefix(index_path: &str) -> Option<String> {
         "x86_64" | "aarch64" if matches!(suite, "chaotic-aur" | "endeavouros" | "archlinuxcn") => {
             Some(format!("{suite}/{directory}"))
         }
-        "x86_64" if matches!(suite, "cachyos" | "cachyos-v3" | "cachyos-v4") => {
-            Some(format!("{directory}/{suite}"))
-        }
+        _ if cachyos_suite_arch(suite) == Some(directory) => Some(format!("{directory}/{suite}")),
         _ => None,
     }
 }
@@ -69,8 +88,6 @@ pub fn is_pacman_package_path(path: &str) -> bool {
                 | "archlinuxcn/x86_64"
                 | "archlinuxcn/aarch64"
                 | "x86_64/cachyos"
-                | "x86_64/cachyos-v3"
-                | "x86_64/cachyos-v4"
                 | "x86_64_v3/cachyos-v3"
                 | "x86_64_v4/cachyos-v4"
         )
@@ -283,6 +300,47 @@ where
     Ok(delivered)
 }
 
+/// Returns the embedded signature for one exact repository-relative package path.
+///
+/// The entire bounded database is validated before returning; malformed archives
+/// and duplicate package filenames are errors, including after the matched entry.
+pub fn package_embedded_signature(
+    bytes: &[u8],
+    db_path: &str,
+    package_path: &RepositoryPath,
+    limits: &ParseLimits,
+) -> Result<Option<Vec<u8>>, IndexError> {
+    package_embedded_signature_reader(&mut Cursor::new(bytes), db_path, package_path, limits)
+}
+
+/// Reader form used by bounded, cancellation-aware repository workers.
+pub fn package_embedded_signature_reader<R: Read>(
+    reader: &mut R,
+    db_path: &str,
+    package_path: &RepositoryPath,
+    limits: &ParseLimits,
+) -> Result<Option<Vec<u8>>, IndexError> {
+    let prefix = pacman_package_prefix(db_path)
+        .ok_or_else(|| IndexError::Deb822("unsupported Pacman database path".into()))?;
+    let mut signature = None;
+    let mut seen_filenames = HashSet::new();
+    scan_pacman_tar(reader, limits, &mut |_, desc| {
+        if !seen_filenames.insert(desc.filename.clone()) {
+            return Err(IndexError::DuplicateField(desc.filename));
+        }
+        if package_path
+            .as_str()
+            .strip_prefix(&prefix)
+            .and_then(|tail| tail.strip_prefix('/'))
+            == Some(desc.filename.as_str())
+        {
+            signature = desc.pgpsig;
+        }
+        Ok(())
+    })?;
+    Ok(signature)
+}
+
 fn scan_pacman_tar<R, F>(
     reader: &mut R,
     limits: &ParseLimits,
@@ -302,14 +360,12 @@ where
         magic_len += count;
     }
     let content_sha256 = {
-        let prefix = Cursor::new(magic[..magic_len].to_vec());
-        let chained: Chain<Cursor<Vec<u8>>, &mut R> = prefix.chain(&mut *reader);
+        let prefix = Cursor::new(&magic[..magic_len]);
+        let chained: Chain<Cursor<&[u8]>, &mut R> = prefix.chain(&mut *reader);
         let decoder: Box<dyn Read + '_> = if magic_len >= 2 && magic[..2] == [0x1f, 0x8b] {
             Box::new(flate2::read::MultiGzDecoder::new(BufReader::new(chained)))
-        } else if magic_len >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-            let stream = ruzstd::decoding::StreamingDecoder::new(BufReader::new(chained))
-                .map_err(|error| IndexError::Deb822(format!("zstd init failed: {error}")))?;
-            Box::new(stream)
+        } else if is_zstd_magic(&magic[..magic_len]) {
+            Box::new(MultiZstdDecoder::new(chained))
         } else if magic_len >= 6 && magic == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
             let stream = xz2::stream::Stream::new_stream_decoder(
                 XZ_DECODER_MEMORY_LIMIT,
@@ -338,18 +394,31 @@ where
 
         loop {
             if !read_exact_or_eof(&mut hashed, &mut header)? {
-                break;
+                return Err(IndexError::Deb822(
+                    "missing tar end-of-archive blocks".into(),
+                ));
             }
             if header.iter().all(|&byte| byte == 0) {
                 zero_blocks = zero_blocks.saturating_add(1);
                 if zero_blocks >= 2 {
-                    let mut drain = [0u8; 8192];
-                    while hashed.read(&mut drain)? != 0 {}
+                    if pax_path.is_some() {
+                        return Err(IndexError::Deb822("dangling tar path extension".into()));
+                    }
+                    while read_exact_or_eof(&mut hashed, &mut header)? {
+                        if header.iter().any(|&byte| byte != 0) {
+                            return Err(IndexError::Deb822(
+                                "nonzero data after tar terminator".into(),
+                            ));
+                        }
+                    }
                     break;
                 }
                 continue;
             }
-            zero_blocks = 0;
+            validate_tar_checksum(&header)?;
+            if zero_blocks != 0 {
+                return Err(IndexError::Deb822("incomplete tar terminator".into()));
+            }
             let size = parse_tar_octal(&header[124..136])
                 .ok_or_else(|| IndexError::InvalidSize("invalid tar octal size".into()))?;
             let typeflag = header[156];
@@ -398,9 +467,35 @@ where
 
         hashed.hasher.finalize()
     };
-    let mut tail = [0u8; 4096];
-    while reader.read(&mut tail)? != 0 {}
+    // All decoder output, frame trailers and compressed input have reached EOF.
     Ok(content_sha256)
+}
+
+fn validate_tar_checksum(header: &[u8; 512]) -> Result<(), IndexError> {
+    let field = &header[148..156];
+    let text = std::str::from_utf8(field)
+        .map_err(|_| IndexError::Deb822("invalid tar checksum encoding".into()))?
+        .trim_matches([' ', '\0']);
+    if text.is_empty() || !text.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        return Err(IndexError::Deb822("invalid tar checksum field".into()));
+    }
+    let expected = u64::from_str_radix(text, 8)
+        .map_err(|_| IndexError::Deb822("invalid tar checksum octal".into()))?;
+    let mut unsigned_sum = 0u64;
+    let mut signed_sum = 0i64;
+    for (offset, &byte) in header.iter().enumerate() {
+        let byte = if (148..156).contains(&offset) {
+            b' '
+        } else {
+            byte
+        };
+        unsigned_sum += u64::from(byte);
+        signed_sum += i64::from(byte as i8);
+    }
+    if expected != unsigned_sum && i64::try_from(expected).ok() != Some(signed_sum) {
+        return Err(IndexError::Deb822("tar header checksum mismatch".into()));
+    }
+    Ok(())
 }
 
 struct HashingBoundedReader<R> {
@@ -661,6 +756,9 @@ fn parse_desc_stanza(
 }
 
 #[cfg(test)]
+mod regression;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -668,7 +766,7 @@ mod tests {
     use flate2::write::GzEncoder;
     use std::io::Write;
 
-    fn tar_entry(path: &str, body: &[u8]) -> Vec<u8> {
+    pub(super) fn tar_entry(path: &str, body: &[u8]) -> Vec<u8> {
         let mut header = [0u8; 512];
         header[..path.len()].copy_from_slice(path.as_bytes());
         header[100..107].copy_from_slice(b"0000644");
@@ -692,7 +790,7 @@ mod tests {
         out
     }
 
-    fn sample_tar(with_pgpsig: bool) -> Vec<u8> {
+    pub(super) fn sample_tar(with_pgpsig: bool) -> Vec<u8> {
         let sig_b64 = base64::engine::general_purpose::STANDARD.encode(b"sample-openpgp-sig");
         let pgpsig_block = if with_pgpsig {
             format!("%PGPSIG%\n{sig_b64}\n\n")

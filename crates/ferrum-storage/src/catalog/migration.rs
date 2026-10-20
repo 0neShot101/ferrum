@@ -56,6 +56,7 @@ fn version_two(directory: &Path) -> PublicationIntent {
         .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
         .unwrap();
     for table in [
+        "capture_package_signatures",
         "derived_residency",
         "publication_metadata",
         "publication_artifacts",
@@ -81,10 +82,9 @@ fn version_two_upgrade_preserves_budget_reservations_private_run_and_trusted_flo
     let directory = tempfile::tempdir().unwrap();
     let intent = version_two(directory.path());
     let catalog = Catalog::open(directory.path(), 4, false).unwrap();
-    let (version, used, data, amount, total, uploaded, downloaded, run) = catalog
+    let (used, data, amount, total, uploaded, downloaded, run) = catalog
         .read(|connection| {
             Ok((
-                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
                 connection.query_row("SELECT used FROM remote_budget WHERE id=1", [], |row| {
                     row.get::<_, i64>(0)
                 })?,
@@ -122,8 +122,8 @@ fn version_two_upgrade_preserves_budget_reservations_private_run_and_trusted_flo
         })
         .unwrap();
     assert_eq!(
-        (version, used, data, amount, total, uploaded, downloaded),
-        (4, 777, 555, 99, 42, 111, 222)
+        (used, data, amount, total, uploaded, downloaded),
+        (777, 555, 99, 42, 111, 222)
     );
     assert_eq!(run, "6e11358885394eea8bc768badaaa89e9");
     let state = catalog
@@ -191,4 +191,84 @@ fn corrupt_or_unknown_version_two_catalog_is_rejected_before_any_migration_write
             .unwrap();
         assert_eq!((version, used, new_tables), (2, 777, 0));
     }
+}
+
+fn authority_rows(connection: &Connection) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'capture_package_signatures' ORDER BY name")
+        .unwrap();
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{name}\" ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let values = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (name, values)
+        })
+        .collect()
+}
+
+#[test]
+fn version_four_package_proof_upgrade_preserves_all_existing_authority_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    version_two(directory.path());
+    drop(Catalog::open(directory.path(), 4, false).unwrap());
+    let path = directory.path().join("state.sqlite");
+    let mut connection = Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+        .unwrap();
+    transaction
+        .execute_batch("DROP TABLE capture_package_signatures")
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO remote_provider(id,endpoint,bucket,region,package_prefix,checkpoint_prefix) VALUES(1,'https://storage.example.invalid','fixture','local','linux-packages/','linux-checkpoints/')",
+            [],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO legacy_provider_adoption(id,provider_id,adopted_at,operator,reason,disclosure) VALUES(1,1,123,'fixture operator','fixture historical adoption','LEGACY PROVIDER VERIFIED; NO DATA OR ALLOWANCE RESET')",
+            [],
+        )
+        .unwrap();
+    transaction.pragma_update(None, "user_version", 4).unwrap();
+    transaction.commit().unwrap();
+    let before = authority_rows(&connection);
+    drop(connection);
+
+    let catalog = Catalog::open(directory.path(), 4, false).unwrap();
+    let after = catalog
+        .read(|connection| Ok(authority_rows(connection)))
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "upgrade must not reset balances, reservations, provider ownership, capture coverage, audit history or publication floors"
+    );
+    drop(catalog);
+    let reopened = Catalog::open(directory.path(), 4, false).unwrap();
+    assert_eq!(
+        reopened
+            .read(|connection| Ok(authority_rows(connection)))
+            .unwrap(),
+        before,
+        "reopening the upgraded catalog must remain idempotent"
+    );
 }

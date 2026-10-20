@@ -148,6 +148,30 @@ pub enum SpoolError {
     Catalog(#[from] crate::catalog::CatalogError),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheProtection {
+    pub objects: u64,
+    pub bytes: u64,
+}
+impl CacheProtection {
+    fn include(&mut self, size: u64) {
+        self.objects = self.objects.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(size);
+    }
+}
+
+/// Protected categories are disjoint, in metadata/pinned/staged/reader order.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CachePreview {
+    pub eligible: CacheProtection,
+    pub pinned: CacheProtection,
+    pub metadata: CacheProtection,
+    pub staged: CacheProtection,
+    pub live_reader: CacheProtection,
+    pub evicting: CacheProtection,
+    pub sampled_at: i64,
+}
+
 /// Catalog connections close before the process lock is released. Every live
 /// file/stream retains this owner even if the last Spool handle is dropped.
 pub(crate) struct SpoolLifetime {
@@ -303,6 +327,8 @@ pub struct Spool(Arc<SpoolInner>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageUsage {
     pub objects: Accounting,
+    pub metadata_installed_bytes: u64,
+    pub metadata_reserved_bytes: u64,
     pub catalog_bytes: u64,
     pub catalog_reserved_bytes: u64,
     pub managed_bytes: u64,
@@ -409,6 +435,8 @@ impl Spool {
             .ok_or(SpoolError::AdmissionClosed)?;
         Ok(StorageUsage {
             objects,
+            metadata_installed_bytes: ledger.metadata_installed(),
+            metadata_reserved_bytes: ledger.metadata_reserved(),
             catalog_bytes,
             catalog_reserved_bytes,
             managed_bytes,
@@ -591,6 +619,39 @@ impl Spool {
         &self.0.root
     }
 
+    pub fn durable_limits(&self) -> Option<DurableSpoolConfig> {
+        self.0.durable.clone()
+    }
+
+    pub fn preview_evictable_cache(&self) -> Result<CachePreview, SpoolError> {
+        let registry = lock_unpoisoned(&self.0.installed);
+        let mut preview = CachePreview {
+            sampled_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|v| i64::try_from(v.as_secs()).ok())
+                .ok_or_else(|| invalid_input("clock before epoch"))?,
+            ..CachePreview::default()
+        };
+        for (identity, entry) in &registry.entries {
+            let category = if entry.class.metadata() {
+                &mut preview.metadata
+            } else if entry.evicting {
+                &mut preview.evicting
+            } else if entry.pins != [0; 3] || entry.generation_references != 0 {
+                &mut preview.pinned
+            } else if self.0.catalog().is_some() && !entry.durable && !entry.reconstructible {
+                &mut preview.staged
+            } else if !entry.object.exclusive_to_owner() {
+                &mut preview.live_reader
+            } else {
+                &mut preview.eligible
+            };
+            category.include(identity.size);
+        }
+        Ok(preview)
+    }
+
     pub(crate) fn durable_catalog(&self) -> Result<&Catalog, SpoolError> {
         self.0.catalog().ok_or(SpoolError::AdmissionClosed)
     }
@@ -652,6 +713,157 @@ impl Spool {
             return Ok(false);
         }
         evict_identity_locked(&self.0, &mut registry, identity, false)
+    }
+
+    /// Evicts all unpinned, unreferenced cached package objects from the local
+    /// spool. Active generations, pinned fills/uploads, metadata, and objects
+    /// with live readers are never removed. Returns `(evicted_objects, freed_bytes)`.
+    pub fn clear_evictable_cache(&self) -> Result<(u64, u64), SpoolError> {
+        let has_catalog = self.0.catalog().is_some();
+        // Freeze the starting set once: newly arriving cache entries are not
+        // chased indefinitely. Only identities are retained, never object leases.
+        let candidates: Vec<ObjectIdentity> = {
+            let registry = lock_unpoisoned(&self.0.installed);
+            self.0.ensure_admission()?;
+            registry
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.class.metadata()
+                        && if has_catalog {
+                            entry.evictable()
+                        } else {
+                            !entry.evicting
+                                && entry.object.exclusive_to_owner()
+                                && entry.pins == [0; 3]
+                                && entry.generation_references == 0
+                        }
+                })
+                .map(|(identity, _)| *identity)
+                .collect()
+        };
+        let mut evicted = 0u64;
+        let mut freed = 0u64;
+        for batch in candidates.chunks(32) {
+            let mut registry = lock_unpoisoned(&self.0.installed);
+            self.0.ensure_admission()?;
+            for &identity in batch {
+                if has_catalog {
+                    if evict_identity_locked(&self.0, &mut registry, identity, false)? {
+                        evicted += 1;
+                        freed = freed.saturating_add(identity.size);
+                    }
+                } else {
+                    let eligible = registry.entries.get(&identity).is_some_and(|entry| {
+                        !entry.evicting
+                            && entry.object.exclusive_to_owner()
+                            && entry.pins == [0; 3]
+                            && entry.generation_references == 0
+                            && !entry.class.metadata()
+                    });
+                    if !eligible {
+                        continue;
+                    }
+                    if let Some(entry) = registry.entries.get(&identity) {
+                        let path = entry.object.path();
+                        fs::remove_file(path)?;
+                        writer::fsync_directory(
+                            path.parent()
+                                .ok_or_else(|| invalid_input("object has no parent"))?,
+                        )?;
+                    }
+                    let Some(entry) = registry.entries.remove(&identity) else {
+                        continue;
+                    };
+                    let metadata = entry.class.metadata();
+                    drop(entry);
+                    lock_unpoisoned(&self.0.lifetime.ledger)
+                        .remove_installed(identity.size, metadata)?;
+                    registry.policy.remove(&identity);
+                    evicted += 1;
+                    freed = freed.saturating_add(identity.size);
+                }
+            }
+        }
+        Ok((evicted, freed))
+    }
+
+    /// One bounded local maintenance batch, reporting actual removals. A
+    /// shortfall is not an error: protected objects stay resident. Durable
+    /// mode uses the existing CLOCK eligibility and catalog eviction path.
+    pub fn evict_cache_batch(
+        &self,
+        max_objects: usize,
+        remaining_target_bytes: Option<u64>,
+    ) -> Result<(u64, u64, bool), SpoolError> {
+        let maximum = max_objects.min(32);
+        let target = remaining_target_bytes.unwrap_or(u64::MAX);
+        if target == 0 || maximum == 0 {
+            return Ok((0, 0, false));
+        }
+        let mut registry = lock_unpoisoned(&self.0.installed);
+        self.0.ensure_admission()?;
+        let mut evicted = 0u64;
+        let mut freed = 0u64;
+        if self.0.catalog().is_some() {
+            let eligible = registry
+                .entries
+                .values()
+                .filter(|entry| entry.evictable())
+                .fold(0u64, |bytes, entry| {
+                    bytes.saturating_add(entry.object.size())
+                });
+            let mut scan = registry.policy.begin_scan(target, eligible);
+            while evicted < maximum as u64 && freed < target {
+                let Some(identity) = registry.policy.next_candidate(&mut scan) else {
+                    return Ok((evicted, freed, false));
+                };
+                if evict_identity_locked(&self.0, &mut registry, identity, false)? {
+                    evicted += 1;
+                    freed = freed.saturating_add(identity.size);
+                } else {
+                    registry.policy.skipped(&identity);
+                }
+            }
+        } else {
+            // Fixture files have no durable receipt. Their existing clear-cache
+            // contract still requires exclusive readers and no metadata/pins.
+            let candidates: Vec<_> = registry
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.evicting
+                        && entry.object.exclusive_to_owner()
+                        && entry.pins == [0; 3]
+                        && entry.generation_references == 0
+                        && !entry.class.metadata()
+                })
+                .take(maximum)
+                .map(|(identity, _)| *identity)
+                .collect();
+            for identity in candidates {
+                if freed >= target {
+                    break;
+                }
+                if let Some(entry) = registry.entries.get(&identity) {
+                    let path = entry.object.path();
+                    fs::remove_file(path)?;
+                    writer::fsync_directory(
+                        path.parent()
+                            .ok_or_else(|| invalid_input("object has no parent"))?,
+                    )?;
+                }
+                if let Some(entry) = registry.entries.remove(&identity) {
+                    drop(entry);
+                    lock_unpoisoned(&self.0.lifetime.ledger)
+                        .remove_installed(identity.size, false)?;
+                    registry.policy.remove(&identity);
+                    evicted += 1;
+                    freed = freed.saturating_add(identity.size);
+                }
+            }
+        }
+        Ok((evicted, freed, evicted == maximum as u64 && freed < target))
     }
 
     pub(crate) fn discard_collected_package(

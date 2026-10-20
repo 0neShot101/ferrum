@@ -144,6 +144,25 @@ pub struct BudgetUsage {
     pub certain: bool,
 }
 
+/// A single read-only ledger snapshot. Reservations are reported, never settled.
+#[derive(Clone, Debug)]
+pub struct BudgetDiagnostics {
+    pub period: i64,
+    pub high_time: i64,
+    pub download: u64,
+    pub package_download: u64,
+    pub certain: bool,
+    pub storage: u64,
+    pub package_storage: u64,
+    pub reservation_count: u64,
+    pub reserved_download: u64,
+    pub reserved_package_download: u64,
+    pub escrow_count: u64,
+    pub escrow_bytes: u64,
+    pub forbidden: bool,
+    pub provider: Option<ProviderIdentity>,
+}
+
 #[derive(Clone, Default)]
 struct LedgerClock {
     #[cfg(test)]
@@ -183,9 +202,25 @@ fn month(seconds: i64) -> Result<i64, CatalogError> {
 }
 
 fn authorize_namespace(connection: &rusqlite::Connection, key: &str) -> Result<(), CatalogError> {
+    let prefixes: Option<(String, String)> = connection
+        .query_row(
+            "SELECT package_prefix,checkpoint_prefix FROM remote_provider WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (pkg, chk) =
+        prefixes
+            .as_ref()
+            .map_or(("linux-packages/", "linux-checkpoints/"), |(p, c)| {
+                (
+                    p.split_once("_ferrum-b07/").map_or(p.as_str(), |(b, _)| b),
+                    c.split_once("_ferrum-b07/").map_or(c.as_str(), |(b, _)| b),
+                )
+            });
     let suffix = key
-        .strip_prefix("linux-packages/")
-        .or_else(|| key.strip_prefix("linux-checkpoints/"))
+        .strip_prefix(pkg)
+        .or_else(|| key.strip_prefix(chk))
         .ok_or(CatalogError::InvalidState)?;
     let binding: Option<Option<String>> = connection
         .query_row(
@@ -861,6 +896,47 @@ impl BudgetLedger {
                     })
                 },
             )?)
+        })?)
+    }
+    /// Does not initialize, roll periods, advance time, or reconcile reservations.
+    pub fn inspect_detailed(spool: &Spool) -> Result<BudgetDiagnostics, BudgetError> {
+        Ok(spool.durable_catalog()?.read(|connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let mut snapshot = transaction.query_row(
+                "SELECT period,high_time,used,data_used,certain,
+                 COALESCE((SELECT total FROM remote_storage_totals WHERE id=1),0),
+                 COALESCE((SELECT data FROM remote_storage_totals WHERE id=1),0),
+                 COALESCE((SELECT forbidden FROM remote_health WHERE id=1),0)
+                 FROM remote_budget WHERE id=1", [], |row| Ok(BudgetDiagnostics {
+                    period: row.get(0)?, high_time: row.get(1)?,
+                    download: crate::catalog::read_unsigned(row, 2)?,
+                    package_download: crate::catalog::read_unsigned(row, 3)?,
+                    certain: row.get(4)?,
+                    storage: crate::catalog::read_unsigned(row, 5)?,
+                    package_storage: crate::catalog::read_unsigned(row, 6)?,
+                    forbidden: row.get(7)?,
+                    reservation_count: 0, reserved_download: 0,
+                    reserved_package_download: 0, escrow_count: 0, escrow_bytes: 0,
+                    provider: None,
+                }),
+            )?;
+            (snapshot.reservation_count, snapshot.reserved_download, snapshot.reserved_package_download) =
+                transaction.query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(amount),0),COALESCE(SUM(CASE WHEN class=0 THEN amount ELSE 0 END),0) FROM download_reservations",
+                    [], |row| Ok((
+                        crate::catalog::read_unsigned(row, 0)?,
+                        crate::catalog::read_unsigned(row, 1)?,
+                        crate::catalog::read_unsigned(row, 2)?,
+                    )))?;
+            (snapshot.escrow_count, snapshot.escrow_bytes) = transaction.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(r.amount),0) FROM readback_escrow e JOIN download_reservations r ON r.id=e.id",
+                [], |row| Ok((
+                    crate::catalog::read_unsigned(row, 0)?,
+                    crate::catalog::read_unsigned(row, 1)?,
+                )))?;
+            snapshot.provider = ProviderIdentity::read(&transaction)?;
+            transaction.commit()?;
+            Ok(snapshot)
         })?)
     }
     pub(crate) fn spool(&self) -> &Spool {

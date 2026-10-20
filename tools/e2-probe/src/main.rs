@@ -109,10 +109,16 @@ async fn interrupted() -> Result<()> {
 }
 
 async fn execute(arguments: Arguments) -> Result<()> {
+    let target = config::load_target(&arguments.environment)?;
     let journal = if arguments.cleanup || arguments.inspect {
-        journal::Journal::open(&arguments.directory)?
+        journal::Journal::open(&arguments.directory, &target)?
     } else {
-        journal::Journal::create(&arguments.directory, random_prefix()?, arguments.profile)?
+        journal::Journal::create(
+            &arguments.directory,
+            random_prefix()?,
+            arguments.profile,
+            &target,
+        )?
     };
     let lock_path = arguments.directory.join("active.lock");
     let mut options = OpenOptions::new();
@@ -126,7 +132,7 @@ async fn execute(arguments: Arguments) -> Result<()> {
     lock.sync_all()?;
     journal::sync_directory(&arguments.directory)?;
     let result = async {
-        let wire = wire::Wire::new(journal.clone());
+        let wire = wire::Wire::new(journal.clone(), target);
         let client = config::client(&arguments.environment, wire.clone())?;
         let probe = probe::Probe::new(client, wire.clone(), journal.clone(), &arguments.directory)?;
         if arguments.inspect {

@@ -1,7 +1,7 @@
 mod inspection;
 
 use crate::{
-    config::{self, BUCKET, BudgetProfile, CHECKPOINT_MAX, CONTROL, LARGE, MIB, PART},
+    config::{self, BudgetProfile, CHECKPOINT_MAX, CONTROL, LARGE, MIB, PART},
     journal::{self, SharedJournal},
     wire::Wire,
 };
@@ -42,6 +42,7 @@ pub(crate) struct Probe {
     client: Client,
     wire: Wire,
     journal: SharedJournal,
+    bucket: String,
     prefix: String,
     payload: PathBuf,
     checkpoint_prefix: Option<String>,
@@ -90,6 +91,7 @@ impl Probe {
         journal: SharedJournal,
         directory: &Path,
     ) -> Result<Self> {
+        let bucket = journal::lock(&journal)?.manifest.bucket.clone();
         let prefix = journal::lock(&journal)?.manifest.prefix.clone();
         let checkpoint_prefix = journal::lock(&journal)?.manifest.checkpoint_prefix.clone();
         let qualification =
@@ -99,6 +101,7 @@ impl Probe {
             client,
             wire,
             journal,
+            bucket,
             prefix,
             checkpoint_prefix,
             qualification,
@@ -246,7 +249,7 @@ impl Probe {
                 0,
                 CONTROL,
                 cleanup,
-                self.client.head_object().bucket(BUCKET).key(key).send(),
+                self.client.head_object().bucket(&self.bucket).key(key).send(),
             )
             .await
         {
@@ -281,7 +284,7 @@ impl Probe {
     ) -> Result<()> {
         config::validate_owned_key(&self.prefix, self.checkpoint_prefix.as_deref(), key)?;
         let started = Instant::now();
-        let mut request = self.client.get_object().bucket(BUCKET).key(key);
+        let mut request = self.client.get_object().bucket(&self.bucket).key(key);
         if let Some((start, end)) = range {
             request = request.range(format!("bytes={start}-{end}"));
         }
@@ -378,7 +381,7 @@ impl Probe {
                 false,
                 self.client
                     .put_object()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(&key)
                     .metadata("ferrum-probe-run", self.marker())
                     .if_none_match("*")
@@ -419,7 +422,7 @@ impl Probe {
                 false,
                 self.client
                     .put_object()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(&key)
                     .if_none_match("*")
                     .metadata("ferrum-probe-run", self.marker())
@@ -449,7 +452,7 @@ impl Probe {
             false,
             self.client
                 .put_object()
-                .bucket(BUCKET)
+                .bucket(&self.bucket)
                 .key(&key)
                 .if_match(&token)
                 .metadata("ferrum-probe-run", self.marker())
@@ -479,7 +482,7 @@ impl Probe {
                 false,
                 self.client
                     .put_object()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(&key)
                     .if_match(token)
                     .metadata("ferrum-probe-run", self.marker())
@@ -504,7 +507,7 @@ impl Probe {
                 0,
                 CONTROL,
                 false,
-                self.client.get_object().bucket(BUCKET).key(key).send(),
+                self.client.get_object().bucket(&self.bucket).key(key).send(),
             )
             .await;
         ensure!(
@@ -531,7 +534,7 @@ impl Probe {
                 false,
                 self.client
                     .create_multipart_upload()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(key)
                     .metadata("ferrum-probe-run", self.marker())
                     .send(),
@@ -562,7 +565,7 @@ impl Probe {
                 false,
                 self.client
                     .upload_part()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(key)
                     .upload_id(id)
                     .part_number(number)
@@ -597,7 +600,7 @@ impl Probe {
                     cleanup,
                     self.client
                         .list_parts()
-                        .bucket(BUCKET)
+                        .bucket(&self.bucket)
                         .key(key)
                         .upload_id(id)
                         .max_parts(2)
@@ -669,7 +672,7 @@ impl Probe {
                 false,
                 self.client
                     .complete_multipart_upload()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(&key)
                     .upload_id(&id)
                     .if_none_match("*")
@@ -738,7 +741,7 @@ impl Probe {
                 cleanup,
                 self.client
                     .abort_multipart_upload()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(key)
                     .upload_id(id)
                     .send(),
@@ -757,7 +760,7 @@ impl Probe {
                 cleanup,
                 self.client
                     .list_parts()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .key(key)
                     .upload_id(id)
                     .max_parts(1)
@@ -808,7 +811,7 @@ impl Probe {
                     cleanup,
                     self.client
                         .list_multipart_uploads()
-                        .bucket(BUCKET)
+                        .bucket(&self.bucket)
                         .prefix(&self.prefix)
                         .max_uploads(2)
                         .set_key_marker(key_marker.clone())
@@ -867,7 +870,7 @@ impl Probe {
                     false,
                     self.client
                         .list_objects_v2()
-                        .bucket(BUCKET)
+                        .bucket(&self.bucket)
                         .prefix(&self.prefix)
                         .max_keys(2)
                         .set_continuation_token(continuation.clone())
@@ -980,7 +983,7 @@ impl Probe {
         let request = self
             .client
             .put_object()
-            .bucket(BUCKET)
+            .bucket(&self.bucket)
             .key(key)
             .metadata("ferrum-probe-run", self.marker())
             .content_length(bytes.len() as i64)
@@ -1028,7 +1031,7 @@ impl Probe {
                 0,
                 CHECKPOINT_MAX,
                 cleanup,
-                self.client.get_object().bucket(BUCKET).key(key).send(),
+                self.client.get_object().bucket(&self.bucket).key(key).send(),
             )
             .await?;
         ensure!(
@@ -1217,7 +1220,7 @@ impl Probe {
                 0,
                 4097,
                 false,
-                invalid.get_object().bucket(BUCKET).key(&key).send(),
+                invalid.get_object().bucket(&self.bucket).key(&key).send(),
             )
             .await;
         ensure!(
@@ -1243,7 +1246,7 @@ impl Probe {
                     0,
                     4097,
                     false,
-                    self.client.get_object().bucket(BUCKET).key(&key).send(),
+                    self.client.get_object().bucket(&self.bucket).key(&key).send(),
                 )
                 .await;
             ensure!(
@@ -1401,7 +1404,7 @@ impl Probe {
                     true,
                     self.client
                         .delete_object()
-                        .bucket(BUCKET)
+                        .bucket(&self.bucket)
                         .key(&key)
                         .if_match(token)
                         .send(),

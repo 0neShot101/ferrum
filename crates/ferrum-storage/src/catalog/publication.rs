@@ -165,16 +165,12 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO suite_checkpoints(repository,suite) VALUES(?1,?2)",
-                params![key.repository(), key.suite()],
-            )?;
+            super::checkpoint::ensure(&transaction, &key)?;
             let state = super::checkpoint::load(&transaction, &key)?;
             if now < 0
                 || state.observed_at.is_some_and(|old| now < old)
-                || state
-                    .observed_date
-                    .is_some_and(|old| date < old || (date == old && state.observed_content.as_ref() != Some(&content)))
+                || (!key.uses_transport_candidate_metadata()
+                    && state.observed_date.is_some_and(|old| date < old || (date == old && state.observed_content.as_ref() != Some(&content))))
             {
                 return Err(CatalogError::InvalidState);
             }
@@ -219,10 +215,7 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO suite_checkpoints(repository,suite) VALUES(?1,?2)",
-                params![key.repository(), key.suite()],
-            )?;
+            super::checkpoint::ensure(&transaction, &key)?;
             transaction.execute(
                 "INSERT INTO suite_publication(repository,suite,last_error,next_check_at) VALUES(?1,?2,?3,?4) ON CONFLICT(repository,suite) DO UPDATE SET last_error=excluded.last_error,next_check_at=excluded.next_check_at",
                 params![key.repository(), key.suite(), error, next],
@@ -290,11 +283,13 @@ fn activate(
     if confirmed_at.is_some_and(|confirmation| {
         confirmation < 0
             || confirmation > now
-            || state.observed_date.is_some_and(|date| {
-                intent.release_date < date
-                    || (intent.release_date == date
-                        && state.observed_content.as_ref() != Some(&intent.release_content_sha256))
-            })
+            || (!key.uses_transport_candidate_metadata()
+                && state.observed_date.is_some_and(|date| {
+                    intent.release_date < date
+                        || (intent.release_date == date
+                            && state.observed_content.as_ref()
+                                != Some(&intent.release_content_sha256))
+                }))
             || state.observed_at.is_some_and(|old| confirmation < old)
     }) {
         return Err(CatalogError::InvalidState);

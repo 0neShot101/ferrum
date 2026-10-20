@@ -147,8 +147,8 @@ impl PrivateStore {
         let wire = Wire::with_inner(config.clone(), journal.clone(), inner);
         let sdk = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::v2026_01_12())
-            .region(Region::new(config::REGION))
-            .endpoint_url(config::ENDPOINT)
+            .region(Region::new(config.region.clone()))
+            .endpoint_url(&config.endpoint)
             .force_path_style(true)
             .credentials_provider(Credentials::new(
                 "TESTACCESS",
@@ -227,6 +227,7 @@ pub struct StatefulRemote(Arc<Mutex<RemoteState>>);
 
 #[derive(Default)]
 struct RemoteState {
+    target: Option<(String, String)>,
     objects: std::collections::BTreeMap<String, (Vec<u8>, String)>,
     faults: std::collections::BTreeMap<String, u16>,
     requests: Vec<(String, String)>,
@@ -268,8 +269,12 @@ impl StatefulRemote {
 }
 
 fn remote_key(key: &str) -> bool {
-    key.len() <= 4096
-        && (key.starts_with("linux-packages/") || key.starts_with("linux-checkpoints/"))
+    !key.is_empty()
+        && key.len() <= 4096
+        && !key.starts_with('/')
+        && !key.ends_with('/')
+        && !key.contains("//")
+        && key.contains('/')
         && key
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
@@ -343,14 +348,28 @@ impl HttpConnector for StatefulRemote {
             const MAX_OBJECTS: usize = 20_000;
             let url = url::Url::parse(request.uri())
                 .map_err(|_| remote_error("invalid local SDK target"))?;
-            if url.scheme() != "https" || url.host_str() != Some("s3.us-central-1.idrivee2.com") {
-                return Err(remote_error("local transport refuses arbitrary endpoint"));
-            }
-            let key = url
+            let host = match url.host() {
+                Some(url::Host::Domain(domain))
+                    if url.scheme() == "https"
+                        && url.port().is_none()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.fragment().is_none()
+                        && domain.contains('.')
+                        && domain.split('.').all(config::valid_label) =>
+                {
+                    domain.to_owned()
+                }
+                _ => return Err(remote_error("local transport refuses arbitrary endpoint")),
+            };
+            let (bucket, key) = url
                 .path()
-                .strip_prefix("/s3-andrew/")
-                .ok_or_else(|| remote_error("local transport refuses arbitrary bucket"))?
-                .to_owned();
+                .strip_prefix('/')
+                .and_then(|path| path.split_once('/'))
+                .filter(|(bucket, _)| config::valid_bucket(bucket))
+                .ok_or_else(|| remote_error("local transport refuses arbitrary bucket"))?;
+            let bucket = bucket.to_owned();
+            let key = key.to_owned();
             let method = request.method().to_owned();
             let operation = match method.as_str() {
                 "PUT" => "PutObject",
@@ -373,6 +392,13 @@ impl HttpConnector for StatefulRemote {
                     .0
                     .lock()
                     .map_err(|_| remote_error("local state poisoned"))?;
+                if let Some((expected_host, expected_bucket)) = &state.target {
+                    if expected_host != &host || expected_bucket != &bucket {
+                        return Err(remote_error("local transport target changed"));
+                    }
+                } else {
+                    state.target = Some((host, bucket));
+                }
                 if state.requests.len() >= 100_000 {
                     return Err(remote_error("local request trace ceiling"));
                 }

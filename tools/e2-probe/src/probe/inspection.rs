@@ -1,4 +1,4 @@
-use super::{BUCKET, CONTROL, Failure, Probe, Result, journal, json};
+use super::{CONTROL, Failure, Probe, Result, journal, json};
 
 impl Probe {
     /// Two read-only controls using the existing durable allowance, never a new probe batch.
@@ -9,7 +9,7 @@ impl Probe {
                 0,
                 CONTROL,
                 false,
-                self.client.get_bucket_versioning().bucket(BUCKET).send(),
+                self.client.get_bucket_versioning().bucket(&self.bucket).send(),
             )
             .await;
         match versioning {
@@ -36,7 +36,7 @@ impl Probe {
                 false,
                 self.client
                     .get_bucket_lifecycle_configuration()
-                    .bucket(BUCKET)
+                    .bucket(&self.bucket)
                     .send(),
             )
             .await;

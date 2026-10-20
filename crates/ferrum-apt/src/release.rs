@@ -270,11 +270,19 @@ pub struct ReleaseEntry {
     pub sha512: Option<Sha512Digest>,
 }
 
-/// Authenticated Release descriptor.
+/// Trust carried by the metadata source, independent of its package checksums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataAuthority {
+    Signed,
+    TransportCandidate,
+}
+
+/// Repository metadata descriptor. Candidate checksums never authenticate packages.
 #[derive(Debug, Clone)]
 pub struct Release {
     pub origin: String,
-    pub suite: String,
+    /// Optional advertised Suite; identity policies decide whether it is required.
+    pub suite: Option<String>,
     pub codename: String,
     pub label: Option<String>,
     pub version: Option<String>,
@@ -287,6 +295,7 @@ pub struct Release {
     entries: Vec<ReleaseEntry>,
     entry_index: HashMap<RepositoryPath, usize>,
     content_sha256: Sha256Digest,
+    authority: MetadataAuthority,
 }
 
 /// Fields whose repetition would let a second copy override the first in a lenient
@@ -348,7 +357,7 @@ impl Release {
             .map_err(|name| ReleaseError::DuplicateField(name.to_owned()))?;
 
         let origin = required_scalar(&paragraph, "Origin")?;
-        let suite = required_scalar(&paragraph, "Suite")?;
+        let suite = optional_scalar(&paragraph, "Suite")?;
         let codename = required_scalar(&paragraph, "Codename")?;
         let label = optional_scalar(&paragraph, "Label")?;
         let version = optional_scalar(&paragraph, "Version")?;
@@ -440,13 +449,16 @@ impl Release {
             entries,
             entry_index,
             content_sha256,
+            authority: MetadataAuthority::Signed,
         })
     }
 
-    /// Constructs an authenticated descriptor for a verified Pacman suite database.
-    pub fn for_pacman(
+    /// Constructs profile metadata after its caller establishes the indicated trust.
+    /// Pacman databases must remain TransportCandidate even with a signed canary.
+    pub fn for_repository(
         origin: impl Into<String>,
         suite: impl Into<String>,
+        authority: MetadataAuthority,
         date: UnixTime,
         content_sha256: Sha256Digest,
         entries: Vec<ReleaseEntry>,
@@ -464,7 +476,7 @@ impl Release {
         Ok(Self {
             origin: origin.into(),
             codename: suite.clone(),
-            suite,
+            suite: Some(suite),
             label: None,
             version: None,
             architectures: vec!["x86_64".into(), "aarch64".into()],
@@ -476,7 +488,12 @@ impl Release {
             entries,
             entry_index,
             content_sha256,
+            authority,
         })
+    }
+
+    pub fn authority(&self) -> MetadataAuthority {
+        self.authority
     }
 
     /// Every advertised file: SHA256 first, then SHA512-, SHA1- and MD5Sum-only
@@ -666,7 +683,7 @@ mod tests {
     fn parses_fixture_release_with_trailing_acquire_by_hash() {
         let release = Release::parse(FIXTURE_RELEASE, &ParseLimits::default()).expect("fixture");
         assert_eq!(release.origin, "FerrumTest");
-        assert_eq!(release.suite, "ferrum-test");
+        assert_eq!(release.suite.as_deref(), Some("ferrum-test"));
         assert_eq!(release.codename, "ferrum-test");
         assert_eq!(release.label.as_deref(), Some("FerrumTest"));
         assert_eq!(release.architectures, ["amd64"]);

@@ -98,6 +98,7 @@ impl Journal {
         directory: &Path,
         prefix: String,
         profile: BudgetProfile,
+        target: &config::ProbeTarget,
     ) -> Result<SharedJournal> {
         config::validate_prefix(&prefix)?;
         std::fs::create_dir(directory)?;
@@ -122,7 +123,7 @@ impl Journal {
                 budget_profile: profile,
                 faults: BTreeMap::new(),
                 prefix,
-                bucket: config::BUCKET.to_owned(),
+                bucket: target.bucket.clone(),
                 upload_reserved: 0,
                 download_reserved: 0,
                 objects: BTreeMap::new(),
@@ -137,11 +138,11 @@ impl Journal {
         };
         journal.save()?;
         let (upload_limit, download_limit, cleanup_reserve) = profile.limits();
-        journal.event(json!({"kind":"contract", "sdk":"aws-sdk-s3=1.152.0", "rust":"1.99.1", "endpoint":config::ENDPOINT, "region":config::REGION, "bucket":config::BUCKET, "prefix":journal.manifest.prefix, "checkpoint_prefix":journal.manifest.checkpoint_prefix, "budget_profile":profile, "credential_profile":"shared_NONISOLATED", "permission_isolation_claim":false, "path_style":true, "behavior_version":"2026-01-12", "request_checksum":"WhenRequired", "response_checksum":"WhenRequired", "sdk_max_attempts":1, "application_retries":0, "upload_limit":upload_limit, "download_limit":download_limit, "cleanup_reserve":cleanup_reserve, "accounting":"full body ceilings plus 64KiB allowance per direction per request; reservations never refunded, even on timeout or cleanup restart; not a provider billing meter"}))?;
+        journal.event(json!({"kind":"contract", "sdk":"aws-sdk-s3=1.152.0", "rust":"1.99.1", "endpoint":target.endpoint, "region":target.region, "bucket":target.bucket, "prefix":journal.manifest.prefix, "checkpoint_prefix":journal.manifest.checkpoint_prefix, "budget_profile":profile, "credential_profile":"shared_NONISOLATED", "permission_isolation_claim":false, "path_style":true, "behavior_version":"2026-01-12", "request_checksum":"WhenRequired", "response_checksum":"WhenRequired", "sdk_max_attempts":1, "application_retries":0, "upload_limit":upload_limit, "download_limit":download_limit, "cleanup_reserve":cleanup_reserve, "accounting":"full body ceilings plus 64KiB allowance per direction per request; reservations never refunded, even on timeout or cleanup restart; not a provider billing meter"}))?;
         Ok(Arc::new(Mutex::new(journal)))
     }
 
-    pub(crate) fn open(directory: &Path) -> Result<SharedJournal> {
+    pub(crate) fn open(directory: &Path, target: &config::ProbeTarget) -> Result<SharedJournal> {
         let metadata = std::fs::symlink_metadata(directory)?;
         ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -158,7 +159,7 @@ impl Journal {
         );
         let manifest: Manifest = serde_json::from_reader(File::open(path)?)?;
         ensure!(
-            manifest.bucket == config::BUCKET,
+            manifest.bucket == target.bucket,
             "manifest bucket mismatch"
         );
         match (manifest.schema_version, manifest.budget_profile) {
@@ -424,6 +425,15 @@ mod tests {
     use super::*;
     use crate::config::MIB;
 
+    fn default_target() -> config::ProbeTarget {
+        config::ProbeTarget {
+            endpoint: config::ENDPOINT.to_owned(),
+            host: "s3.us-east-1.amazonaws.com".to_owned(),
+            region: config::REGION.to_owned(),
+            bucket: config::BUCKET.to_owned(),
+        }
+    }
+
     #[test]
     fn cleanup_keeps_reserved_headroom_and_restart_never_resets_usage() -> Result<()> {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -432,7 +442,8 @@ mod tests {
             std::process::id()
         ));
         let prefix = format!("{}0123456789abcdef0123456789abcdef/", config::ROOT);
-        let journal = Journal::create(&directory, prefix, BudgetProfile::LegacyBlob)?;
+        let target = default_target();
+        let journal = Journal::create(&directory, prefix, BudgetProfile::LegacyBlob, &target)?;
         {
             let mut journal = lock(&journal)?;
             journal.reserve(90 * MIB, 0, false)?;
@@ -451,7 +462,7 @@ mod tests {
             fields.remove(field);
         }
         std::fs::write(&manifest_path, serde_json::to_vec(&old)?)?;
-        let journal = Journal::open(&directory)?;
+        let journal = Journal::open(&directory, &target)?;
         {
             let mut journal = lock(&journal)?;
             assert_eq!(journal.manifest.upload_reserved, total);
@@ -480,7 +491,8 @@ mod tests {
         ));
         let prefix = format!("{}0123456789abcdef0123456789abcdef/", config::ROOT);
         let checkpoint = format!("{}state", config::checkpoint_prefix(&prefix)?);
-        let journal = Journal::create(&directory, prefix, BudgetProfile::Qualification)?;
+        let target = default_target();
+        let journal = Journal::create(&directory, prefix, BudgetProfile::Qualification, &target)?;
         {
             let mut journal = lock(&journal)?;
             journal.reserve(239 * MIB, 495 * MIB, false)?;
@@ -509,7 +521,7 @@ mod tests {
         }
         let total = lock(&journal)?.manifest.upload_reserved;
         drop(journal);
-        let journal = Journal::open(&directory)?;
+        let journal = Journal::open(&directory, &target)?;
         {
             let mut journal = lock(&journal)?;
             assert_eq!(

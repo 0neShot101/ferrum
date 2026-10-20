@@ -16,14 +16,16 @@ impl S3Store {
         let store = self.production()?;
         match identity {
             OperationIdentity::PrivateQualificationCleanup
-                if store
-                    .config
-                    .package_prefix
-                    .starts_with("linux-packages/_ferrum-b07/")
+                if store.config.package_prefix.contains("/_ferrum-b07/")
                     && (key.starts_with(store.config.package_prefix.as_ref())
                         || key.starts_with(store.config.checkpoint_prefix.as_ref())) =>
             {
-                let suffix = namespace_suffix(identity, key)?;
+                let suffix = namespace_suffix(
+                    identity,
+                    key,
+                    &store.config.package_prefix,
+                    &store.config.checkpoint_prefix,
+                )?;
                 validate_suffix(identity, suffix)?;
             }
             OperationIdentity::OfflineMaintenance => {

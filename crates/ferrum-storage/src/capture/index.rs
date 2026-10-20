@@ -1,5 +1,6 @@
-//! Signed-index authority shared by capture, recovery and generation publishers.
-//! Only hash-checked complete streams promote staging rows into lookup authority.
+//! Bounded package identity indexes shared by capture, recovery and publishers.
+//! Hash-checked Pacman rows remain candidates; only each package's signature can
+//! promote them to capture authority. APT/RPM retain their signed metadata chain.
 use super::CaptureError;
 use crate::{
     Spool, VerifiedObject,
@@ -49,7 +50,7 @@ pub(super) fn reconciliation_gate(spool: &Spool) -> Result<Arc<Semaphore>, Captu
     Ok(gate)
 }
 
-async fn index_owner(
+pub(super) async fn index_owner(
     spool: &Spool,
     deadline: Instant,
     cancel: &CancellationToken,
@@ -112,6 +113,9 @@ impl AuthenticatedPackageIndex {
                 proof,
                 path,
                 identity,
+                package_signature: None,
+                package_objects: None,
+                request_authentication: std::sync::OnceLock::new(),
             }))
     }
     pub fn lookup(&self, path: &RepositoryPath) -> Result<Option<ObjectIdentity>, CaptureError> {
@@ -293,7 +297,7 @@ pub async fn stage_package_index(
         logical_path: index_path.to_owned(),
     })
 }
-/// Internal only: caller has authenticated the Release entry and source artifact.
+/// Internal only: caller established profile source trust and the exact entry identity.
 /// Historical proof validation calls this instead of a separate derived hash pass.
 pub(crate) async fn stage_authenticated_source(
     spool: &Spool,

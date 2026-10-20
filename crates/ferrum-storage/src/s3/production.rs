@@ -72,8 +72,57 @@ impl UploadOutcome {
         }
     }
 }
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawS3Config {
+    provider: Option<String>,
+    account_id: Option<String>,
+    endpoint: Option<String>,
+    region: Option<String>,
+    bucket: String,
+    #[serde(default = "default_package_prefix")]
+    package_prefix: String,
+    #[serde(default = "default_checkpoint_prefix")]
+    checkpoint_prefix: String,
+    credentials_file: PathBuf,
+    #[serde(default = "default_shared_nonisolated")]
+    shared_nonisolated: bool,
+}
+
+fn default_package_prefix() -> String {
+    config::DEFAULT_PACKAGE_PREFIX.into()
+}
+
+fn default_checkpoint_prefix() -> String {
+    config::DEFAULT_CHECKPOINT_PREFIX.into()
+}
+
+fn default_shared_nonisolated() -> bool {
+    true
+}
+
+impl From<RawS3Config> for S3Config {
+    fn from(raw: RawS3Config) -> Self {
+        let (endpoint, region) = config::resolve_provider_fields(
+            raw.provider.as_deref(),
+            raw.account_id.as_deref(),
+            raw.endpoint,
+            raw.region,
+        );
+        Self {
+            endpoint,
+            region,
+            bucket: raw.bucket,
+            package_prefix: raw.package_prefix,
+            checkpoint_prefix: raw.checkpoint_prefix,
+            credentials_file: raw.credentials_file,
+            shared_nonisolated: raw.shared_nonisolated,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(from = "RawS3Config")]
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
@@ -86,27 +135,12 @@ pub struct S3Config {
 }
 impl S3Config {
     pub fn validate(&self) -> Result<(), S3Error> {
-        let endpoint = url::Url::parse(&self.endpoint).map_err(|_| S3Error::Boundary)?;
-        let domain = match endpoint.host() {
-            Some(url::Host::Domain(domain)) => domain,
-            _ => return Err(S3Error::Boundary),
-        };
-        if endpoint.scheme() != "https"
-            || endpoint.port().is_some()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.path() != "/"
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-            || !domain.contains('.')
-            || !domain.split('.').all(valid_label)
-            || self.region.len() > 63
-            || !valid_label(&self.region)
-            || !(3..=63).contains(&self.bucket.len())
-            || self.bucket.parse::<std::net::IpAddr>().is_ok()
-            || !self.bucket.split('.').all(valid_label)
-            || self.package_prefix != "linux-packages/"
-            || self.checkpoint_prefix != "linux-checkpoints/"
+        let _ = config::valid_endpoint_and_host(&self.endpoint)?;
+        if !config::valid_region(&self.region)
+            || !config::valid_bucket(&self.bucket)
+            || !config::valid_prefix(&self.package_prefix)
+            || !config::valid_prefix(&self.checkpoint_prefix)
+            || config::prefixes_overlap(&self.package_prefix, &self.checkpoint_prefix)
             || !self.shared_nonisolated
             || !self.credentials_file.is_absolute()
         {
@@ -126,8 +160,8 @@ impl S3Config {
         let (package_prefix, checkpoint_prefix) = match qualification_run {
             None => (self.package_prefix.clone(), self.checkpoint_prefix.clone()),
             Some(run) if crate::budget::provider::valid_run(run) => (
-                format!("linux-packages/_ferrum-b07/{run}/"),
-                format!("linux-checkpoints/_ferrum-b07/{run}/"),
+                format!("{}_ferrum-b07/{run}/", self.package_prefix),
+                format!("{}_ferrum-b07/{run}/", self.checkpoint_prefix),
             ),
             Some(_) => return Err(S3Error::Boundary),
         };
@@ -141,15 +175,6 @@ impl S3Config {
     }
 }
 
-fn valid_label(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 63
-        && !value.starts_with('-')
-        && !value.ends_with('-')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
 /// One concrete SDK adapter. Private qualification retains its original journal
 /// and operation boundary; production identities share one ledger and slot owner.
 pub struct S3Store {
@@ -246,8 +271,8 @@ impl S3Store {
         ledger
             .bind_qualification(run_id)
             .map_err(|_| S3Error::AdmissionRefused)?;
-        config.package_prefix = format!("linux-packages/_ferrum-b07/{run_id}/");
-        config.checkpoint_prefix = format!("linux-checkpoints/_ferrum-b07/{run_id}/");
+        config.package_prefix = identity.package_prefix;
+        config.checkpoint_prefix = identity.checkpoint_prefix;
         Self::open_scoped(config, ledger)
     }
     fn open_scoped(config: S3Config, ledger: BudgetLedger) -> Result<Self, S3Error> {
@@ -257,6 +282,7 @@ impl S3Store {
             &config.endpoint,
             &config.region,
             &config.bucket,
+            &config.package_prefix,
             transport.clone(),
         )?;
         let forbidden = ledger
@@ -1449,15 +1475,26 @@ fn validate_suffix(identity: OperationIdentity, suffix: &str) -> Result<(), S3Er
     }
 }
 
-fn namespace_suffix(identity: OperationIdentity, key: &str) -> Result<&str, S3Error> {
+fn namespace_suffix<'a>(
+    identity: OperationIdentity,
+    key: &'a str,
+    package_prefix: &str,
+    checkpoint_prefix: &str,
+) -> Result<&'a str, S3Error> {
+    let base_package = package_prefix
+        .split_once("_ferrum-b07/")
+        .map_or(package_prefix, |(base, _)| base);
+    let base_checkpoint = checkpoint_prefix
+        .split_once("_ferrum-b07/")
+        .map_or(checkpoint_prefix, |(base, _)| base);
     let checkpoints = identity == OperationIdentity::Checkpoint
         || (identity == OperationIdentity::PrivateQualificationCleanup
-            && key.starts_with("linux-checkpoints/"));
+            && key.starts_with(base_checkpoint));
     let suffix = key
         .strip_prefix(if checkpoints {
-            "linux-checkpoints/"
+            base_checkpoint
         } else {
-            "linux-packages/"
+            base_package
         })
         .ok_or(S3Error::Boundary)?;
     if identity == OperationIdentity::PrivateQualificationCleanup

@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 pub const CHECKPOINT_LIMIT: u64 = 16 * 1024;
 pub const MANIFEST_LIMIT: u64 = 1024 * 1024;
-pub const MAX_SUITES: usize = 64;
+/// Shared bound for configured, retained and reconciled suite identities.
+pub const MAX_SUITES: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct SuiteKey {
@@ -47,6 +48,15 @@ impl SuiteKey {
     }
     pub fn suite(&self) -> &str {
         &self.suite
+    }
+    /// Unsigned Pacman databases have transport freshness, not a signed revision
+    /// order. The local checkpoint sequence records observations, not rollback
+    /// resistance against a malicious or replaying origin.
+    pub fn uses_transport_candidate_metadata(&self) -> bool {
+        matches!(
+            self.repository.as_str(),
+            "archlinux" | "chaotic-aur" | "cachyos" | "archlinuxcn" | "endeavouros"
+        )
     }
     pub(crate) fn suffix(&self) -> String {
         format!("v1/checkpoints/{}/{}.json", self.repository, self.suite)

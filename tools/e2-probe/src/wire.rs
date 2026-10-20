@@ -33,11 +33,11 @@ use std::{
 pub(crate) struct Wire {
     inner: SharedHttpClient,
     journal: SharedJournal,
+    target: config::ProbeTarget,
     permits: Arc<Mutex<VecDeque<Permit>>>,
     upload_bytes: Arc<AtomicU64>,
     download_bytes: Arc<AtomicU64>,
 }
-
 #[derive(Clone)]
 struct Permit {
     operation: &'static str,
@@ -52,7 +52,7 @@ impl fmt::Debug for Wire {
 }
 
 impl Wire {
-    pub(crate) fn new(journal: SharedJournal) -> Self {
+    pub(crate) fn new(journal: SharedJournal, target: config::ProbeTarget) -> Self {
         let inner = aws_smithy_http_client::Builder::new()
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
@@ -61,6 +61,7 @@ impl Wire {
         Self {
             inner,
             journal,
+            target,
             permits: Arc::new(Mutex::new(VecDeque::new())),
             upload_bytes: Arc::new(AtomicU64::new(0)),
             download_bytes: Arc::new(AtomicU64::new(0)),
@@ -140,6 +141,7 @@ fn denied(message: &'static str) -> ConnectorError {
 
 fn boundary(
     request: &HttpRequest,
+    target: &config::ProbeTarget,
     prefix: &str,
     checkpoint: Option<&str>,
     operation: &str,
@@ -147,7 +149,7 @@ fn boundary(
     let uri = url::Url::parse(request.uri())?;
     ensure!(
         uri.scheme() == "https"
-            && uri.host_str() == Some("s3.us-central-1.idrivee2.com")
+            && uri.host_str() == Some(target.host.as_str())
             && uri.port().is_none()
             && uri.username().is_empty()
             && uri.password().is_none()
@@ -209,7 +211,7 @@ fn boundary(
         pairs.iter().all(|(name, _)| names.insert(name.as_ref())),
         "duplicate query parameter"
     );
-    let bucket = format!("/{}", config::BUCKET);
+    let bucket = format!("/{}", target.bucket);
     if matches!(operation, "inspect_versioning" | "inspect_lifecycle") {
         let selector = if operation == "inspect_versioning" {
             "versioning"
@@ -420,6 +422,7 @@ impl HttpConnector for Connector {
                     journal::lock(&wire.journal).map_err(|_| denied("journal unavailable"))?;
                 boundary(
                     &request,
+                    &wire.target,
                     &journal.manifest.prefix,
                     journal.manifest.checkpoint_prefix.as_deref(),
                     permit.operation,
@@ -427,7 +430,7 @@ impl HttpConnector for Connector {
                 .map_err(|_| denied("request escaped probe boundary"))?;
                 let uri =
                     url::Url::parse(request.uri()).map_err(|_| denied("invalid request URI"))?;
-                if let Some(key) = uri.path().strip_prefix(&format!("/{}/", config::BUCKET)) {
+                if let Some(key) = uri.path().strip_prefix(&format!("/{}/", wire.target.bucket)) {
                     if ["PUT", "POST", "DELETE"].contains(&request.method()) {
                         let object = journal
                             .manifest
@@ -706,6 +709,15 @@ impl Body for LimitedBody {
 mod tests {
     use super::*;
 
+    fn default_target() -> config::ProbeTarget {
+        config::ProbeTarget {
+            endpoint: config::ENDPOINT.to_owned(),
+            host: "s3.us-east-1.amazonaws.com".to_owned(),
+            region: config::REGION.to_owned(),
+            bucket: config::BUCKET.to_owned(),
+        }
+    }
+
     #[test]
     fn configuration_inspection_cannot_escape_read_only_bucket_selectors() -> Result<()> {
         let prefix = "linux-packages/_ferrum-probe/0123456789abcdef0123456789abcdef/";
@@ -718,7 +730,7 @@ mod tests {
                 config::ENDPOINT,
                 config::BUCKET
             ))?;
-            assert!(boundary(&request, prefix, None, operation).is_ok());
+            assert!(boundary(&request, &default_target(), prefix, None, operation).is_ok());
             for suffix in [
                 format!("?{selector}&prefix={prefix}"),
                 format!("?{selector}&{selector}"),
@@ -730,7 +742,7 @@ mod tests {
                 let request =
                     HttpRequest::get(format!("{}/{}/{suffix}", config::ENDPOINT, config::BUCKET))?;
                 assert!(
-                    boundary(&request, prefix, None, operation).is_err(),
+                    boundary(&request, &default_target(), prefix, None, operation).is_err(),
                     "{suffix}"
                 );
             }
@@ -755,7 +767,7 @@ mod tests {
             config::ENDPOINT,
             config::BUCKET
         ))?;
-        assert!(boundary(&request, prefix, None, "list_objects_v2").is_err());
+        assert!(boundary(&request, &default_target(), prefix, None, "list_objects_v2").is_err());
         Ok(())
     }
 
@@ -786,23 +798,23 @@ mod tests {
             config::BUCKET,
             checkpoint
         ))?;
-        assert!(boundary(&request, prefix, Some(&checkpoint), "checkpoint_get").is_ok());
-        assert!(boundary(&request, prefix, Some(&checkpoint), "get_full").is_err());
+        assert!(boundary(&request, &default_target(), prefix, Some(&checkpoint), "checkpoint_get").is_ok());
+        assert!(boundary(&request, &default_target(), prefix, Some(&checkpoint), "get_full").is_err());
         let package = HttpRequest::get(format!(
             "{}/{}/{}small",
             config::ENDPOINT,
             config::BUCKET,
             prefix
         ))?;
-        assert!(boundary(&package, prefix, Some(&checkpoint), "checkpoint_get").is_err());
+        assert!(boundary(&package, &default_target(), prefix, Some(&checkpoint), "checkpoint_get").is_err());
         let live = HttpRequest::get(format!(
             "{}/{}/linux-checkpoints/live",
             config::ENDPOINT,
             config::BUCKET
         ))?;
-        assert!(boundary(&live, prefix, Some(&checkpoint), "checkpoint_get").is_err());
+        assert!(boundary(&live, &default_target(), prefix, Some(&checkpoint), "checkpoint_get").is_err());
         let bucket = HttpRequest::get(format!("{}/{}/?policy", config::ENDPOINT, config::BUCKET))?;
-        assert!(boundary(&bucket, prefix, Some(&checkpoint), "list_objects_v2").is_err());
+        assert!(boundary(&bucket, &default_target(), prefix, Some(&checkpoint), "list_objects_v2").is_err());
         Ok(())
     }
 
@@ -856,7 +868,7 @@ mod tests {
                 .insert("x-amz-meta-ferrum-probe-run", marker);
             request.headers_mut().insert("if-none-match", "*");
             assert!(
-                boundary(&request, prefix, None, operation).is_ok(),
+                boundary(&request, &default_target(), prefix, None, operation).is_ok(),
                 "{operation}"
             );
         }
@@ -872,7 +884,7 @@ mod tests {
         ] {
             let request =
                 HttpRequest::get(format!("{}/{}/?{query}", config::ENDPOINT, config::BUCKET))?;
-            assert!(boundary(&request, prefix, None, operation).is_ok());
+            assert!(boundary(&request, &default_target(), prefix, None, operation).is_ok());
         }
         for query in [
             "x-id=DeleteBucket",
@@ -885,7 +897,7 @@ mod tests {
                 config::ENDPOINT,
                 config::BUCKET
             ))?;
-            assert!(boundary(&request, prefix, None, "get_full").is_err());
+            assert!(boundary(&request, &default_target(), prefix, None, "get_full").is_err());
         }
         Ok(())
     }

@@ -5,11 +5,68 @@ use aws_sdk_s3::config::{
 };
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
-pub(crate) const ENDPOINT: &str = "https://s3.us-central-1.idrivee2.com";
-pub(crate) const REGION: &str = "us-central-1";
-pub(crate) const BUCKET: &str = "s3-andrew";
+#[cfg(test)]
+pub(crate) const ENDPOINT: &str = "https://s3.us-east-1.amazonaws.com";
+#[cfg(test)]
+pub(crate) const REGION: &str = "us-east-1";
+#[cfg(test)]
+pub(crate) const BUCKET: &str = "ferrum";
 pub(crate) const ROOT: &str = "linux-packages/_ferrum-probe/";
 pub(crate) const CHECKPOINT_ROOT: &str = "linux-checkpoints/_ferrum-probe/";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProbeTarget {
+    pub(crate) endpoint: String,
+    pub(crate) host: String,
+    pub(crate) region: String,
+    pub(crate) bucket: String,
+}
+
+fn valid_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+pub(crate) fn validate_target(endpoint: &str, region: &str, bucket: &str) -> Result<ProbeTarget> {
+    let parsed = url::Url::parse(endpoint)?;
+    let host = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.to_owned(),
+        _ => bail!("S3 endpoint must use a domain name"),
+    };
+    ensure!(
+        parsed.scheme() == "https"
+            && parsed.port().is_none()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.path() == "/"
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+            && host.contains('.')
+            && host.split('.').all(valid_label),
+        "invalid S3 endpoint"
+    );
+    ensure!(
+        region.len() <= 63 && valid_label(region),
+        "invalid S3 region"
+    );
+    ensure!(
+        (3..=63).contains(&bucket.len())
+            && bucket.parse::<std::net::IpAddr>().is_err()
+            && bucket.split('.').all(valid_label),
+        "invalid S3 bucket"
+    );
+    Ok(ProbeTarget {
+        endpoint: endpoint.trim_end_matches('/').to_owned(),
+        host,
+        region: region.to_owned(),
+        bucket: bucket.to_owned(),
+    })
+}
 pub(crate) const MIB: u64 = 1024 * 1024;
 pub(crate) const PART: u64 = 16 * MIB;
 pub(crate) const LARGE: u64 = 5 * PART;
@@ -78,7 +135,7 @@ fn parse(content: &str) -> Result<BTreeMap<String, String>> {
     Ok(values)
 }
 
-pub(crate) fn client(path: &Path, wire: crate::wire::Wire) -> Result<aws_sdk_s3::Client> {
+fn read_env_file(path: &Path) -> Result<(String, String, ProbeTarget)> {
     for name in [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -126,31 +183,42 @@ pub(crate) fn client(path: &Path, wire: crate::wire::Wire) -> Result<aws_sdk_s3:
         !access.is_empty() && !secret.is_empty(),
         "empty credential field"
     );
-    let get = |name: &str| -> Result<&str> {
-        let value = values
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("required provider field missing"))?;
-        ensure!(!value.is_empty(), "empty provider field");
-        Ok(value.as_str())
-    };
-    for (name, approved) in [
-        ("AWS_ENDPOINT_URL_S3", ENDPOINT),
-        ("AWS_REGION", REGION),
-        ("FERRUM_S3_BUCKET", BUCKET),
-        ("FERRUM_S3_PREFIX", "linux-packages/"),
-    ] {
-        ensure!(
-            get(name)? == approved,
-            "provider configuration differs from approved boundary"
-        );
-    }
     if values.contains_key("AWS_SESSION_TOKEN") {
         bail!("session credentials are outside the approved static credential contract");
     }
+    let region = values
+        .remove("AWS_REGION")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("AWS_REGION required"))?;
+    let bucket = values
+        .remove("FERRUM_S3_BUCKET")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("FERRUM_S3_BUCKET required"))?;
+    let endpoint = values
+        .remove("AWS_ENDPOINT_URL_S3")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+    if let Some(prefix) = values.remove("FERRUM_S3_PREFIX") {
+        ensure!(
+            prefix == "linux-packages/",
+            "FERRUM_S3_PREFIX differs from approved boundary"
+        );
+    }
+    ensure!(values.is_empty(), "unknown credential field");
+    let target = validate_target(&endpoint, &region, &bucket)?;
+    Ok((access, secret, target))
+}
+
+pub(crate) fn load_target(path: &Path) -> Result<ProbeTarget> {
+    Ok(read_env_file(path)?.2)
+}
+
+pub(crate) fn client(path: &Path, wire: crate::wire::Wire) -> Result<aws_sdk_s3::Client> {
+    let (access, secret, target) = read_env_file(path)?;
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::v2026_01_12())
-        .region(Region::new(REGION))
-        .endpoint_url(ENDPOINT)
+        .region(Region::new(target.region))
+        .endpoint_url(target.endpoint)
         .force_path_style(true)
         .disable_multi_region_access_points(true)
         .disable_s3_express_session_auth(true)

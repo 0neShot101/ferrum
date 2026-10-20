@@ -7,9 +7,12 @@
 //! `<checksum type="sha256">`.
 
 use std::collections::HashSet;
-use std::io::{self, BufReader, Chain, Cursor, Read};
+use std::io::{BufReader, Chain, Cursor, Read};
 
-use xmlparser::{ElementEnd, Token, Tokenizer};
+mod xml;
+
+use crate::pacman::zstd::{MultiZstdDecoder, is_zstd_magic};
+use xml::Element;
 
 use crate::digest::{ObjectIdentity, Sha256Digest};
 use crate::index::{IndexError, PackageRecord};
@@ -156,138 +159,87 @@ pub fn parse_repomd_xml(
     let mut primary_path: Option<RepositoryPath> = None;
     let mut max_timestamp: Option<i64> = None;
 
-    let mut current_data_type: Option<String> = None;
-    let mut current_tag: Option<String> = None;
-    let mut current_checksum_is_sha256 = false;
-    let mut data_sha256: Option<Sha256Digest> = None;
-    let mut data_location: Option<String> = None;
-    let mut data_size: Option<u64> = None;
-    let mut data_timestamp: Option<i64> = None;
-
-    for token in Tokenizer::from(text) {
-        let token =
-            token.map_err(|error| IndexError::Deb822(format!("repomd XML error: {error}")))?;
-        match token {
-            Token::ElementStart { local, .. } => {
-                let name = local.as_str();
-                if name == "data" {
-                    current_data_type = None;
-                    data_sha256 = None;
-                    data_location = None;
-                    data_size = None;
-                    data_timestamp = None;
-                } else if current_data_type.is_some() {
-                    current_tag = Some(name.to_owned());
-                    current_checksum_is_sha256 = false;
-                }
+    xml::document(
+        Cursor::new(text.as_bytes()),
+        "repomd",
+        "http://linux.duke.edu/metadata/repo",
+        limits,
+        limits.max_release as u64,
+        |data| {
+            if data.name != "data" || !data.in_document_namespace() {
+                return Ok(());
             }
-            Token::Attribute { local, value, .. } => {
-                if current_tag.is_none() && local.as_str() == "type" && current_data_type.is_none()
-                {
-                    current_data_type = Some(value.as_str().to_owned());
-                } else if let Some(tag) = current_tag.as_deref() {
-                    if tag == "checksum" && local.as_str() == "type" && value.as_str() == "sha256" {
-                        current_checksum_is_sha256 = true;
-                    } else if tag == "location" && local.as_str() == "href" {
-                        data_location = Some(value.as_str().to_owned());
-                    }
-                }
+            let dtype = data
+                .attribute("type")
+                .ok_or(IndexError::MissingField("repomd data type"))?;
+            let checksum = data.field("checksum")?;
+            let location = data.field("location")?;
+            let size = data.field("size")?;
+            let timestamp = data.field("timestamp")?;
+            if let Some(location) = location
+                && !location.scalar()?.is_empty()
+            {
+                return Err(IndexError::Deb822("repomd location must be empty".into()));
             }
-            Token::Text { text } => {
-                if let Some(tag) = current_tag.as_deref() {
-                    let trimmed = text.as_str().trim();
-                    if !trimmed.is_empty() {
-                        match tag {
-                            "checksum" if current_checksum_is_sha256 => {
-                                data_sha256 = Some(Sha256Digest::from_hex(trimmed)?);
-                            }
-                            "size" => {
-                                let parsed: u64 = trimmed
-                                    .parse()
-                                    .map_err(|_| IndexError::InvalidSize(trimmed.to_owned()))?;
-                                if parsed == 0 {
-                                    return Err(IndexError::InvalidSize("zero repomd size".into()));
-                                }
-                                data_size = Some(parsed);
-                            }
-                            "timestamp" => {
-                                if let Ok(ts) = trimmed.parse::<f64>()
-                                    && ts >= 0.0
-                                {
-                                    data_timestamp = Some(ts as i64);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+            let sha256 = match checksum {
+                Some(checksum) if checksum.attribute("type") == Some("sha256") => {
+                    Some(Sha256Digest::from_hex(checksum.scalar()?)?)
                 }
+                _ => None,
+            };
+            let size = size
+                .map(|size| parse_positive_size(size.scalar()?))
+                .transpose()?;
+            let timestamp = timestamp
+                .map(|timestamp| {
+                    let text = timestamp.scalar()?;
+                    let value = text
+                        .parse::<i64>()
+                        .map_err(|_| IndexError::Deb822("invalid repomd timestamp".into()))?;
+                    if value < 0 {
+                        return Err(IndexError::Deb822("negative repomd timestamp".into()));
+                    }
+                    Ok(value)
+                })
+                .transpose()?;
+            let href = location.and_then(|location| location.attribute("href"));
+            let (Some(href), Some(sha256), Some(size)) = (href, sha256, size) else {
+                if dtype == "primary" {
+                    return Err(IndexError::MissingField(
+                        "repomd primary location/sha256/size",
+                    ));
+                }
+                return Ok(());
+            };
+            let file = href
+                .strip_prefix("repodata/")
+                .filter(|file| !file.is_empty() && !file.contains('/'))
+                .ok_or_else(|| IndexError::Deb822("repomd data must be under repodata/".into()))?;
+            if dtype == "primary" && !is_primary_xml_filename(file) {
+                return Err(IndexError::Deb822(format!(
+                    "unsupported repomd primary filename {file}"
+                )));
             }
-            Token::ElementEnd { end, .. } => match end {
-                ElementEnd::Close(_, local) if local.as_str() == "data" => {
-                    if let Some(dtype) = current_data_type.take() {
-                        if dtype == "primary" {
-                            let href = data_location
-                                .take()
-                                .ok_or(IndexError::MissingField("repomd primary location"))?;
-                            let file = href.strip_prefix("repodata/").ok_or_else(|| {
-                                IndexError::Deb822("repomd primary must be under repodata/".into())
-                            })?;
-                            if !is_primary_xml_filename(file) {
-                                return Err(IndexError::Deb822(format!(
-                                    "unsupported repomd primary filename {file}"
-                                )));
-                            }
-                            let sha256 = data_sha256
-                                .take()
-                                .ok_or(IndexError::MissingField("repomd primary sha256"))?;
-                            let size = data_size
-                                .take()
-                                .ok_or(IndexError::MissingField("repomd primary size"))?;
-                            let full_path =
-                                RepositoryPath::parse_decoded(&format!("{suite_root}/{href}"))?;
-                            if let Some(ts) = data_timestamp {
-                                max_timestamp = Some(max_timestamp.map_or(ts, |prev| prev.max(ts)));
-                            }
-                            if seen_paths.insert(full_path.clone()) {
-                                primary_path = Some(full_path.clone());
-                                data_records.push(RepomdDataRecord {
-                                    data_type: dtype,
-                                    path: full_path,
-                                    identity: ObjectIdentity { sha256, size },
-                                    timestamp: data_timestamp,
-                                });
-                            }
-                        } else if let (Some(href), Some(sha256), Some(size)) =
-                            (data_location.take(), data_sha256.take(), data_size.take())
-                            && let Some(file) = href.strip_prefix("repodata/")
-                            && !file.is_empty()
-                            && !file.contains('/')
-                        {
-                            let full_path =
-                                RepositoryPath::parse_decoded(&format!("{suite_root}/{href}"))?;
-                            if let Some(ts) = data_timestamp {
-                                max_timestamp = Some(max_timestamp.map_or(ts, |prev| prev.max(ts)));
-                            }
-                            if seen_paths.insert(full_path.clone()) {
-                                data_records.push(RepomdDataRecord {
-                                    data_type: dtype,
-                                    path: full_path,
-                                    identity: ObjectIdentity { sha256, size },
-                                    timestamp: data_timestamp,
-                                });
-                            }
-                        }
-                    }
-                    current_tag = None;
-                }
-                ElementEnd::Close(_, _) | ElementEnd::Empty => {
-                    current_tag = None;
-                }
-                ElementEnd::Open => {}
-            },
-            _ => {}
-        }
-    }
+            let full_path = RepositoryPath::parse_decoded(&format!("{suite_root}/{href}"))?;
+            if !seen_paths.insert(full_path.clone()) {
+                return Err(IndexError::DuplicateField(full_path.as_str().to_owned()));
+            }
+            if dtype == "primary" && primary_path.replace(full_path.clone()).is_some() {
+                return Err(IndexError::DuplicateField("repomd primary data".into()));
+            }
+            if let Some(timestamp) = timestamp {
+                max_timestamp =
+                    Some(max_timestamp.map_or(timestamp, |previous| previous.max(timestamp)));
+            }
+            data_records.push(RepomdDataRecord {
+                data_type: dtype.to_owned(),
+                path: full_path,
+                identity: ObjectIdentity { sha256, size },
+                timestamp,
+            });
+            Ok(())
+        },
+    )?;
 
     let Some(primary_path) = primary_path else {
         return Err(IndexError::MissingField("repomd primary data"));
@@ -329,14 +281,12 @@ where
         magic_len += count;
     }
     let delivered = {
-        let prefix = Cursor::new(magic[..magic_len].to_vec());
-        let chained: Chain<Cursor<Vec<u8>>, &mut R> = prefix.chain(&mut *reader);
+        let prefix = Cursor::new(&magic[..magic_len]);
+        let chained: Chain<Cursor<&[u8]>, &mut R> = prefix.chain(&mut *reader);
         let decoder: Box<dyn Read + '_> = if magic_len >= 2 && magic[..2] == [0x1f, 0x8b] {
             Box::new(flate2::read::MultiGzDecoder::new(BufReader::new(chained)))
-        } else if magic_len >= 4 && magic[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-            let stream = ruzstd::decoding::StreamingDecoder::new(BufReader::new(chained))
-                .map_err(|error| IndexError::Deb822(format!("zstd init failed: {error}")))?;
-            Box::new(stream)
+        } else if is_zstd_magic(&magic[..magic_len]) {
+            Box::new(MultiZstdDecoder::new(chained))
         } else if magic_len >= 6 && magic == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
             let stream = xz2::stream::Stream::new_stream_decoder(
                 XZ_DECODER_MEMORY_LIMIT,
@@ -353,43 +303,19 @@ where
             Box::new(chained)
         };
 
-        let mut total_decompressed = 0u64;
-        let mut buffer = Vec::with_capacity(64 * 1024);
-        let mut chunk = [0u8; 32 * 1024];
-        let mut stanza = 0usize;
         let mut count = 0usize;
         let mut seen_paths = HashSet::new();
-        let mut reader_inner = decoder;
-
-        loop {
-            let read_bytes = reader_inner.read(&mut chunk)?;
-            if read_bytes > 0 {
-                total_decompressed = total_decompressed
-                    .checked_add(read_bytes as u64)
-                    .ok_or_else(|| io::Error::other("primary.xml size overflow"))?;
-                if total_decompressed > MAX_DECOMPRESSED_PRIMARY_XML_BYTES {
-                    return Err(IndexError::TooLarge {
-                        stanza: stanza.saturating_add(1),
-                    });
+        xml::document(
+            decoder,
+            "metadata",
+            "http://linux.duke.edu/metadata/common",
+            limits,
+            MAX_DECOMPRESSED_PRIMARY_XML_BYTES,
+            |package| {
+                if package.name != "package" || !package.in_document_namespace() {
+                    return Err(IndexError::Deb822("unexpected primary XML child".into()));
                 }
-                buffer.extend_from_slice(&chunk[..read_bytes]);
-            }
-
-            while let Some(end_pos) = find_subslice(&buffer, b"</package>") {
-                let close_end = end_pos + b"</package>".len();
-                let Some(start_pos) = find_subslice(&buffer[..close_end], b"<package") else {
-                    return Err(IndexError::Deb822(
-                        "closing </package> without <package".into(),
-                    ));
-                };
-                stanza = stanza.saturating_add(1);
-                let stanza_bytes = &buffer[start_pos..close_end];
-                if stanza_bytes.len() > limits.max_stanza {
-                    return Err(IndexError::TooLarge { stanza });
-                }
-                let stanza_text = std::str::from_utf8(stanza_bytes)
-                    .map_err(|error| IndexError::Deb822(format!("primary.xml UTF-8: {error}")))?;
-                if let Some(record) = parse_rpm_package_stanza(stanza_text, &suite_root)? {
+                if let Some(record) = parse_rpm_package(&package, &suite_root)? {
                     if !seen_paths.insert(record.filename.clone()) {
                         return Err(IndexError::DuplicateField(
                             record.filename.as_str().to_owned(),
@@ -398,142 +324,74 @@ where
                     sink(record)?;
                     count = count.saturating_add(1);
                 }
-                buffer.drain(..close_end);
-            }
-
-            if buffer.len() > limits.max_stanza {
-                return Err(IndexError::TooLarge {
-                    stanza: stanza.saturating_add(1),
-                });
-            }
-            if read_bytes == 0 {
-                break;
-            }
-        }
+                Ok(())
+            },
+        )?;
         count
     };
-    let mut tail = [0u8; 4096];
-    while reader.read(&mut tail)? != 0 {}
     Ok(delivered)
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+fn parse_positive_size(text: &str) -> Result<u64, IndexError> {
+    let value = text
+        .parse::<u64>()
+        .map_err(|_| IndexError::InvalidSize(text.to_owned()))?;
+    if value == 0 {
+        return Err(IndexError::InvalidSize("zero RPM size".into()));
+    }
+    Ok(value)
 }
 
-fn parse_rpm_package_stanza(
-    stanza_xml: &str,
+fn required_field<'a>(element: &'a Element, name: &'static str) -> Result<&'a Element, IndexError> {
+    element.field(name)?.ok_or(IndexError::MissingField(name))
+}
+
+fn required_attribute<'a>(element: &'a Element, name: &'static str) -> Result<&'a str, IndexError> {
+    element
+        .attribute(name)
+        .filter(|value| !value.is_empty())
+        .ok_or(IndexError::MissingField(name))
+}
+
+fn parse_rpm_package(
+    package: &Element,
     suite_root: &str,
 ) -> Result<Option<PackageRecord>, IndexError> {
-    let mut name: Option<String> = None;
-    let mut arch: Option<String> = None;
-    let mut version: Option<String> = None;
-    let mut sha256: Option<Sha256Digest> = None;
-    let mut size: Option<u64> = None;
-    let mut location: Option<String> = None;
-
-    let mut depth = 0usize;
-    let mut current_top_tag: Option<String> = None;
-    let mut checksum_is_sha256 = false;
-    let mut ver_epoch: Option<String> = None;
-    let mut ver_ver: Option<String> = None;
-    let mut ver_rel: Option<String> = None;
-
-    for token in Tokenizer::from(stanza_xml) {
-        let token =
-            token.map_err(|error| IndexError::Deb822(format!("primary.xml error: {error}")))?;
-        match token {
-            Token::ElementStart { local, .. } => {
-                depth = depth.saturating_add(1);
-                if depth == 2 {
-                    current_top_tag = Some(local.as_str().to_owned());
-                    checksum_is_sha256 = false;
-                    if local.as_str() == "version" {
-                        ver_epoch = None;
-                        ver_ver = None;
-                        ver_rel = None;
-                    }
-                }
-            }
-            Token::Attribute { local, value, .. } if depth == 2 => {
-                if let Some(tag) = current_top_tag.as_deref() {
-                    match (tag, local.as_str()) {
-                        ("version", "epoch") => ver_epoch = Some(value.as_str().to_owned()),
-                        ("version", "ver") => ver_ver = Some(value.as_str().to_owned()),
-                        ("version", "rel") => ver_rel = Some(value.as_str().to_owned()),
-                        ("checksum", "type") if value.as_str() == "sha256" => {
-                            checksum_is_sha256 = true;
-                        }
-                        ("size", "package") => {
-                            let parsed: u64 = value
-                                .as_str()
-                                .parse()
-                                .map_err(|_| IndexError::InvalidSize(value.as_str().to_owned()))?;
-                            if parsed == 0 {
-                                return Err(IndexError::InvalidSize(
-                                    "zero RPM package size".into(),
-                                ));
-                            }
-                            size = Some(parsed);
-                        }
-                        ("location", "href") => {
-                            location = Some(value.as_str().to_owned());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Token::Text { text } if depth == 2 => {
-                if let Some(tag) = current_top_tag.as_deref() {
-                    let trimmed = text.as_str().trim();
-                    if !trimmed.is_empty() {
-                        match tag {
-                            "name" => name = Some(trimmed.to_owned()),
-                            "arch" => arch = Some(trimmed.to_owned()),
-                            "checksum" if checksum_is_sha256 => {
-                                sha256 = Some(Sha256Digest::from_hex(trimmed)?);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Token::ElementEnd { end, .. } => {
-                if depth == 2
-                    && current_top_tag.as_deref() == Some("version")
-                    && let (Some(v), Some(r)) = (ver_ver.take(), ver_rel.take())
-                {
-                    let epoch = ver_epoch.take().unwrap_or_else(|| "0".into());
-                    version = Some(if epoch == "0" || epoch.is_empty() {
-                        format!("{v}-{r}")
-                    } else {
-                        format!("{epoch}:{v}-{r}")
-                    });
-                }
-                match end {
-                    ElementEnd::Close(_, _) | ElementEnd::Empty => {
-                        if depth == 2 {
-                            current_top_tag = None;
-                        }
-                        depth = depth.saturating_sub(1);
-                    }
-                    ElementEnd::Open => {}
-                }
-            }
-            _ => {}
-        }
+    if package.attribute("type") != Some("rpm") {
+        return Err(IndexError::Deb822(
+            "primary package type must be rpm".into(),
+        ));
     }
-
-    let name = name.ok_or(IndexError::MissingField("rpm <name>"))?;
-    let arch = arch.ok_or(IndexError::MissingField("rpm <arch>"))?;
-    let version = version.ok_or(IndexError::MissingField("rpm <version>"))?;
-    let sha256 = sha256.ok_or(IndexError::MissingField("rpm <checksum type=sha256>"))?;
-    let size = size.ok_or(IndexError::MissingField("rpm <size package>"))?;
-    let href = location.ok_or(IndexError::MissingField("rpm <location href>"))?;
-
-    if !matches!(arch.as_str(), "x86_64" | "aarch64" | "noarch") {
+    let name = required_field(package, "name")?.scalar()?;
+    let arch = required_field(package, "arch")?.scalar()?;
+    let version = required_field(package, "version")?;
+    let checksum = required_field(package, "checksum")?;
+    let size = required_field(package, "size")?;
+    let location = required_field(package, "location")?;
+    if !version.scalar()?.is_empty() || !size.scalar()?.is_empty() || !location.scalar()?.is_empty()
+    {
+        return Err(IndexError::Deb822(
+            "RPM version/size/location must be empty".into(),
+        ));
+    }
+    if name.is_empty() || arch.is_empty() {
+        return Err(IndexError::MissingField("RPM name/arch"));
+    }
+    if checksum.attribute("type") != Some("sha256") {
+        return Err(IndexError::MissingField("rpm <checksum type=sha256>"));
+    }
+    let sha256 = Sha256Digest::from_hex(checksum.scalar()?)?;
+    let size = parse_positive_size(required_attribute(size, "package")?)?;
+    let href = required_attribute(location, "href")?;
+    let ver = required_attribute(version, "ver")?;
+    let rel = required_attribute(version, "rel")?;
+    let epoch = version.attribute("epoch").unwrap_or("0");
+    let version = if epoch == "0" || epoch.is_empty() {
+        format!("{ver}-{rel}")
+    } else {
+        format!("{epoch}:{ver}-{rel}")
+    };
+    if !matches!(arch, "x86_64" | "aarch64" | "noarch") {
         return Ok(None);
     }
     let full_path = format!("{suite_root}/{href}");
@@ -542,14 +400,17 @@ fn parse_rpm_package_stanza(
     }
     let filename = RepositoryPath::parse_decoded(&full_path)?;
     Ok(Some(PackageRecord {
-        package: name,
+        package: name.to_owned(),
         version,
-        architecture: arch,
+        architecture: arch.to_owned(),
         filename,
         size,
         sha256,
     }))
 }
+
+#[cfg(test)]
+mod regression;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -42,12 +42,24 @@ fn explicit_provider_keeps_transport_and_namespace_boundaries() {
     let mut invalid = config.clone();
     invalid.shared_nonisolated = false;
     assert!(invalid.validate().is_err());
-    invalid = config.clone();
-    invalid.package_prefix = "another-prefix/".into();
-    assert!(invalid.validate().is_err());
-    invalid = config;
-    invalid.checkpoint_prefix = "another-prefix/".into();
-    assert!(invalid.validate().is_err());
+    let mut custom_prefixes = config.clone();
+    custom_prefixes.package_prefix = "custom-packages/".into();
+    custom_prefixes.checkpoint_prefix = "custom-checkpoints/".into();
+    custom_prefixes.validate().unwrap();
+    for (pkg, chk) in [
+        ("", "linux-checkpoints/"),
+        ("no-slash", "linux-checkpoints/"),
+        ("/leading/", "linux-checkpoints/"),
+        ("../escape/", "linux-checkpoints/"),
+        ("same/", "same/"),
+        ("shared/", "shared/sub/"),
+        ("linux-packages/_ferrum-b07/", "linux-checkpoints/"),
+    ] {
+        let mut invalid = config.clone();
+        invalid.package_prefix = pkg.into();
+        invalid.checkpoint_prefix = chk.into();
+        assert!(invalid.validate().is_err(), "{pkg} vs {chk}");
+    }
 }
 
 #[tokio::test]
@@ -676,4 +688,71 @@ async fn canonical_adapter_cannot_dispatch_after_qualification_binding() {
     assert_eq!(ledger.usage().unwrap().download, 0);
     let qualification = ledger.qualification_usage().unwrap();
     assert_eq!((qualification.uploaded, qualification.downloaded), (0, 0));
+}
+
+#[tokio::test]
+async fn stateful_and_disk_transports_operate_with_custom_bucket_endpoint_and_prefixes() {
+    let root = tempfile::tempdir().unwrap();
+    let spool_a = test_support::open_spool(&root.path().join("state-a"));
+    let ledger_a = BudgetLedger::initialize(spool_a.clone(), capture_test::limits()).unwrap();
+    let mut config = capture_test::config(&spool_a);
+    config.endpoint = "https://objects.custom-provider.example".into();
+    config.region = "eu-west-1".into();
+    config.bucket = "custom-archive-bucket".into();
+    config.package_prefix = "custom-packages/".into();
+    config.checkpoint_prefix = "custom-checkpoints/".into();
+
+    let (stateful_store, stateful_remote) =
+        S3Store::stateful_production(config.clone(), ledger_a).unwrap();
+    stateful_store
+        .control_put(
+            OperationIdentity::Checkpoint,
+            "v1/checkpoints/debian/trixie.json",
+            b"{}",
+            ControlCondition::Create,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stateful_remote
+            .bytes("custom-checkpoints/v1/checkpoints/debian/trixie.json")
+            .unwrap()
+            .as_deref(),
+        Some(b"{}".as_slice())
+    );
+
+    let spool_b = test_support::open_spool(&root.path().join("state-b"));
+    let ledger_b = BudgetLedger::initialize(spool_b.clone(), capture_test::limits()).unwrap();
+    let (disk_store, _disk_remote) = S3Store::disk_backed_production(
+        config,
+        ledger_b,
+        root.path().join("disk-remote"),
+        16 * 1024 * 1024,
+    )
+    .unwrap();
+    disk_store
+        .control_put(
+            OperationIdentity::Checkpoint,
+            "v1/checkpoints/debian/trixie.json",
+            b"{\"seq\":1}",
+            ControlCondition::Create,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let read = disk_store
+        .control_get(
+            OperationIdentity::Checkpoint,
+            "v1/checkpoints/debian/trixie.json",
+            1024,
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.bytes, b"{\"seq\":1}");
+    assert!(!read.etag.is_empty());
 }

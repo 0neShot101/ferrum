@@ -1,6 +1,6 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::SystemTime;
 
@@ -12,15 +12,16 @@ use sequoia_openpgp::parse::{
 use sequoia_openpgp::types::SignatureType;
 use sequoia_policy_config::ConfiguredStandardPolicy;
 
+mod input;
 mod trust;
 
-const MAX_BYTES: u64 = 32 * 1024 * 1024;
+use input::{METADATA_CAP, PACKAGE_CAP};
 
 #[derive(Parser)]
 #[command(
     name = "ferrum-verifier",
     version,
-    about = "Verify repository metadata using current trusted signing keys"
+    about = "Verify repository metadata and packages using current trusted signing keys"
 )]
 struct Arguments {
     #[arg(long)]
@@ -33,6 +34,10 @@ struct Arguments {
     signature_file: Option<PathBuf>,
     #[arg(long, requires = "cleartext")]
     output: Option<PathBuf>,
+    #[arg(long, requires_all = ["signature_file", "expected_size"], conflicts_with = "cleartext")]
+    package: bool,
+    #[arg(long, requires = "package", value_parser = clap::value_parser!(u64).range(..=PACKAGE_CAP))]
+    expected_size: Option<u64>,
     input: PathBuf,
 }
 
@@ -40,6 +45,12 @@ struct Arguments {
 enum Failure {
     #[error("input: expected a readable regular file of at most 32 MiB")]
     Input,
+    #[error(
+        "package input: expected a readable regular file matching --expected-size within 8 GiB"
+    )]
+    PackageInput,
+    #[error("input changed during verification")]
+    InputChanged,
     #[error("keyring: malformed, secret, empty, or excessive trusted public-key material")]
     Keyring,
     #[error("policy: unable to load the system cryptographic policy")]
@@ -90,24 +101,37 @@ fn verify(arguments: Arguments, now: SystemTime) -> Result<(), Failure> {
         .parse_config_file(ConfiguredStandardPolicy::CONFIG_FILE)
         .map_err(|_| Failure::Policy)?;
     let policy = configured.build();
-    let certs = trust::load(open_input(&arguments.keyring)?)?;
+    let mut keyring = input::open_metadata(&arguments.keyring)?;
+    let certs = trust::load(&mut keyring)?;
+    keyring.verify_unchanged()?;
     let signature_type = if arguments.cleartext {
         SignatureType::Text
     } else {
         SignatureType::Binary
     };
     let helper = trust::Helper::new(certs, &policy, now, signature_type);
-    let mut input = open_input(&arguments.input)?;
+    let mut input = if arguments.package {
+        input::open_package(
+            &arguments.input,
+            arguments.expected_size.ok_or(Failure::Mode)?,
+        )?
+    } else {
+        input::open_metadata(&arguments.input)?
+    };
 
     if let Some(signature_path) = arguments.signature_file {
-        let signature = open_input(&signature_path)?;
-        let mut verifier = DetachedVerifierBuilder::from_reader(signature)
+        let mut signature = input::open_metadata(&signature_path)?;
+        let mut verifier = DetachedVerifierBuilder::from_reader(&mut signature)
             .map_err(|_| Failure::Verification)?
             .with_policy(&policy, Some(now), helper)
             .map_err(|_| Failure::Verification)?;
         verifier
-            .verify_reader(input)
+            .verify_reader(&mut input)
             .map_err(|_| Failure::Verification)?;
+        drop(verifier);
+        input.finish()?;
+        signature.verify_unchanged()?;
+        keyring.verify_unchanged()?;
         return Ok(());
     }
 
@@ -128,8 +152,7 @@ fn verify(arguments: Arguments, now: SystemTime) -> Result<(), Failure> {
             return Err(Failure::Mode);
         }
     }
-    input.inner.rewind().map_err(|_| Failure::Input)?;
-    input.remaining = MAX_BYTES;
+    input.rewind()?;
     let output_path = arguments.output.ok_or(Failure::Mode)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -142,7 +165,7 @@ fn verify(arguments: Arguments, now: SystemTime) -> Result<(), Failure> {
     // Bytes are provisional until verification finishes.  The caller only
     // trusts exit zero; remove partial output on every ordinary failure.
     let result = (|| {
-        let mut verifier = VerifierBuilder::from_reader(input)
+        let mut verifier = VerifierBuilder::from_reader(&mut input)
             .map_err(|_| Failure::Verification)?
             .with_policy(&policy, Some(now), helper)
             .map_err(|_| Failure::Verification)?;
@@ -155,14 +178,19 @@ fn verify(arguments: Arguments, now: SystemTime) -> Result<(), Failure> {
             if count == 0 {
                 break;
             }
-            written += count as u64;
-            if written > MAX_BYTES {
+            written = written
+                .checked_add(u64::try_from(count).map_err(|_| Failure::Output)?)
+                .ok_or(Failure::Output)?;
+            if written > METADATA_CAP {
                 return Err(Failure::Output);
             }
             output
                 .write_all(&buffer[..count])
                 .map_err(|_| Failure::Output)?;
         }
+        drop(verifier);
+        input.finish()?;
+        keyring.verify_unchanged()?;
         output.flush().map_err(|_| Failure::Output)
     })();
     drop(output);
@@ -170,47 +198,4 @@ fn verify(arguments: Arguments, now: SystemTime) -> Result<(), Failure> {
         fs::remove_file(output_path).map_err(|_| Failure::Output)?;
     }
     result
-}
-
-fn open_input(path: &Path) -> Result<LimitedReader<File>, Failure> {
-    // Check before open as well: opening a FIFO could otherwise block before
-    // the post-open check. Follow normal operator-owned keyring symlinks (as
-    // installed by Debian); private caller-owned artifact paths prevent mutation.
-    let metadata = fs::metadata(path).map_err(|_| Failure::Input)?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
-        return Err(Failure::Input);
-    }
-    let file = File::open(path).map_err(|_| Failure::Input)?;
-    let metadata = file.metadata().map_err(|_| Failure::Input)?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
-        return Err(Failure::Input);
-    }
-    Ok(LimitedReader {
-        inner: file,
-        remaining: MAX_BYTES,
-    })
-}
-
-struct LimitedReader<R> {
-    inner: R,
-    remaining: u64,
-}
-
-impl<R: Read> Read for LimitedReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        if self.remaining == 0 {
-            let mut overflow = [0];
-            return match self.inner.read(&mut overflow)? {
-                0 => Ok(0),
-                _ => Err(io::Error::other("input exceeds 32 MiB")),
-            };
-        }
-        let limit = buffer.len().min(self.remaining as usize);
-        let count = self.inner.read(&mut buffer[..limit])?;
-        self.remaining -= count as u64;
-        Ok(count)
-    }
 }

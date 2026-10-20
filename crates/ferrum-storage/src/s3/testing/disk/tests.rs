@@ -14,6 +14,8 @@ fn remote(root: &std::path::Path, maximum: u64) -> DiskBackedRemote {
     DiskBackedRemote::new(
         root.join("remote"),
         maximum,
+        config::ENDPOINT,
+        config::BUCKET,
         ["linux-packages/".into(), "linux-checkpoints/".into()],
     )
     .unwrap()
@@ -618,14 +620,14 @@ async fn endpoint_query_and_size_boundaries_fail_without_creating_data() {
     let root = tempfile::tempdir().unwrap();
     let remote = remote(root.path(), 1024);
     for uri in [
-        "http://s3.us-central-1.idrivee2.com/s3-andrew/linux-packages/key",
-        "https://example.com/s3-andrew/linux-packages/key",
-        "https://s3.us-central-1.idrivee2.com/other/linux-packages/key",
-        "https://s3.us-central-1.idrivee2.com/s3-andrew/unowned/key",
-        "https://s3.us-central-1.idrivee2.com/s3-andrew/linux-packages/key?versionId=1",
-        "https://s3.us-central-1.idrivee2.com/s3-andrew/linux-packages/key?x-id=PutObject",
-        "https://s3.us-central-1.idrivee2.com/s3-andrew/linux-packages/key?x-id=GetObject&x-id=GetObject",
-        "https://s3.us-central-1.idrivee2.com/s3-andrew/linux-packages/%2e%2e/unowned",
+        "http://s3.us-east-1.amazonaws.com/ferrum/linux-packages/key",
+        "https://example.com/ferrum/linux-packages/key",
+        "https://s3.us-east-1.amazonaws.com/other/linux-packages/key",
+        "https://s3.us-east-1.amazonaws.com/ferrum/unowned/key",
+        "https://s3.us-east-1.amazonaws.com/ferrum/linux-packages/key?versionId=1",
+        "https://s3.us-east-1.amazonaws.com/ferrum/linux-packages/key?x-id=PutObject",
+        "https://s3.us-east-1.amazonaws.com/ferrum/linux-packages/key?x-id=GetObject&x-id=GetObject",
+        "https://s3.us-east-1.amazonaws.com/ferrum/linux-packages/%2e%2e/unowned",
     ] {
         assert!(
             remote.call(HttpRequest::get(uri).unwrap()).await.is_err(),
@@ -669,7 +671,9 @@ async fn owned_root_is_exclusive_and_cleanup_waits_for_readers() {
         DiskBackedRemote::new(
             root.path().join("remote"),
             1024,
-            ["linux-packages/".into(), "linux-checkpoints/".into()]
+            config::ENDPOINT,
+            config::BUCKET,
+            ["linux-packages/".into(), "linux-checkpoints/".into()],
         )
         .is_err()
     );
@@ -1081,7 +1085,9 @@ fn root_refuses_symlink_ancestors_without_touching_target() {
         DiskBackedRemote::new(
             root.path().join("linked/remote"),
             1024,
-            ["linux-packages/".into(), "linux-checkpoints/".into()]
+            config::ENDPOINT,
+            config::BUCKET,
+            ["linux-packages/".into(), "linux-checkpoints/".into()],
         )
         .is_err()
     );

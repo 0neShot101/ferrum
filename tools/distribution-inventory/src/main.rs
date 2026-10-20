@@ -85,6 +85,10 @@ impl SuiteReport {
 }
 
 fn validate_identity(release: &Release, suite: &Suite, now: UnixTime) -> Result<()> {
+    ensure!(
+        release.suite.is_some(),
+        "Suite is required for Debian and Ubuntu"
+    );
     if suite.ubuntu {
         ensure!(
             release.origin == "Ubuntu",
@@ -101,7 +105,7 @@ fn validate_identity(release: &Release, suite: &Suite, now: UnixTime) -> Result<
             release.codename
         );
         ensure!(
-            release.suite == suite.name,
+            release.suite.as_deref() == Some(suite.name),
             "unexpected Ubuntu pocket {:?}",
             release.suite
         );

@@ -3,7 +3,7 @@ mod production;
 pub use production::{
     ControlCondition, ControlObject, OperationIdentity, S3Config, S3Store, VerifiedUpload,
 };
-mod config;
+pub(crate) mod config;
 mod journal;
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-harness"))]
@@ -115,7 +115,7 @@ impl PrivateStore {
         config.validate()?;
         let journal = journal::Journal::reopen(&config)?;
         let config = Arc::new(config);
-        let wire = wire::Wire::new(config.clone(), journal.clone());
+        let wire = wire::Wire::new(config.clone(), journal.clone())?;
         let client = config::client(&config, wire.clone())?;
         Ok(Self {
             client,
@@ -246,7 +246,7 @@ impl PrivateStore {
         let output = bounded(deadline, &cancel, async {
             self.client
                 .get_object()
-                .bucket(config::BUCKET)
+                .bucket(&self.config.bucket)
                 .key(&key)
                 .send()
                 .await
@@ -316,7 +316,7 @@ impl PrivateStore {
         let output = bounded(deadline, &cancel, async {
             self.client
                 .head_object()
-                .bucket(config::BUCKET)
+                .bucket(&self.config.bucket)
                 .key(&key)
                 .send()
                 .await
@@ -369,7 +369,7 @@ impl PrivateStore {
         let output = bounded(deadline, &cancel, async {
             self.client
                 .put_object()
-                .bucket(config::BUCKET)
+                .bucket(&self.config.bucket)
                 .key(&key)
                 .if_none_match("*")
                 .metadata("ferrum-b05-run", self.config.marker())
@@ -437,7 +437,7 @@ impl PrivateStore {
         let output = bounded(deadline, &cancel, async {
             self.client
                 .put_object()
-                .bucket(config::BUCKET)
+                .bucket(&self.config.bucket)
                 .key(&key)
                 .if_match(etag)
                 .metadata("ferrum-b05-run", self.config.marker())
@@ -484,7 +484,7 @@ impl PrivateStore {
         match bounded(deadline, &cancel, async {
             invalid
                 .get_object()
-                .bucket(config::BUCKET)
+                .bucket(&self.config.bucket)
                 .key(&key)
                 .send()
                 .await
@@ -526,7 +526,7 @@ impl PrivateStore {
             let output = bounded(deadline, &cancel, async {
                 client
                     .head_object()
-                    .bucket(config::BUCKET)
+                    .bucket(&self.config.bucket)
                     .key(&key)
                     .send()
                     .await
@@ -570,7 +570,7 @@ impl PrivateStore {
             bounded(deadline, &cancel, async {
                 client
                     .delete_object()
-                    .bucket(config::BUCKET)
+                    .bucket(&self.config.bucket)
                     .key(&key)
                     .if_match(etag)
                     .send()

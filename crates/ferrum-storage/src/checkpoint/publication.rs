@@ -46,44 +46,6 @@ impl PackageDescriptor {
     }
 }
 impl CheckpointPublisher {
-    /// Registers a detached signature only after the caller verifies its package binding.
-    /// Conflicting index identities and descriptors from another spool are rejected.
-    pub fn register_verified_package_signature(
-        &self,
-        package: &PackageDescriptor,
-        sig_path: &RepositoryPath,
-        sig_identity: ObjectIdentity,
-    ) -> Result<PackageDescriptor, CheckpointError> {
-        if !self.spool.same_owner(&package.proof.owner)
-            || sig_path.as_str() != format!("{}.sig", package.path.as_str())
-            || !ferrum_apt::pacman::is_pacman_package_path(sig_path.as_str())
-        {
-            return Err(CheckpointError::Proof);
-        }
-        let id = package.index.id.clone();
-        let path = sig_path.as_str().to_owned();
-        self.spool.catalog_write(move |connection| {
-            let transaction = connection.transaction()?;
-            let digest = sig_identity.sha256.to_hex();
-            let size = crate::catalog::signed(sig_identity.size)?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO capture_index_entries(index_id,path,digest,size) VALUES(?1,?2,?3,?4)",
-                params![id, path, digest, size],
-            )?;
-            let conflict: bool = transaction.query_row(
-                "SELECT digest<>?3 OR size<>?4 FROM capture_index_entries WHERE index_id=?1 AND path=?2",
-                params![id, path, digest, size],
-                |row| row.get(0),
-            )?;
-            if conflict {
-                return Err(CatalogError::InvalidState);
-            }
-            transaction.commit()?;
-            Ok(())
-        })?;
-        self.lookup_package(&package.generation().repository, sig_path)?
-            .ok_or(CheckpointError::Proof)
-    }
     pub fn record_error(
         &self,
         key: &SuiteKey,
@@ -184,6 +146,17 @@ impl CheckpointPublisher {
                 .remove(scope);
             return Err(error);
         }
+        // The cached content may be reused, but request-time package verification
+        // must use the exact policy and verifier that just revalidated it.
+        let mut rebound = (*proof).clone();
+        rebound.package_authority = policy
+            .is_pacman()
+            .then(|| (verifier.clone(), policy.keyring().to_path_buf()));
+        let proof = Arc::new(rebound);
+        self.proofs
+            .lock()
+            .map_err(|_| CheckpointError::Proof)?
+            .insert(scope.to_owned(), proof.clone());
         Ok(Some(proof))
     }
     /// Persisted JSON is not a capability. Only proofs authenticated in this

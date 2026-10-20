@@ -31,6 +31,21 @@ pub(crate) fn proof_pin(generation: &str) -> Sha256Digest {
     hash.update(generation.as_bytes());
     hash.finalize()
 }
+pub(crate) fn signature_pin(
+    generation: &str,
+    package_path: &str,
+    signature: ObjectIdentity,
+) -> Sha256Digest {
+    let mut hash = ferrum_apt::digest::Sha256Hasher::new();
+    hash.update(b"ferrum-capture-package-signature-v1:");
+    hash.update(generation.as_bytes());
+    hash.update(&[0]);
+    hash.update(package_path.as_bytes());
+    hash.update(&[0]);
+    hash.update(signature.sha256.as_bytes());
+    hash.update(&signature.size.to_le_bytes());
+    hash.finalize()
+}
 /// A disk reservation or admitted commit owns the capture until its own cleanup.
 /// This is called within the same SQL transaction that removes the last disk
 /// reservation, preventing a cancelled commit from losing its outbox intent.

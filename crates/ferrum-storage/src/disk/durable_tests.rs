@@ -1076,3 +1076,58 @@ async fn owned_installed_snapshot_cleans_error_and_cancel_but_preserves_shared_l
             .expect("cleanup")
     );
 }
+
+#[tokio::test]
+async fn cancelled_candidate_commit_remains_reclaimable_after_reopen() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+    let bytes = Bytes::from_static(b"provisional package abandoned after body commit");
+    let expected = identity(&bytes);
+    let writer = writer(&spool, bytes, ReservationClass::Package).await;
+    let mut gate = Gate::arm(&spool, "commit");
+    let job = tokio::spawn(writer.commit_candidate());
+    gate.entered().await;
+    job.abort();
+    assert!(job.await.expect_err("caller cancelled").is_cancelled());
+    gate.release();
+    let permits = Arc::clone(spool.0.io_permits())
+        .acquire_many_owned(2)
+        .await
+        .expect("detached commit drained");
+    drop(permits);
+    assert_eq!(spool.accounting().reserved, 0);
+    assert!(spool.lookup(expected).is_some());
+    drop(spool);
+
+    let spool = open(root.path());
+    assert_eq!(
+        spool.reclaim(expected.size).expect("provisional eviction"),
+        expected.size
+    );
+    assert!(spool.lookup(expected).is_none());
+    assert_eq!(pending(root.path()), 0);
+}
+
+#[tokio::test]
+async fn candidate_dedup_does_not_downgrade_existing_package_ownership() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+    let bytes = Bytes::from_static(b"already retained shared package");
+    let expected = identity(&bytes);
+    let existing = install(&spool, bytes.clone(), ReservationClass::Package).await;
+    let candidate = writer(&spool, bytes, ReservationClass::Package)
+        .await
+        .commit_candidate()
+        .await
+        .expect("shared candidate");
+    assert_eq!(existing.path(), candidate.path());
+    drop((existing, candidate));
+    assert_eq!(spool.reclaim(expected.size).expect("existing ownership"), 0);
+    drop(spool);
+    let spool = open(root.path());
+    assert_eq!(
+        spool.reclaim(expected.size).expect("persisted ownership"),
+        0
+    );
+    assert!(spool.lookup(expected).is_some());
+}

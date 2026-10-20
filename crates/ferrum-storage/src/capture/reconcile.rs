@@ -59,8 +59,8 @@ impl CaptureManager {
         self.spool.reset_capture_verification()?;
         self.reconcile_gc_intents(now, deadline, cancel).await?;
         let suites = self.spool.durable_catalog()?.read(|connection| {
-            let mut statement = connection.prepare("SELECT repository,suite FROM suite_checkpoints WHERE floor IS NOT NULL OR active IS NOT NULL OR pending IS NOT NULL LIMIT 65")?;
-            let rows = statement.query_map([], |row| {
+            let mut statement = connection.prepare("SELECT repository,suite FROM suite_checkpoints WHERE floor IS NOT NULL OR active IS NOT NULL OR pending IS NOT NULL LIMIT ?1")?;
+            let rows = statement.query_map([crate::checkpoint::MAX_SUITES as i64 + 1], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -180,7 +180,7 @@ impl CaptureManager {
                         let suffix = key
                             .strip_prefix(&prefix)
                             .ok_or(CatalogError::InvalidState)?;
-                        if prefix == "linux-packages/" && is_qualification_namespace(suffix) {
+                        if !prefix.contains("/_ferrum-b07/") && is_qualification_namespace(suffix) {
                             continue;
                         }
                         let kind = kind(suffix).ok_or(CatalogError::InvalidState)?;
@@ -277,7 +277,7 @@ impl CaptureManager {
                     .control_get(
                         OperationIdentity::Object,
                         suffix,
-                        16 * 1024,
+                        super::RECEIPT_LIMIT,
                         deadline,
                         cancel,
                     )
@@ -294,7 +294,12 @@ impl CaptureManager {
                 }
                 self.ensure_receipt_proof(&receipt, trusts, verifier, now, deadline, cancel)
                     .await?;
-                self.record_indexed_receipt(&receipt, now)?;
+                let authenticated = self
+                    .authenticate_package_receipt(
+                        &receipt, trusts, verifier, deadline, cancel, true,
+                    )
+                    .await?;
+                self.record_indexed_receipt(&receipt, authenticated.as_ref(), now)?;
                 self.store.account_observed(
                     OperationIdentity::Object,
                     suffix,
@@ -310,6 +315,8 @@ impl CaptureManager {
             }
         }
         self.authenticate_pending_proofs(trusts, verifier, deadline, cancel)
+            .await?;
+        self.authenticate_pending_packages(trusts, verifier, deadline, cancel)
             .await?;
         // Rebuild references only for proofs authenticated in this traversal.
         // A crash midway through retirement must not leave an obsolete infinity
@@ -687,6 +694,209 @@ impl CaptureManager {
         }
         Err(CaptureError::Proof)
     }
+    async fn authenticate_package_receipt(
+        &self,
+        receipt: &CaptureReceipt,
+        trusts: &[CaptureTrust],
+        verifier: &SignatureVerifier,
+        deadline: Instant,
+        cancel: &CancellationToken,
+        require_remote: bool,
+    ) -> Result<Option<super::VerifiedCaptureProof>, CaptureError> {
+        if !ferrum_apt::pacman::is_pacman_package_path(&receipt.public_package_path) {
+            return if receipt.package_signature.is_none() {
+                Ok(None)
+            } else {
+                Err(CaptureError::Proof)
+            };
+        }
+        let package_path = receipt
+            .public_package_path
+            .strip_suffix(".sig")
+            .unwrap_or(&receipt.public_package_path)
+            .to_owned();
+        let repository = receipt.repository.clone();
+        let raw_generation = receipt.proof_generation_id.clone();
+        let candidate_path = package_path.clone();
+        let (encoded, digest, size, index_path) = self.spool.durable_catalog()?.read(move |connection| {
+            Ok(connection.query_row(
+                "SELECT q.manifest,e.digest,e.size,m.path FROM capture_proofs q JOIN capture_proof_indexes m ON m.generation=q.generation JOIN capture_indexes i ON i.id=m.index_id AND i.verified=1 JOIN capture_index_entries e ON e.index_id=i.id WHERE q.reconciled=1 AND q.repository=?1 AND q.raw_generation=?2 AND e.path=?3 ORDER BY q.generation LIMIT 1",
+                params![repository,raw_generation,candidate_path],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,crate::catalog::read_unsigned(row,2)?,row.get::<_,String>(3)?)),
+            )?)
+        })?;
+        let manifest: GenerationManifest = serde_json::from_str(&encoded)?;
+        let trust = trusts
+            .iter()
+            .find(|trust| manifest.key().is_ok_and(|key| key == trust.key))
+            .filter(|trust| trust.policy.is_pacman())
+            .ok_or(CaptureError::Proof)?;
+        let historical = Arc::new(
+            tokio::time::timeout_at(
+                deadline,
+                verify_historical_proof(&self.spool, &manifest, &trust.policy, verifier),
+            )
+            .await
+            .map_err(|_| CaptureError::Admission)?
+            .map_err(|_| CaptureError::Proof)?,
+        );
+        let identity = ferrum_apt::digest::ObjectIdentity {
+            sha256: Sha256Digest::from_hex(&digest).map_err(|_| CaptureError::Proof)?,
+            size,
+        };
+        let path = ferrum_apt::path::RepositoryPath::parse_decoded(&package_path)
+            .map_err(|_| CaptureError::Proof)?;
+        let candidate = super::VerifiedCaptureProof::from_index(
+            &self.spool,
+            historical.clone(),
+            &index_path,
+            path,
+            identity,
+            deadline,
+            cancel,
+        )
+        .await?;
+        let signature_identity = if let Some(binding) = &receipt.package_signature {
+            if binding.package_path() != package_path || binding.package_identity()? != identity {
+                return Err(CaptureError::Proof);
+            }
+            binding.signature_identity()?
+        } else if receipt.public_package_path.ends_with(".sig") {
+            receipt.validate()?
+        } else if let Some(identity) = candidate.candidate_signature_identity()? {
+            identity
+        } else {
+            // Legacy dynamic receipts have no binding field. The sibling is only
+            // a bounded locator: its actual bytes must still verify this package.
+            let prefix = self.store.package_key(&format!(
+                "v1/captures/{}/{}/",
+                receipt.repository,
+                Sha256Digest::of(format!("{package_path}.sig").as_bytes())
+            ))?;
+            let rows = self.spool.durable_catalog()?.read(move |connection| {
+                let mut statement = connection.prepare("SELECT key FROM capture_inventory WHERE key>=?1 AND key<?2 AND kind=2 ORDER BY key LIMIT 2")?;
+                let rows = statement.query_map(params![prefix,format!("{prefix}~")],|row|row.get::<_,String>(0))?;
+                Ok(rows.collect::<Result<Vec<_>,_>>()?)
+            })?;
+            if rows.len() != 1 {
+                return Err(CaptureError::Proof);
+            }
+            let suffix = rows[0]
+                .strip_prefix(self.store.package_prefix()?)
+                .ok_or(CaptureError::Proof)?;
+            let read = self
+                .store
+                .control_get(
+                    OperationIdentity::Object,
+                    suffix,
+                    super::RECEIPT_LIMIT,
+                    deadline,
+                    cancel,
+                )
+                .await?;
+            let sibling: CaptureReceipt = serde_json::from_slice(&read.bytes)?;
+            if sibling.repository != receipt.repository
+                || sibling.proof_generation_id != receipt.proof_generation_id
+                || sibling.public_package_path != format!("{package_path}.sig")
+                || sibling.suffix() != suffix
+            {
+                return Err(CaptureError::Proof);
+            }
+            sibling.validate()?
+        };
+        let package = self
+            .restore_binding_object(identity, deadline, cancel, require_remote)
+            .await?;
+        let signature = self
+            .restore_binding_object(signature_identity, deadline, cancel, require_remote)
+            .await?;
+        let verified = candidate
+            .authenticate_package(&package, &signature, deadline, cancel)
+            .await?;
+        if receipt
+            .package_signature
+            .as_ref()
+            .is_some_and(|binding| Some(binding) != verified.package_signature())
+        {
+            return Err(CaptureError::Proof);
+        }
+        let path = ferrum_apt::path::RepositoryPath::parse_decoded(&receipt.public_package_path)
+            .map_err(|_| CaptureError::Proof)?;
+        let authenticated = super::VerifiedCaptureProof {
+            proof: historical,
+            path,
+            identity: receipt.validate()?,
+            package_signature: verified.package_signature.clone(),
+            package_objects: verified.package_objects.clone(),
+            request_authentication: std::sync::OnceLock::new(),
+        };
+        authenticated.require_package_authentication()?;
+        if let Some(binding) = authenticated.package_signature() {
+            let signature = binding.signature_identity()?;
+            let pin = super::lifecycle::signature_pin(
+                &authenticated.manifest().scope_id().to_hex(),
+                binding.package_path(),
+                signature,
+            );
+            if require_remote {
+                self.spool.release_generation(pin)?;
+            } else {
+                self.spool.retain_generation(pin, &[signature])?;
+            }
+        }
+        let signature_suffix = format!("v1/objects/sha256/{}", signature_identity.sha256);
+        self.inventory(&self.store.package_key(&signature_suffix)?, 0)?;
+        self.store.account_observed(
+            OperationIdentity::Object,
+            &signature_suffix,
+            signature_identity.size,
+            BudgetClass::Control,
+        )?;
+        Ok(Some(authenticated))
+    }
+    async fn authenticate_pending_packages(
+        &self,
+        trusts: &[CaptureTrust],
+        verifier: &SignatureVerifier,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), CaptureError> {
+        let mut after_repository = String::new();
+        let mut after_path = String::new();
+        loop {
+            let repository = after_repository.clone();
+            let path = after_path.clone();
+            let rows = self.spool.durable_catalog()?.read(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT p.repository,p.path,p.digest,b.size,q.raw_generation,b.first_capture,p.generation FROM capture_paths p JOIN capture_blobs b ON b.digest=p.digest JOIN capture_proofs q ON q.generation=p.generation WHERE q.reconciled=1 AND p.receipt_verified=0 AND (p.repository,p.path)>(?1,?2) ORDER BY p.repository,p.path LIMIT 32"
+                )?;
+                let rows = statement.query_map(params![repository,path], |row| Ok((
+                    CaptureReceipt {
+                        schema_version: 1, repository: row.get(0)?, public_package_path: row.get(1)?,
+                        sha256: row.get(2)?, size: crate::catalog::read_unsigned(row,3)?,
+                        proof_generation_id: row.get(4)?, first_capture_time: row.get(5)?,
+                        package_signature: None,
+                    }, row.get::<_,String>(6)?,
+                )))?;
+                Ok(rows.collect::<Result<Vec<_>,_>>()?)
+            })?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for (mut receipt, generation) in rows {
+                after_repository.clone_from(&receipt.repository);
+                after_path.clone_from(&receipt.public_package_path);
+                if ferrum_apt::pacman::is_pacman_package_path(&receipt.public_package_path) {
+                    receipt.package_signature =
+                        self.package_binding(&generation, &receipt.public_package_path)?;
+                    self.authenticate_package_receipt(
+                        &receipt, trusts, verifier, deadline, cancel, false,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
     fn inventory(&self, key: &str, kind: i64) -> Result<(), CaptureError> {
         let key = key.to_owned();
         self.spool.catalog_write(move |connection| {
@@ -765,6 +975,7 @@ impl CaptureManager {
                         size: crate::catalog::read_unsigned(row, 3)?,
                         proof_generation_id: row.get(4)?,
                         first_capture_time: row.get(5)?,
+                        package_signature: None,
                     })
                 })?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1139,10 +1350,28 @@ impl CaptureManager {
     fn record_indexed_receipt(
         &self,
         receipt: &CaptureReceipt,
+        authenticated: Option<&super::VerifiedCaptureProof>,
         now: i64,
     ) -> Result<(), CaptureError> {
         let identity = receipt.validate()?;
+        if ferrum_apt::pacman::is_pacman_package_path(&receipt.public_package_path) {
+            let authenticated = authenticated.ok_or(CaptureError::Proof)?;
+            authenticated.require_package_authentication()?;
+            if authenticated.identity() != identity
+                || authenticated.path().as_str() != receipt.public_package_path
+                || authenticated.repository() != receipt.repository
+                || authenticated.manifest().generation_id != receipt.proof_generation_id
+                || receipt.package_signature.as_ref().is_some_and(|binding| {
+                    Some(binding) != authenticated.package_signature.as_ref()
+                })
+            {
+                return Err(CaptureError::Proof);
+            }
+        } else if receipt.package_signature.is_some() {
+            return Err(CaptureError::Proof);
+        }
         let saved = receipt.clone();
+        let remote_package_verified = authenticated.is_some();
         let retain = now.checked_add(GRACE).ok_or(CaptureError::Admission)?;
         let accepted = self.spool.capture_write(identity, move |connection| {
             let transaction = connection.transaction()?;
@@ -1186,6 +1415,24 @@ impl CaptureManager {
                     Sha256Digest::of(saved.public_package_path.as_bytes()).to_hex()
                 ],
             )?;
+            if remote_package_verified {
+                // This receipt's exact package and signature were both read back
+                // and cryptographically verified above. Only deletion eligibility
+                // is granted here; suite coverage remains closed until traversal ends.
+                transaction.execute(
+                    "UPDATE capture_blobs SET readback_verified=1 WHERE digest=?1",
+                    [identity.sha256.to_hex()],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO derived_residency(digest) SELECT digest FROM objects WHERE digest=?1",
+                    [identity.sha256.to_hex()],
+                )?;
+            } else {
+                transaction.execute(
+                    "DELETE FROM derived_residency WHERE digest=?1",
+                    [identity.sha256.to_hex()],
+                )?;
+            }
             transaction.commit()?;
             Ok(true)
         })?;

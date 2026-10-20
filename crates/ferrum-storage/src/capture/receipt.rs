@@ -18,7 +18,7 @@ pub(super) async fn read(
         .control_get(
             OperationIdentity::Object,
             &suffix,
-            16 * 1024,
+            super::RECEIPT_LIMIT,
             deadline,
             cancel,
         )
@@ -52,6 +52,9 @@ pub(super) async fn put(
     cancel: &CancellationToken,
 ) -> Result<CaptureReceipt, CaptureError> {
     let bytes = serde_json::to_vec(expected)?;
+    if bytes.len() as u64 > super::RECEIPT_LIMIT {
+        return Err(CaptureError::Proof);
+    }
     if let Err(error) = store
         .control_put(
             OperationIdentity::Object,
@@ -165,6 +168,7 @@ mod tests {
                 proof_generation_id: Sha256Digest::of(b"post-authenticated owner transition")
                     .to_hex(),
                 first_capture_time: 1,
+                package_signature: None,
             };
             let mut other = expected.clone();
             other.repository = "origin-b".into();

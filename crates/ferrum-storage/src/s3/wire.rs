@@ -38,18 +38,22 @@ impl fmt::Debug for Wire {
 }
 
 impl Wire {
-    pub(crate) fn new(config: Arc<PrivateS3Config>, journal: SharedJournal) -> Self {
-        Self {
+    pub(crate) fn new(
+        config: Arc<PrivateS3Config>,
+        journal: SharedJournal,
+    ) -> Result<Self, S3Error> {
+        let host = super::config::valid_endpoint_and_host(&config.endpoint)?;
+        Ok(Self {
             inner: aws_smithy_http_client::Builder::new()
                 .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                     aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
                 ))
-                .build_with_resolver(super::production::dns::PublicResolver::default()),
+                .build_with_resolver(super::production::dns::PublicResolver::new(host.into())),
             journal,
             config,
             cleanup: false,
             sentinel: false,
-        }
+        })
     }
 
     #[cfg(any(test, feature = "test-harness"))]
@@ -108,9 +112,10 @@ fn denied(error: S3Error) -> ConnectorError {
 }
 
 fn boundary(request: &HttpRequest, config: &PrivateS3Config) -> Result<String, S3Error> {
+    let expected_host = super::config::valid_endpoint_and_host(&config.endpoint)?;
     let uri = url::Url::parse(request.uri()).map_err(|_| S3Error::Boundary)?;
     if uri.scheme() != "https"
-        || uri.host_str() != Some("s3.us-central-1.idrivee2.com")
+        || uri.host_str() != Some(expected_host.as_str())
         || uri.port().is_some()
         || !uri.username().is_empty()
         || uri.password().is_some()
@@ -120,7 +125,7 @@ fn boundary(request: &HttpRequest, config: &PrivateS3Config) -> Result<String, S
     }
     let key = uri
         .path()
-        .strip_prefix("/s3-andrew/")
+        .strip_prefix(&format!("/{}/", config.bucket))
         .ok_or(S3Error::Boundary)?;
     config.validate_key(key)?;
     let operation = match request.method() {
@@ -588,10 +593,9 @@ mod tests {
             "/linux-checkpoints/v1/state",
             "/linux-packages/v1/objects/sha256/0000",
         ] {
-            let request = HttpRequest::get(format!(
-                "https://s3.us-central-1.idrivee2.com/s3-andrew{suffix}"
-            ))
-            .expect("request");
+            let request =
+                HttpRequest::get(format!("{}/{}{suffix}", config.endpoint, config.bucket))
+                    .expect("request");
             assert!(boundary(&request, &config).is_err());
         }
     }

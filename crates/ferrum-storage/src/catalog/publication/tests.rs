@@ -11,7 +11,19 @@ fn stage(
     path: &str,
     digest: Sha256Digest,
 ) -> Activation {
-    let artifacts = ["InRelease", "Release", "Release.gpg"]
+    let paths = if SuiteKey::new(repository, suite)
+        .unwrap()
+        .uses_transport_candidate_metadata()
+    {
+        [
+            "os/x86_64/core.db",
+            "os/x86_64/canary-1-1-any.pkg.tar.zst",
+            "os/x86_64/canary-1-1-any.pkg.tar.zst.sig",
+        ]
+    } else {
+        ["InRelease", "Release", "Release.gpg"]
+    };
+    let artifacts = paths
         .into_iter()
         .map(|path| ManifestArtifact {
             path: path.into(),
@@ -846,4 +858,48 @@ fn capture_mapping_claim_checks_digest_size_and_repository_without_publication()
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn pacman_candidate_revisions_do_not_inherit_package_build_time_rollback_rules() {
+    let directory = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(directory.path(), 4, true).unwrap();
+    let key = SuiteKey::new("archlinux", "core").unwrap();
+    // A database-only metadata change leaves max BUILDDATE unchanged; removing
+    // the newest-built package can lower it. Neither is a signed repository date.
+    for (sequence, build_date) in [(1, 200), (2, 200), (3, 100)] {
+        let mut revision = stage(
+            &catalog,
+            ("archlinux", "core"),
+            sequence,
+            sequence as i64 * 10,
+            None,
+            "core/os/x86_64/retained-1-1-any.pkg.tar.zst",
+            Sha256Digest::of(b"retained"),
+        );
+        revision.manifest.release_date = build_date;
+        revision.intent.release_date = build_date;
+        revision.intent.manifest_sha256 =
+            Sha256Digest::of(&revision.manifest.encode().unwrap()).to_hex();
+        catalog
+            .publication_observe(
+                key.clone(),
+                revision.intent.generation_id.clone(),
+                build_date,
+                revision.intent.release_content_sha256.clone(),
+                revision.now,
+            )
+            .unwrap();
+        let expected = revision.intent.clone();
+        install(&catalog, revision);
+        let state = catalog.checkpoint_state(key.clone()).unwrap();
+        assert_eq!(state.active, Some(expected));
+        assert_eq!(state.confirmed_at, Some(sequence as i64 * 10));
+    }
+    // Sequence and wall-clock regressions remain rejected even for candidates.
+    assert!(
+        catalog
+            .publication_observe(key, "f".repeat(64), 100, "e".repeat(64), 29)
+            .is_err()
+    );
 }

@@ -106,7 +106,19 @@ pub(super) fn load(
     }
     Ok(state)
 }
-fn ensure(connection: &rusqlite::Connection, key: &SuiteKey) -> Result<(), CatalogError> {
+pub(super) fn ensure(
+    connection: &rusqlite::Connection,
+    key: &SuiteKey,
+) -> Result<(), CatalogError> {
+    let (exists, count): (bool, i64) = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM suite_checkpoints WHERE repository=?1 AND suite=?2), \
+         (SELECT COUNT(*) FROM suite_checkpoints)",
+        params![key.repository(), key.suite()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if !exists && count >= crate::checkpoint::MAX_SUITES as i64 {
+        return Err(CatalogError::InvalidState);
+    }
     connection.execute(
         "INSERT INTO suite_checkpoints(repository,suite) VALUES(?1,?2) ON CONFLICT DO NOTHING",
         params![key.repository(), key.suite()],
@@ -134,14 +146,14 @@ impl Catalog {
             {
                 return Err(CatalogError::InvalidState);
             }
-            if state
+            if !key.uses_transport_candidate_metadata() && state
                 .floor
                 .as_ref()
                 .is_some_and(|floor| intent.release_date < floor.release_date || (intent.release_date == floor.release_date && intent.release_content_sha256 != floor.release_content_sha256))
             {
                 return Err(CatalogError::InvalidState);
             }
-            if state
+            if !key.uses_transport_candidate_metadata() && state
                 .observed_date
                 .is_some_and(|date| intent.release_date < date || (intent.release_date == date && state.observed_content.as_ref() != Some(&intent.release_content_sha256)))
             {
@@ -427,7 +439,7 @@ impl crate::Spool {
             let integrity: String = connection.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))?;
             let app: u32 = connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
             let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if integrity != "ok" || app != super::APPLICATION_ID || !(2..=4).contains(&version) {
+            if integrity != "ok" || app != super::APPLICATION_ID || !(2..=super::SCHEMA_VERSION).contains(&version) {
                 return Err(CatalogError::InvalidState);
             }
             super::validate_catalog(&connection, version)?;
@@ -619,6 +631,21 @@ mod tests {
         catalog.checkpoint_accept(value.clone()).unwrap();
         catalog.checkpoint_activate(value).unwrap();
     }
+    #[test]
+    fn checkpoint_inventory_accepts_shared_ceiling_and_rejects_additional_identity() {
+        let directory = TempDir::new().unwrap();
+        let catalog = Catalog::open(directory.path(), 4, true).unwrap();
+        for index in 0..crate::checkpoint::MAX_SUITES {
+            let key = SuiteKey::new("debian", &format!("suite-{index}")).unwrap();
+            catalog.checkpoint_block(key).unwrap();
+        }
+        let extra = SuiteKey::new("debian", "overflow").unwrap();
+        assert!(catalog.checkpoint_block(extra).is_err());
+        let existing = SuiteKey::new("debian", "suite-0").unwrap();
+        catalog.checkpoint_block(existing.clone()).unwrap();
+        assert!(catalog.checkpoint_state(existing).unwrap().blocked);
+    }
+
     #[test]
     fn crash_matrix_separates_observed_intent_floor_and_active() {
         let directory = TempDir::new().unwrap();

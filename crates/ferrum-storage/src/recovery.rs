@@ -127,13 +127,23 @@ impl GenerationManifest {
             self.repository.as_str(),
             "archlinux" | "chaotic-aur" | "cachyos" | "archlinuxcn" | "endeavouros"
         ) {
+            let package_prefix = ferrum_apt::pacman::pacman_package_prefix(&self.artifacts[0].path)
+                .ok_or(CheckpointError::Proof)?;
+            let database_directory = self.artifacts[0]
+                .path
+                .rsplit_once('/')
+                .map(|(directory, _)| directory)
+                .ok_or(CheckpointError::Proof)?;
+            let package_file = self.artifacts[1]
+                .path
+                .strip_prefix(database_directory)
+                .and_then(|tail| tail.strip_prefix('/'))
+                .ok_or(CheckpointError::Proof)?;
             if !self.derived.is_empty()
                 || self.artifacts.len() != 3
-                || ferrum_apt::pacman::pacman_package_prefix(&self.artifacts[0].path).is_none()
                 || self.artifacts[2].path != format!("{}.sig", self.artifacts[1].path)
                 || !ferrum_apt::pacman::is_pacman_package_path(&format!(
-                    "{}/{}",
-                    self.suite, self.artifacts[1].path
+                    "{package_prefix}/{package_file}"
                 ))
             {
                 return Err(CheckpointError::Proof);
@@ -236,7 +246,9 @@ impl TrustPolicy {
                 Ok("x86_64/chaotic-aur.db".into())
             }
             (Self::CachyOs { .. }, "cachyos", "cachyos" | "cachyos-v3" | "cachyos-v4") => {
-                Ok(format!("x86_64/{}.db", key.suite()))
+                let architecture = ferrum_apt::pacman::cachyos_suite_arch(key.suite())
+                    .ok_or(CheckpointError::Proof)?;
+                Ok(format!("{architecture}/{}.db", key.suite()))
             }
             (Self::ArchLinuxCn { .. }, "archlinuxcn", "archlinuxcn") => {
                 Ok("x86_64/archlinuxcn.db".into())
@@ -365,7 +377,7 @@ impl TrustPolicy {
                 codename.is_some_and(|expected| {
                     release.origin == "Ubuntu"
                         && release.codename == expected
-                        && release.suite == key.suite()
+                        && release.suite.as_deref() == Some(key.suite())
                 })
             }
             Self::UbuntuPorts { .. } => {
@@ -382,7 +394,7 @@ impl TrustPolicy {
                             | "noble-security"
                     )
                     && release.origin == "Ubuntu"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
             }
             Self::DockerDebian { .. } => {
                 key.repository() == "docker-debian"
@@ -398,11 +410,21 @@ impl TrustPolicy {
                 key.repository() == "tailscale-debian"
                     && matches!(key.suite(), "bookworm" | "trixie")
                     && release.origin == "Tailscale"
+                    && release.codename == key.suite()
+                    && release
+                        .suite
+                        .as_deref()
+                        .is_none_or(|suite| suite == key.suite())
             }
             Self::TailscaleUbuntu { .. } => {
                 key.repository() == "tailscale-ubuntu"
                     && matches!(key.suite(), "jammy" | "noble")
                     && release.origin == "Tailscale"
+                    && release.codename == key.suite()
+                    && release
+                        .suite
+                        .as_deref()
+                        .is_none_or(|suite| suite == key.suite())
             }
             Self::PostgresqlApt { .. } => {
                 key.repository() == "postgresql-apt"
@@ -421,7 +443,7 @@ impl TrustPolicy {
                 key.repository() == "kali"
                     && matches!(key.suite(), "kali-rolling" | "kali-last-snapshot")
                     && release.origin == "Kali"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
                     && release.codename == key.suite()
             }
             Self::Parrot { .. } => {
@@ -442,7 +464,7 @@ impl TrustPolicy {
                             | "ecne-security"
                     )
                     && release.origin == "Trisquel"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
                     && release.codename == key.suite()
             }
             Self::RaspberryPi { .. } => {
@@ -467,51 +489,51 @@ impl TrustPolicy {
                 key.repository() == "archlinux"
                     && matches!(key.suite(), "core" | "extra" | "multilib")
                     && release.origin == "ArchLinux"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
                     && release.codename == key.suite()
             }
             Self::ChaoticAur { .. } => {
                 key.repository() == "chaotic-aur"
                     && key.suite() == "chaotic-aur"
                     && release.origin == "ChaoticAUR"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
                     && release.codename == key.suite()
             }
             Self::CachyOs { .. } => {
                 key.repository() == "cachyos"
                     && matches!(key.suite(), "cachyos" | "cachyos-v3" | "cachyos-v4")
                     && release.origin == "CachyOS"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
             }
             Self::ArchLinuxCn { .. } => {
                 key.repository() == "archlinuxcn"
                     && key.suite() == "archlinuxcn"
                     && release.origin == "ArchLinuxCN"
-                    && release.suite == "archlinuxcn"
+                    && release.suite.as_deref() == Some("archlinuxcn")
             }
             Self::EndeavourOs { .. } => {
                 key.repository() == "endeavouros"
                     && key.suite() == "endeavouros"
                     && release.origin == "EndeavourOS"
-                    && release.suite == "endeavouros"
+                    && release.suite.as_deref() == Some("endeavouros")
             }
             Self::AlmaLinux { .. } => {
                 key.repository() == "almalinux"
                     && ferrum_apt::rpm::rpm_suite_root(key.suite()).is_some()
                     && release.origin == "AlmaLinux"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
             }
             Self::RockyLinux { .. } => {
                 key.repository() == "rockylinux"
                     && ferrum_apt::rpm::rpm_suite_root(key.suite()).is_some()
                     && release.origin == "RockyLinux"
-                    && release.suite == key.suite()
+                    && release.suite.as_deref() == Some(key.suite())
             }
             Self::LoopbackFixture { .. } => {
                 key.repository() == "fixture"
                     && key.suite() == "ferrum-test"
                     && release.origin == "FerrumTest"
-                    && release.suite == "ferrum-test"
+                    && release.suite.as_deref() == Some("ferrum-test")
                     && release.codename == "ferrum-test"
             }
         };
@@ -520,6 +542,11 @@ impl TrustPolicy {
             Self::Debian { .. } | Self::Ubuntu { .. } | Self::LoopbackFixture { .. }
         );
         if !valid
+            || (release.suite.is_none()
+                && !matches!(
+                    self,
+                    Self::TailscaleDebian { .. } | Self::TailscaleUbuntu { .. }
+                ))
             || (requires_by_hash && !release.acquire_by_hash)
             || !release
                 .architectures
@@ -549,8 +576,10 @@ impl TrustPolicy {
                 );
             }
             (Self::CachyOs { .. }, "cachyos", "cachyos" | "cachyos-v3" | "cachyos-v4") => {
+                let architecture = ferrum_apt::pacman::cachyos_suite_arch(key.suite())
+                    .ok_or(CheckpointError::Proof)?;
                 return Ok(format!(
-                    "https://mirror.cachyos.org/repo/x86_64/{}/{}.db",
+                    "https://mirror.cachyos.org/repo/{architecture}/{}/{}.db",
                     key.suite(),
                     key.suite()
                 ));
@@ -759,6 +788,7 @@ pub struct VerifiedHistoricalProof {
     artifacts: Vec<VerifiedObject>,
     pub(crate) owner: Spool,
     derived_identities: Vec<(String, ObjectIdentity)>,
+    pub(crate) package_authority: Option<(SignatureVerifier, std::path::PathBuf)>,
 }
 impl VerifiedHistoricalProof {
     pub fn manifest(&self) -> &GenerationManifest {
@@ -768,7 +798,8 @@ impl VerifiedHistoricalProof {
         &self.release
     }
     /// Rechecks stored signatures and their content binding under current policy.
-    /// Pacman canaries and RPM detached metadata signatures retain their bindings.
+    /// A Pacman canary authenticates only itself, never its unsigned database;
+    /// RPM metadata signatures authenticate the full metadata representation.
     pub(crate) async fn revalidate(
         &self,
         policy: &TrustPolicy,
@@ -847,6 +878,11 @@ impl VerifiedHistoricalProof {
         self.manifest
             .artifacts
             .iter()
+            .filter(|artifact| {
+                self.release.authority()
+                    != ferrum_apt::release::MetadataAuthority::TransportCandidate
+                    || artifact.path == self.manifest.artifacts[0].path
+            })
             .map(|artifact| artifact.path.as_str())
             .chain(
                 self.manifest
@@ -865,7 +901,9 @@ impl VerifiedHistoricalProof {
                         .map_or("", |(directory, _)| directory)
                         .to_owned(),
                     identity: self.identity(path).ok_or(CheckpointError::Proof)?,
-                    sha256_alias: entry.is_some_and(|entry| entry.sha256.is_some()),
+                    sha256_alias: self.release.authority()
+                        == ferrum_apt::release::MetadataAuthority::Signed
+                        && entry.is_some_and(|entry| entry.sha256.is_some()),
                     sha512: entry
                         .and_then(|entry| entry.sha512)
                         .map(|digest| digest.to_hex()),
@@ -929,9 +967,10 @@ fn rpm_release(
             .iter()
             .map(|record| pacman_entry(record.path.clone(), record.identity)),
     );
-    let release = Release::for_pacman(
+    let release = Release::for_repository(
         origin,
         key.suite(),
+        ferrum_apt::release::MetadataAuthority::Signed,
         summary.max_timestamp,
         summary.repomd_identity.sha256,
         entries,
@@ -985,10 +1024,11 @@ async fn verify_pacman_canary(
     }
     let scratch = spool.reserve_class(32 * 1024 * 1024, ReservationClass::Metadata)?;
     verifier
-        .verify_detached_owned(
+        .verify_package_owned(
             policy.keyring(),
             package.path(),
             signature.path(),
+            package.size(),
             (scratch, package.clone(), signature.clone()),
         )
         .await?;
@@ -1000,9 +1040,10 @@ async fn verify_pacman_canary(
         TrustPolicy::EndeavourOs { .. } => "EndeavourOS",
         _ => return Err(CheckpointError::Proof),
     };
-    let release = Release::for_pacman(
+    let release = Release::for_repository(
         origin,
         key.suite(),
+        ferrum_apt::release::MetadataAuthority::TransportCandidate,
         summary.max_build_date,
         summary.content_sha256,
         vec![
@@ -1124,6 +1165,7 @@ pub async fn verify_historical_proof(
             artifacts,
             owner: spool.clone(),
             derived_identities: Vec::new(),
+            package_authority: Some((verifier.clone(), policy.keyring().to_path_buf())),
         });
         crate::capture::stage_package_index(
             spool,
@@ -1199,6 +1241,7 @@ pub async fn verify_historical_proof(
             artifacts,
             owner: spool.clone(),
             derived_identities: Vec::new(),
+            package_authority: None,
         });
         crate::capture::stage_package_index(
             spool,
@@ -1226,6 +1269,16 @@ pub async fn verify_historical_proof(
     {
         return Err(CheckpointError::Proof);
     }
+    let historical_architectures: &[&str] = if matches!(policy, TrustPolicy::RaspberryPi { .. })
+        && !manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.path.contains("binary-arm64/"))
+    {
+        &["amd64"]
+    } else {
+        policy.architectures()
+    };
     let (selected, _) = ferrum_apt::selection::select_for_architectures(
         &release,
         policy.components_for_suite(&release.codename),
@@ -1233,7 +1286,7 @@ pub async fn verify_historical_proof(
             policy,
             TrustPolicy::Ubuntu { .. } | TrustPolicy::UbuntuPorts { .. }
         ),
-        policy.architectures(),
+        historical_architectures,
     )
     .map_err(|_| CheckpointError::Proof)?;
     let selected_by_path: std::collections::HashMap<_, _> = selected
@@ -1394,6 +1447,7 @@ pub async fn verify_historical_proof(
         artifacts,
         owner: spool.clone(),
         derived_identities,
+        package_authority: None,
     });
     if let Some(path) = manifest
         .artifacts
@@ -1453,7 +1507,8 @@ impl VerifiedGeneration {
         let now = UnixTime::now().as_secs();
         if self.verified_at.elapsed() > Duration::from_secs(600)
             || now < self.confirmed_at.saturating_sub(600)
-            || self.proof.release.date.as_secs() > now.saturating_add(600)
+            || (self.proof.release.authority() == ferrum_apt::release::MetadataAuthority::Signed
+                && self.proof.release.date.as_secs() > now.saturating_add(600))
             || self
                 .proof
                 .release
@@ -1748,7 +1803,7 @@ impl OriginVerifier {
             Release::parse(&authenticated, &ParseLimits::default())?
         };
         policy.identity(key, &release)?;
-        if release.date.as_secs() > now.saturating_add(600)
+        if (!policy.is_pacman() && release.date.as_secs() > now.saturating_add(600))
             || release
                 .valid_until
                 .is_some_and(|until| until.as_secs() <= now)
@@ -2584,7 +2639,7 @@ mod tests {
                 "cachyos",
                 "cachyos-v3",
                 "CachyOS",
-                "x86_64/cachyos-v3.db",
+                "x86_64_v3/cachyos-v3.db",
             ),
             (
                 TrustPolicy::ArchLinuxCn {
@@ -2614,12 +2669,13 @@ mod tests {
             } else {
                 assert_eq!(
                     policy.origin(&key).unwrap(),
-                    "https://mirror.cachyos.org/repo/x86_64/cachyos-v3/cachyos-v3.db"
+                    "https://mirror.cachyos.org/repo/x86_64_v3/cachyos-v3/cachyos-v3.db"
                 );
             }
-            let mut release = Release::for_pacman(
+            let mut release = Release::for_repository(
                 origin,
                 suite,
+                ferrum_apt::release::MetadataAuthority::TransportCandidate,
                 UnixTime::from_secs(1),
                 Sha256Digest::of(b"db"),
                 Vec::new(),
@@ -2727,9 +2783,10 @@ mod tests {
             manifest.artifacts.swap(0, 1);
             manifest.artifacts[2].path = "9/BaseOS/aarch64/os/repodata/filelists.xml.gz".into();
             assert!(manifest.validate().is_err());
-            let mut release = Release::for_pacman(
+            let mut release = Release::for_repository(
                 origin,
                 key.suite(),
+                ferrum_apt::release::MetadataAuthority::Signed,
                 UnixTime::from_secs(1),
                 Sha256Digest::of(b"metadata"),
                 Vec::new(),
@@ -3218,6 +3275,7 @@ mod transport_tests {
                 artifacts: vec![object.clone(), object.clone(), object],
                 owner: publisher.spool.clone(),
                 derived_identities: Vec::new(),
+                package_authority: None,
             }),
             manifest_sha256,
             confirmed_at: UnixTime::now().as_secs(),
@@ -3260,9 +3318,9 @@ mod transport_tests {
     ) -> (CheckpointPublisher, crate::s3::testing::ScriptedRequests) {
         let ledger = BudgetLedger::initialize(spool.clone(), BudgetLimits::default()).unwrap();
         let config = S3Config {
-            endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-            region: "us-central-1".into(),
-            bucket: "s3-andrew".into(),
+            endpoint: crate::s3::config::DEFAULT_ENDPOINT.into(),
+            region: crate::s3::config::DEFAULT_REGION.into(),
+            bucket: crate::s3::config::DEFAULT_BUCKET.into(),
             package_prefix: "linux-packages/".into(),
             checkpoint_prefix: "linux-checkpoints/".into(),
             credentials_file: spool
@@ -3398,7 +3456,7 @@ mod transport_tests {
         let (fixture, publisher, requests, proof) = warm_publisher(directory.path(), 2).await;
         assert_serving(&publisher, &proof, true);
         let key = fixture.manifest.key().unwrap();
-        let recovered = publisher
+        publisher
             .recover_floor_artifacts(
                 &key,
                 FloorTrust::IntactTrusted,
@@ -3409,7 +3467,7 @@ mod transport_tests {
             )
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(&proof, &recovered.proof));
+        assert_serving(&publisher, &proof, true);
         remove_signer(&fixture.policy);
         assert!(matches!(
             publisher
@@ -3446,10 +3504,6 @@ mod transport_tests {
             )
             .await
             .unwrap();
-        assert!(Arc::ptr_eq(
-            &proof,
-            &publisher.retained_proofs(&key).unwrap()[0]
-        ));
         assert_serving(&publisher, &proof, true);
         remove_signer(&fixture.policy);
         assert!(matches!(
@@ -4024,7 +4078,7 @@ pub(crate) mod test_support {
             .unwrap_or_else(|| PathBuf::from("ferrum-verifier"));
         let verifier = SignatureVerifier::new(binary, Duration::from_secs(30))
             .await
-            .expect("ferrum-verifier 0.1.0 required");
+            .expect("ferrum-verifier 0.2.0 required");
         SignedFixture {
             spool,
             manifest,

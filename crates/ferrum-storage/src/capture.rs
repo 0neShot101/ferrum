@@ -1,12 +1,16 @@
 //! Authenticated repository-qualified capture mappings and durable bounded outbox.
 //! A receipt is a recovery pointer, never an authentication token.
 pub(crate) mod index;
+pub mod inventory;
 mod proof;
 pub use index::{AuthenticatedPackageIndex, stage_package_index};
 pub(crate) mod cleanup;
 pub(crate) mod lifecycle;
+mod package;
 mod receipt;
 mod reconcile;
+pub(crate) use package::PACKAGE_SIGNATURE_SCHEMA;
+pub use package::PackageSignatureBinding;
 mod rehydrate;
 use crate::budget::{BudgetClass, BudgetError};
 use crate::catalog::CatalogError;
@@ -135,6 +139,9 @@ pub(crate) const AUX_SCHEMA: &[(&str, &str)] = &[
     ),
 ];
 const GRACE: i64 = 30 * 24 * 60 * 60;
+// Two independently validated 8 KiB paths, JSON escaping, digests and scalar
+// fields fit this fixed ceiling; signature payloads remain separate bounded objects.
+pub(crate) const RECEIPT_LIMIT: u64 = 64 * 1024;
 const OUTBOX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const OUTBOX_ENTRIES: u64 = 10_000;
 
@@ -167,6 +174,8 @@ pub struct CaptureReceipt {
     pub sha256: String,
     pub proof_generation_id: String,
     pub first_capture_time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_signature: Option<PackageSignatureBinding>,
 }
 pub fn is_package_path(path: &str) -> bool {
     path.starts_with("pool/")
@@ -200,6 +209,9 @@ impl CaptureReceipt {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             || !is_package_path(&self.public_package_path)
             || self.size > 8 * 1024 * 1024 * 1024
+            || (ferrum_apt::pacman::is_pacman_package_path(&self.public_package_path)
+                && self.public_package_path.ends_with(".sig")
+                && (self.size == 0 || self.size > ferrum_apt::pacman::MAX_PACMAN_SIG_BYTES as u64))
         {
             return Err(CaptureError::Proof);
         }
@@ -217,12 +229,16 @@ impl CaptureReceipt {
         })
     }
 }
-/// Private fields enforce the shared signature verifier -> signed index -> exact
-/// Filename/Size/SHA256 chain before any path can enter capture authority.
+/// Signed-index authority, or an unsigned Pacman candidate awaiting its own
+/// package/signature verification. Only the private, process-owned package
+/// binding can promote a Pacman candidate into capture authority.
 pub struct VerifiedCaptureProof {
     proof: Arc<VerifiedHistoricalProof>,
     path: RepositoryPath,
     identity: ObjectIdentity,
+    package_signature: Option<PackageSignatureBinding>,
+    package_objects: Option<(crate::VerifiedObject, crate::VerifiedObject)>,
+    request_authentication: std::sync::OnceLock<Arc<VerifiedCaptureProof>>,
 }
 impl VerifiedCaptureProof {
     pub async fn from_index(
@@ -245,6 +261,9 @@ impl VerifiedCaptureProof {
             proof,
             path,
             identity,
+            package_signature: None,
+            package_objects: None,
+            request_authentication: std::sync::OnceLock::new(),
         })
     }
     pub fn identity(&self) -> ObjectIdentity {
@@ -340,8 +359,9 @@ impl CaptureManager {
             )?)
         })?)
     }
-    /// Must precede the upstream body. Durable rehydration deliberately does not
-    /// call this operation and is independent of outbox occupancy.
+    /// Signed-metadata fills reserve before the upstream body. Pacman candidates
+    /// reserve only after bounded spool acquisition and package authentication;
+    /// no candidate row or unsigned receipt itself grants capture authority.
     pub fn reserve(
         &self,
         proof: &VerifiedCaptureProof,
@@ -350,6 +370,7 @@ impl CaptureManager {
         if !self.spool.same_owner(&proof.proof.owner) {
             return Err(CaptureError::Proof);
         }
+        proof.require_package_authentication()?;
         if now < 0 {
             return Err(CaptureError::Admission);
         }
@@ -421,13 +442,29 @@ impl CaptureManager {
             sha256: identity.sha256.to_hex(),
             proof_generation_id: manifest.generation_id.clone(),
             first_capture_time: now,
+            package_signature: proof.package_signature.clone(),
         };
         self.store.ledger()?.reserve_storage(
             &self.store.package_key(&receipt.suffix())?,
             serde_json::to_vec(&receipt)?.len() as u64,
             BudgetClass::Control,
         )?;
-        let artifacts = manifest.artifacts.clone();
+        let mut artifacts = manifest.artifacts.clone();
+        if let Some(binding) = &proof.package_signature {
+            let signature = binding.signature_identity()?;
+            self.store.ledger()?.reserve_storage(
+                &self
+                    .store
+                    .package_key(&format!("v1/objects/sha256/{}", signature.sha256))?,
+                signature.size,
+                BudgetClass::Control,
+            )?;
+            artifacts.push(crate::recovery::ManifestArtifact {
+                path: format!("{}.sig", binding.package_path()),
+                sha256: signature.sha256.to_hex(),
+                size: signature.size,
+            });
+        }
         let admitted = self.spool.capture_write(identity, move |connection| {
             let transaction = connection.transaction()?;
             let coverage: bool = transaction.query_row("SELECT coverage FROM capture_state WHERE id=1", [], |row| {
@@ -463,6 +500,10 @@ impl CaptureManager {
                 return Ok(false);
             }
             let size = crate::catalog::signed(identity.size)?;
+            transaction.execute(
+                "DELETE FROM derived_residency WHERE digest=?1",
+                [identity.sha256.to_hex()],
+            )?;
             transaction.execute(
                 "INSERT INTO capture_blobs(digest,size,first_capture,retain_until,readback_verified) VALUES(?1,?2,0,?3,0) ON CONFLICT(digest) DO UPDATE SET retain_until=MAX(retain_until,excluded.retain_until)",
                 params![identity.sha256.to_hex(), size, retain],
@@ -512,6 +553,16 @@ impl CaptureManager {
             return Err(CaptureError::Admission);
         }
         reservation.registered = true;
+        if let Some(binding) = &proof.package_signature {
+            self.spool.retain_generation(
+                lifecycle::signature_pin(
+                    &manifest.scope_id().to_hex(),
+                    binding.package_path(),
+                    binding.signature_identity()?,
+                ),
+                &[binding.signature_identity()?],
+            )?;
+        }
         // Retain signed proof files locally until their remote closure is verified.
         let proof_id = manifest.scope_id().to_hex();
         let needed = self.spool.durable_catalog()?.read(move |connection| {
@@ -601,7 +652,9 @@ impl CaptureManager {
             &key,
             identity.size.max(64 * 1024).saturating_add(256 * 1024),
         )?;
-        let object = self.spool.lookup(identity).ok_or(CaptureError::Admission)?;
+        let object = self
+            .restore_binding_object(identity, deadline, cancel, false)
+            .await?;
         let _pin = self
             .spool
             .pin(identity, crate::disk::PinKind::Upload)?
@@ -679,7 +732,20 @@ impl CaptureManager {
                     sha256: digest.clone(),
                     proof_generation_id: manifest.generation_id.clone(),
                     first_capture_time: first_capture,
+                    package_signature: self.package_binding(&generation, &path)?,
                 };
+                if ferrum_apt::pacman::is_pacman_package_path(&path)
+                    && receipt.package_signature.is_none()
+                {
+                    return Err(CaptureError::Proof);
+                }
+                self.persist_package_signature(
+                    receipt.package_signature.as_ref(),
+                    &generation,
+                    deadline,
+                    cancel,
+                )
+                .await?;
                 let _observed = receipt::put(&self.store, &receipt, deadline, cancel).await?;
                 self.spool.catalog_write(move |connection| {
                     let transaction = connection.transaction()?;
@@ -817,11 +883,13 @@ impl CaptureManager {
         if !self.spool.same_owner(&proof.proof.owner) {
             return Err(CaptureError::Proof);
         }
+        proof.require_package_authentication()?;
         let identity = receipt.validate()?;
         if identity != proof.identity
             || receipt.repository != proof.repository()
             || receipt.public_package_path != proof.path.as_str()
             || receipt.proof_generation_id != proof.manifest().generation_id
+            || receipt.package_signature != proof.package_signature
         {
             return Err(CaptureError::Proof);
         }
@@ -839,7 +907,7 @@ impl CaptureManager {
             .control_get(
                 OperationIdentity::Object,
                 &receipt.suffix(),
-                16 * 1024,
+                RECEIPT_LIMIT,
                 deadline,
                 cancel,
             )
@@ -848,6 +916,17 @@ impl CaptureManager {
         let observed: CaptureReceipt = serde_json::from_slice(&observed.bytes)?;
         if observed != *receipt {
             return Err(CaptureError::Proof);
+        }
+        if let Some(binding) = proof.package_signature() {
+            let package = self
+                .restore_binding_object(binding.package_identity()?, deadline, cancel, true)
+                .await?;
+            let signature = self
+                .restore_binding_object(binding.signature_identity()?, deadline, cancel, true)
+                .await?;
+            proof
+                .authenticate_package(&package, &signature, deadline, cancel)
+                .await?;
         }
         receipt::verify_closure(self, proof, deadline, cancel).await?;
         self.store.ledger()?.reserve_storage(
@@ -863,7 +942,28 @@ impl CaptureManager {
             size,
             BudgetClass::Control,
         )?;
-        self.record_recovered_receipt(receipt, proof, recovery_time)
+        self.record_recovered_receipt(receipt, proof, recovery_time)?;
+        if let Some(binding) = proof.package_signature() {
+            self.spool.capture_write(identity, move |connection| {
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "UPDATE capture_blobs SET readback_verified=1 WHERE digest=?1",
+                    [identity.sha256.to_hex()],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO derived_residency(digest) SELECT digest FROM objects WHERE digest=?1",
+                    [identity.sha256.to_hex()],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })?;
+            self.spool.release_generation(lifecycle::signature_pin(
+                &proof.manifest().scope_id().to_hex(),
+                binding.package_path(),
+                binding.signature_identity()?,
+            ))?;
+        }
+        Ok(())
     }
     pub(super) fn record_recovered_receipt(
         &self,
@@ -874,6 +974,7 @@ impl CaptureManager {
         if !self.spool.same_owner(&proof.proof.owner) {
             return Err(CaptureError::Proof);
         }
+        proof.require_package_authentication()?;
         let identity = receipt.validate()?;
         if identity != proof.identity
             || receipt.repository != proof.repository()
