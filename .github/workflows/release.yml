@@ -44,7 +44,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@master
-
+        with:
+          toolchain: 1.99.1
       - name: Cache Cargo registry and release build
         uses: Swatinem/rust-cache@v2
 
