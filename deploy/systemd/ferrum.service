@@ -1,5 +1,5 @@
 [Unit]
-Description=Ferrum APT Mirror Gateway
+Description=Ferrum Package Mirror Gateway
 After=network-online.target systemd-timesyncd.service
 Wants=network-online.target
 
@@ -7,19 +7,20 @@ Wants=network-online.target
 Type=simple
 User=ferrum
 Group=ferrum
+Environment="FERRUM_UI_DIR=/usr/local/share/ferrum/ui/build"
 ExecStart=/usr/local/bin/ferrum serve --config /etc/ferrum/gateway.toml
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=45s
 KillMode=mixed
 
-# Resource enforcement (PLAN.md §7, §8, §9)
+# Resource enforcement
 MemoryMax=6G
 TasksMax=256
-LimitNOFILE=65536
+LimitNOFILE=131072
 LimitCORE=0
 
-# Hardening (PLAN.md §7)
+# Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

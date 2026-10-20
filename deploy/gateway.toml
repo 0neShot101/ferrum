@@ -1,10 +1,20 @@
-# Replace public_host and provider account settings before deployment.
-mode = 'public-durable'
+# Self-hosted Ferrum gateway configuration template.
+#
+# Use `private-durable` for private/LAN/tunnel deployments (no public domain or Nginx required).
+# Switch to `mode = 'public-durable'` and set `listen.public_host` only when exposing
+# the gateway on a public HTTPS domain behind the Nginx boundary in `deploy/nginx/`.
+mode = 'private-durable'
 
 [listen]
 public = '127.0.0.1:8080'
 admin = '127.0.0.1:9090'
-public_host = 'ferrum.oneshot.wtf'
+# Required only when `mode = 'public-durable'`:
+# public_host = 'mirror.example.com'
+
+[admin]
+# Defaults to `<state_dir>.admin` (`/var/lib/ferrum/state.admin`) and `http://127.0.0.1:9090`.
+# Uncomment if accessing the admin dashboard through a custom local SSH tunnel port:
+# origin = 'http://127.0.0.1:9090'
 
 [verifier]
 binary = '/usr/local/bin/ferrum-verifier'
@@ -12,22 +22,40 @@ timeout_seconds = 30
 
 [durable]
 state_dir = '/var/lib/ferrum/state'
-# Curate active suites so the hot working set fits inside the 200 GiB local NVMe spool
-# (for example: Debian trixie, Ubuntu noble, Proxmox VE/PBS, and Arch Linux).
-# Avoid enabling suites = ['all'] (106 suites) unless local cache and S3 budgets are scaled accordingly.
+# Omitting `suites` selects the 6 baseline Debian trixie and Ubuntu noble suites.
+# Uncomment to curate your active suites (up to 106 supported across APT, Pacman, and RPM):
+# suites = [
+#   'debian/trixie',
+#   'debian/trixie-updates',
+#   'debian-security/trixie-security',
+#   'ubuntu/noble',
+#   'ubuntu/noble-updates',
+#   'ubuntu-security/noble-security',
+# ]
 
 [durable.provider]
-endpoint = 'https://s3.us-central-1.idrivee2.com'
-region = 'us-central-1'
+# Supported S3-compatible object storage providers:
+# - AWS S3: set `region = 'us-east-1'` (endpoint defaults to https://s3.<region>.amazonaws.com)
+# - Cloudflare R2: set `provider = 'cloudflare-r2'` and `account_id = '<account_id>'`
+# - IDrive e2: set `provider = 'idrive-e2'` and `region = 'us-central-1'`
+# - Custom S3 / MinIO / Ceph: set `endpoint = 'https://s3.example.com'` and `region = 'us-east-1'`
+region = 'us-east-1'
 bucket = 'ferrum'
-package_prefix = 'linux-packages/'
-checkpoint_prefix = 'linux-checkpoints/'
 credentials_file = '/var/lib/ferrum/private/provider.env'
-shared_nonisolated = true
+# Optional prefix overrides (must match deploy/maintenance.toml):
+# package_prefix = 'linux-packages/'
+# checkpoint_prefix = 'linux-checkpoints/'
+# shared_nonisolated = true
 
 [durable.keyrings]
 debian = '/usr/share/keyrings/debian-archive-keyring.gpg'
 ubuntu = '/etc/ferrum/keyrings/ubuntu-archive-keyring.gpg'
+# Optional distribution keyrings (uncomment when enabling their suites):
+# kali = '/etc/ferrum/keyrings/kali-archive-keyring.gpg'
+# parrot = '/etc/ferrum/keyrings/parrot-archive-keyring.gpg'
+# trisquel = '/etc/ferrum/keyrings/trisquel-archive-keyring.gpg'
+# raspberrypi = '/etc/ferrum/keyrings/raspberrypi-archive-keyring.gpg'
+# proxmox = '/etc/ferrum/keyrings/proxmox-archive-keyring.gpg'
 # archlinux = '/etc/ferrum/keyrings/archlinux-keyring.gpg'
 # chaoticaur = '/etc/ferrum/keyrings/chaotic-keyring.gpg'
 # cachyos = '/etc/ferrum/keyrings/cachyos-keyring.gpg'
@@ -39,6 +67,7 @@ ubuntu = '/etc/ferrum/keyrings/ubuntu-archive-keyring.gpg'
 # tailscale = '/etc/ferrum/keyrings/tailscale-archive-keyring.gpg'
 # postgresql = '/etc/ferrum/keyrings/postgresql-archive-keyring.gpg'
 # grafana = '/etc/ferrum/keyrings/grafana-archive-keyring.gpg'
+
 [durable.budget]
 mode = 'existing'
 storage_bytes = 1099511627776
@@ -47,6 +76,5 @@ monthly_download_bytes = 1099511627776
 download_control_bytes = 107374182400
 
 [limits]
-# Raise upstream fill concurrency and admission wait for public cold-burst resilience.
 concurrent_fills = 32
-admission_wait_seconds = 10
+admission_wait_seconds = 2

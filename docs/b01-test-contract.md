@@ -451,13 +451,13 @@ tools/distribution-inventory/target/debug/distribution-inventory \
   --output /absolute/path/to/a-new-evidence-directory
 ```
 
-Use both resulting binaries from the selected Cargo target directories; the example above assumes Cargo's default paths. Current runtime requires `ferrum-verifier 0.1.0`, its Nettle/Hogweed/GMP shared libraries, timeout/prlimit, gzip/xz/bzip2 and CA certificates. The historical 2026-10-17 snapshot used Rust 1.99.1, sqv 1.3.0, Debian archive keyring package 2025.1 and Ubuntu's keyring extracted from the existing official `ubuntu:24.04` image. Keyring hashes and exact suite dates/digests are in that report. Its locked build, selection-boundary test and Clippy with warnings denied passed in a local Docker container limited to 2 CPUs / 3 GiB / 128 tasks; those results do not qualify the verifier replacement. No serving-VM build dependencies were added.
+Use both resulting binaries from the selected Cargo target directories; the example above assumes Cargo's default paths. Current runtime requires `ferrum-verifier 0.2.0`, its Nettle/Hogweed/GMP shared libraries, timeout/prlimit, gzip/xz/bzip2 and CA certificates. The historical 2026-10-17 snapshot used Rust 1.99.1, sqv 1.3.0, Debian archive keyring package 2025.1 and Ubuntu's keyring extracted from the existing official `ubuntu:24.04` image. Keyring hashes and exact suite dates/digests are in that report. Its locked build, selection-boundary test and Clippy with warnings denied passed in a local Docker container limited to 2 CPUs / 3 GiB / 128 tasks; those results do not qualify the verifier replacement. No serving-VM build dependencies were added.
 
 B01 inventory issue `ferrum-95f0f729180ea19a` records this snapshot and its explicit retention limitations. B01's SDK/configuration subset is separately exercised below; full B02 remains gated independently.
 
 ## Private fixture smoke expectations (B04 acceptance inputs)
 
-See `fixture/smoke.sh` and PLAN.md section 10 "Private APT smoke procedure". The acceptance contracts include normal authenticated APT update/download/install, exact `ferrum-fixture-ok`, package SHA-256 agreement, client-side authenticated SHA256 or SHA512 by-hash traffic, one shared cold source fetch, warm delivery with origin package deleted, corruption returning 502 with zero bytes, untrusted publication rejection, verified cold single-range delivery, restart reauthentication, exhausted retry wakeup without promotion, and measured stock-client retry windows. The harness records these separately from production acceptance.
+See `fixture/smoke.sh`. The acceptance contracts include normal authenticated APT update/download/install, exact `ferrum-fixture-ok`, package SHA-256 agreement, client-side authenticated SHA256 or SHA512 by-hash traffic, one shared cold source fetch, warm delivery with origin package deleted, corruption returning 502 with zero bytes, untrusted publication rejection, verified cold single-range delivery, restart reauthentication, exhausted retry wakeup without promotion, and measured stock-client retry windows. The harness records these separately from production acceptance.
 
 ## Executed private acceptance (2026-10-17)
 
@@ -629,3 +629,48 @@ Nginx uses four automatic workers, sendfile, 768 worker connections and service 
 On Proxmox `the-lanlord`, bond0 is 802.3ad LACP with layer3+4 transmit hashing; enp2s0f0/enp2s0f1 are both up at 10,000 Mbps/full in the same aggregator, with no link failures/churn. Port f1 has 92,690 historical RX drops, unchanged across the observations—not a load-test result. VM VirtIO queues were live-expanded from one to four, confirmed in the guest. **20 Gb/s aggregate throughput is unmeasured:** an authorized external high-capacity peer is still required. Same-host VM traffic would bypass these physical links; a single flow is not promised 20 Gb/s.
 
 The operator subsequently accepted a measured near-10Gb external baseline: direct public Clouvider Dallas tests, eight TCP streams for five seconds per direction, received 9.36060 Gb/s into Ferrum and 9.36607 Gb/s out. Retransmission counts were 129 and 3,123, so this was not loss-free. Raw results are in `fixture/run/network-public-20261017/`; the customer node was not used for those tests. Temporary tools were removed. This closes the accepted network-baseline task, not the RFC's static-Nginx/HTTPS/application workload gates or a 20Gb aggregate claim.
+
+## Post-review correctness fixes: local qualification
+
+The review corrections cover per-package Pacman signature authority (never database-wide trust from a signed canary), persisted detached-signature recovery, metadata-only HEAD/304 behavior, package verification beyond the metadata-size limit, local database revisions independent of maximum package build time, all 106 configured profiles, Tailscale's optional Suite field, CachyOS repository roots, complete Zstandard/TAR parsing, bounded namespace-aware RPM XML and the inventory lockfile.
+
+The helper protocol is now `ferrum-verifier 0.2.0`; deploy the gateway and helper together. Package verification streams an exact regular-file length up to the existing 8 GiB object bound. The 32 MiB metadata/keyring/signature limits, helper memory/CPU/time limits, certificate/signing-key validity and revocation checks remain enforced. Each Pacman response requiring a package signature rechecks the full package, including Range, `.sig` and positive HEAD/304 responses. Earlier warm-throughput measurements do not qualify this implementation.
+
+Schema 5 adds package-signature bindings without recreating the allowance ledger. A version-4 migration regression compares all pre-existing table rows, including provider/adoption history, and checks reopening. Temporary unreceipted bodies are reclaimable only under the storage owner's existing deletion rules; capture admission removes that eligibility, and independently pending signatures remain pinned. Receipt recovery requires full body readback and current-keyring cryptographic verification. A receipt or stored boolean is not authentication.
+
+An actual local gateway startup additionally exposed unchanged Pacman/RPM generation recovery failing before activation. Their opaque authenticated origin observations already establish the root/canary signature; publication now preserves that authority while checking the staged closure and full recovery proof. APT's separate Release/Release.gpg verification and exact authenticated-payload comparison remain required. The Arch/Chaotic-AUR and AlmaLinux publication regressions reconstruct fresh catalogs before serving their fixtures.
+
+Local Linux containers use disposable fixtures and a disk-backed remote test transport, not the real S3 bucket or its allowance. No native-VM deployment, public configuration change, provider operation or production-ledger mutation is part of this correction. Representative load/capacity qualification remains open. An unchanged Pacman database/package with a newly signed detached signature can still fail closed when a rotated keyring rejects the previously pinned signature; `ferrum-1c6a4c7cb5592a99` tracks that separate availability limitation.
+
+### Executed checks (2026-10-19)
+
+Final integrated verification, after the unchanged-generation correction: **421 workspace tests**, **15 explicitly enabled signed-publication scenarios** and **5 explicitly enabled signed HTTP fixture scenarios** passed. Workspace all-target Clippy passed with warnings denied both with and without `test-harness`; formatting and the locked release build passed. The separately locked inventory tool built offline and its `--help` command ran. All six retained official Debian/Ubuntu signatures verified with byte-for-byte authenticated payload matches using helper 0.2.0.
+
+The final pipeline ran inside the existing Linux builder, from `/work`, with `CARGO_TARGET_DIR=/provider-target`, `FERRUM_VERIFIER=/provider-target/debug/ferrum-verifier` and that debug directory on `PATH`:
+
+```sh
+cargo test --locked --workspace --features test-harness
+cargo test --locked -p ferrum --features test-harness --test publication -- --ignored --test-threads=1
+cargo test --locked -p ferrum --features test-harness --test signed_fixture -- --ignored --test-threads=1
+cargo clippy --locked --workspace --all-targets --features test-harness -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo build --locked --release --workspace
+cargo fmt --all -- --check
+```
+
+| Actual client/runtime check | Result |
+| --- | --- |
+| Stock Debian 13, release binaries, signed private APT repository | Update, download, install and `ferrum-fixture-ok` passed in two fresh clients separated by a real gateway process restart |
+| Stock Arch `pacman`, full durable gateway with injected local transport | Required package signature verified; 34,605,552-byte package installed and printed `ferrum-fixture-ok` |
+| Stock AlmaLinux 9 `dnf`, same gateway | Repository and RPM signature checks enabled; installation printed `ferrum-fixture-ok` |
+| Origin stopped, Arch package / detached signature / RPM package | Exact full bodies, first/last-byte 206, out-of-bounds 416, HEAD 200 and conditional 304 passed |
+| Durable gateway shutdown/start, origin still stopped | Exact Arch package/signature and RPM bodies plus single-byte ranges recovered; unconfirmed mutable Arch/RPM metadata correctly returned 503 |
+| Release APT gateway, origin stopped | Exact full body, first/last-byte 206, out-of-bounds 416, ignored multi-range 200, stale If-Range 200 and HEAD without a body passed |
+
+The Arch/RPM smoke used an explicitly injected clock-probe fixture in a disposable network-isolated container, not a native synchronized host. Its gateway restart was application shutdown/start within the harness process; the Debian release smoke used distinct gateway processes. Earlier harness attempts raced manual clock toggling against the live synchronizer or used an invalid shortened durable cadence; those failed attempts are not passes and caused no production clock-policy change. These are correctness checks, not throughput, native-VM, real-provider or public-launch qualification.
+
+The disposable ledger remained certain across Arch/RPM restart: total download accounting advanced from 126,532,353 to 204,409,492 bytes, package-download accounting from 106,969,639 to 177,230,195 bytes, and storage stayed 35,019,561 bytes. These are conservative accounting charges, not wire-transfer measurements. No shared allowance was opened or modified.
+
+Final release SHA-256: `ferrum` = `70d61a83eb57c2306b30163addaf3c3870a3b2b74c3dec92c57a0791d712b594`; `ferrum-verifier` = `a6e68bf5f5fa92acdcd3a1e29ff1163fa8e9bdcba1da9146ce744f5e080d04d4`; root `Cargo.lock` = `85144cf8affdc533d1949b081ee5c763d31fe9505b35d05ca415a8a3454b7304`.
+
+All owned smoke services exited cleanly. The disposable runtime container, signing keys, package fixtures, client scripts, external harness and its package-specific build artifacts were removed. Existing repository fixtures, builder container, shared dependency/release cache and pre-existing state were retained. No commit, push or deployment was performed.

@@ -36,3 +36,8 @@ provider.env
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Admin UI build artifacts and dependencies
+/ui/node_modules/
+/ui/.svelte-kit/
+/ui/build/
