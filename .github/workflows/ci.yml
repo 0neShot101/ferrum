@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui:
+    name: Admin UI (SvelteKit & TypeScript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck and build UI bundle
+        working-directory: ui
+        run: bun run check && bun run build
+
+      - name: Upload built UI bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-ui-build
+          path: ui/build
+          if-no-files-found: error
+          retention-days: 7
+
+  rust:
+    name: Rust Workspace (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    needs: ui
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install native build and verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            curl \
+            dpkg-dev \
+            gnupg \
+            jq \
+            libclang-dev \
+            libgmp-dev \
+            nettle-dev \
+            openssl \
+            pkg-config
+
+      - name: Download built UI bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ferrum-ui-build
+          path: ui/build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy (default workspace targets)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Clippy (test-harness feature)
+        run: cargo clippy --workspace --all-targets --locked --features ferrum/test-harness -- -D warnings
+
+      - name: Build isolated OpenPGP verifier binary
+        run: cargo build --release -p ferrum-verifier --locked
+
+      - name: Run workspace unit and integration tests
+        env:
+          FERRUM_UI_DIR: ${{ github.workspace }}/ui/build
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/target/release:${PATH}"
+          cargo test --workspace --locked --features ferrum/test-harness
+
+      - name: Generate signed fixture repository and run signed-fixture suite
+        run: |
+          export PATH="${GITHUB_WORKSPACE}/target/release:${PATH}"
+          FIXTURE_DIR="${RUNNER_TEMP}/fixture" bash fixture/generate.sh
+          FERRUM_FIXTURE_PUBLIC="${RUNNER_TEMP}/fixture/public" \
+            cargo test --locked -p ferrum --features test-harness --test signed_fixture -- --ignored --test-threads=1
