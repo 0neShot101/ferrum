@@ -29,6 +29,66 @@ pub enum Repository {
 }
 
 impl Repository {
+    pub const ALL: [Self; 24] = [
+        Self::Debian,
+        Self::DebianSecurity,
+        Self::Ubuntu,
+        Self::UbuntuSecurity,
+        Self::Kali,
+        Self::Parrot,
+        Self::Trisquel,
+        Self::RaspberryPi,
+        Self::ProxmoxPve,
+        Self::ProxmoxPbs,
+        Self::ArchLinux,
+        Self::ChaoticAur,
+        Self::UbuntuPorts,
+        Self::DockerDebian,
+        Self::DockerUbuntu,
+        Self::TailscaleDebian,
+        Self::TailscaleUbuntu,
+        Self::PostgresqlApt,
+        Self::GrafanaApt,
+        Self::CachyOs,
+        Self::ArchLinuxCn,
+        Self::EndeavourOs,
+        Self::AlmaLinux,
+        Self::RockyLinux,
+    ];
+
+    pub const fn ecosystem(self) -> &'static str {
+        match self {
+            Self::ArchLinux
+            | Self::ChaoticAur
+            | Self::CachyOs
+            | Self::ArchLinuxCn
+            | Self::EndeavourOs => "pacman",
+            Self::AlmaLinux | Self::RockyLinux => "rpm",
+            _ => "apt",
+        }
+    }
+
+    pub const fn architectures(self) -> &'static [&'static str] {
+        match self {
+            Self::UbuntuPorts => &["arm64"],
+            Self::DockerDebian
+            | Self::DockerUbuntu
+            | Self::TailscaleDebian
+            | Self::TailscaleUbuntu
+            | Self::PostgresqlApt
+            | Self::GrafanaApt
+            | Self::RaspberryPi => &["amd64", "arm64"],
+            Self::ArchLinux
+            | Self::ChaoticAur
+            | Self::CachyOs
+            | Self::ArchLinuxCn
+            | Self::EndeavourOs
+            | Self::AlmaLinux
+            | Self::RockyLinux => &["x86_64", "aarch64"],
+            _ => &["amd64"],
+        }
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Debian => "debian",
@@ -219,3 +279,5 @@ pub const ALL_DISTRIBUTION_SUITES: [DistributionSuite; 106] = [
     suite(RockyLinux, "10-baseos-aarch64"),
     suite(RockyLinux, "10-appstream-aarch64"),
 ];
+
+const _: () = assert!(ALL_DISTRIBUTION_SUITES.len() <= ferrum_storage::checkpoint::MAX_SUITES);

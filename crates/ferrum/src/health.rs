@@ -12,7 +12,7 @@ use crate::sync::Catalog;
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ferrum_apt::release::UnixTime;
@@ -29,9 +29,9 @@ pub enum RequestClass {
     Other,
 }
 
-const REQUEST_CLASSES: [&str; 4] = ["metadata", "by_hash", "package", "other"];
-const REQUEST_OUTCOMES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
-const FILL_OUTCOMES: [&str; 9] = [
+pub(crate) const REQUEST_CLASSES: [&str; 4] = ["metadata", "by_hash", "package", "other"];
+pub(crate) const REQUEST_OUTCOMES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
+pub(crate) const FILL_OUTCOMES: [&str; 9] = [
     "verified",
     "corrupt",
     "not_found",
@@ -42,7 +42,25 @@ const FILL_OUTCOMES: [&str; 9] = [
     "s3_budget",
     "internal",
 ];
-const SYNC_OUTCOMES: [&str; 4] = ["published", "renewed", "rejected", "error"];
+pub(crate) const SYNC_OUTCOMES: [&str; 4] = ["published", "renewed", "rejected", "error"];
+pub(crate) const CACHE_SOURCES: [&str; 5] = [
+    "local_hit",
+    "conditional_304",
+    "s3_rehydrated",
+    "origin_fill",
+    "derived_expanded",
+];
+pub(crate) const PRODUCER_SOURCES: [&str; 3] = ["s3", "origin", "derived"];
+pub(crate) const LATENCY_BUCKETS_NANOS: [u64; 8] = [
+    1_000_000,
+    5_000_000,
+    25_000_000,
+    100_000_000,
+    500_000_000,
+    2_000_000_000,
+    10_000_000_000,
+    u64::MAX,
+];
 const SUITE_ERROR_CLASSES: [&str; 7] = [
     "signature",
     "checkpoint_conflict",
@@ -56,15 +74,21 @@ const SUITE_ERROR_CLASSES: [&str; 7] = [
 /// Plain atomics; every label combination is a fixed slot.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    requests: [[AtomicU64; 4]; 4],
-    request_ttfb_nanos: [AtomicU64; 4],
-    response_bytes: [AtomicU64; 4],
-    body_duration_nanos: [AtomicU64; 4],
-    body_transfers: [AtomicU64; 2],
-    fills: [AtomicU64; 9],
-    fill_waiters: AtomicU64,
-    waiter_timeouts: AtomicU64,
-    sync: [AtomicU64; 4],
+    pub(crate) cache_sources: [AtomicU64; 5],
+    pub(crate) producer_sources: [AtomicU64; 3],
+    pub(crate) repo_requests: [[AtomicU64; 2]; 25],
+    pub(crate) repo_bytes: [AtomicU64; 25],
+    pub(crate) request_ttfb_buckets: [[AtomicU64; 8]; 4],
+    pub(crate) fill_duration_buckets: [AtomicU64; 8],
+    pub(crate) requests: [[AtomicU64; 4]; 4],
+    pub(crate) request_ttfb_nanos: [AtomicU64; 4],
+    pub(crate) response_bytes: [AtomicU64; 4],
+    pub(crate) body_duration_nanos: [AtomicU64; 4],
+    pub(crate) body_transfers: [AtomicU64; 2],
+    pub(crate) fills: [AtomicU64; 9],
+    pub(crate) fill_waiters: AtomicU64,
+    pub(crate) waiter_timeouts: AtomicU64,
+    pub(crate) sync: [AtomicU64; 4],
 }
 
 fn class_slot(class: RequestClass) -> usize {
@@ -77,6 +101,35 @@ fn class_slot(class: RequestClass) -> usize {
 }
 
 impl Metrics {
+    pub fn record_cache_source(&self, source: usize) {
+        if let Some(counter) = self.cache_sources.get(source) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn record_producer(&self, source: usize) {
+        if let Some(counter) = self.producer_sources.get(source) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn record_fill_duration(&self, duration: Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        let bucket = LATENCY_BUCKETS_NANOS
+            .iter()
+            .position(|bound| nanos <= *bound)
+            .unwrap_or(7);
+        self.fill_duration_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_repository_request(&self, repository: usize, status: StatusCode) {
+        if let Some(counters) = self.repo_requests.get(repository) {
+            counters[usize::from(status.is_server_error() || status.is_client_error())]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn record_repository_bytes(&self, repository: usize, bytes: u64) {
+        if let Some(counter) = self.repo_bytes.get(repository) {
+            counter.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
     pub fn record_request(&self, class: RequestClass, status: StatusCode) {
         self.record_request_timed(class, status, Duration::ZERO);
     }
@@ -92,6 +145,11 @@ impl Metrics {
         self.requests[slot][outcome].fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(ttfb.as_nanos()).unwrap_or(u64::MAX);
         self.request_ttfb_nanos[slot].fetch_add(nanos, Ordering::Relaxed);
+        let bucket = LATENCY_BUCKETS_NANOS
+            .iter()
+            .position(|bound| nanos <= *bound)
+            .unwrap_or(7);
+        self.request_ttfb_buckets[slot][bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_body_bytes(&self, class: RequestClass, bytes: u64) {
@@ -148,35 +206,40 @@ pub struct HealthState {
     pub metrics: Arc<Metrics>,
     pub spool: Spool,
     pub capture: Option<Arc<ferrum_storage::capture::CaptureManager>>,
+    pub sync_trigger: Option<crate::sync::SyncTrigger>,
+    pub admin: Arc<crate::admin::AdminStore>,
+    pub admin_http: Arc<crate::admin::AdminHttpState>,
     pub verifier_version: String,
+    pub jobs: Arc<crate::admin::jobs::JobRegistry>,
+    pub telemetry: Arc<crate::admin::telemetry::TelemetryHub>,
+    pub config: Arc<crate::config::Config>,
+    pub publisher: Option<Arc<ferrum_storage::checkpoint::CheckpointPublisher>>,
+    pub s3: Option<Arc<ferrum_storage::s3::S3Store>>,
+    pub fills: Option<crate::fetch::FillRegistry>,
+    pub request_slots: Option<Arc<tokio::sync::Semaphore>>,
+    pub active_bodies: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Serialize)]
 struct Readiness {
     ready: bool,
-    generation_id: Option<String>,
-    confirmed_at: Option<i64>,
-    valid_until: Option<i64>,
-    last_error: Option<String>,
-    suites: Vec<SuiteHealth>,
-    verifier_version: String,
 }
 
-#[derive(Serialize)]
-struct SuiteHealth {
-    repository: String,
-    suite: String,
-    ready: bool,
-    generation_id: Option<String>,
-    lease_deadline: Option<i64>,
-    lease_remaining_seconds: Option<i64>,
-    observed_age_seconds: Option<i64>,
-    confirmed_age_seconds: Option<i64>,
-    publication_lag_seconds: Option<i64>,
-    checkpoint_sequence: Option<u64>,
-    checkpoint_status: &'static str,
-    alert_state: &'static str,
-    last_error: Option<String>,
+#[derive(Serialize, Clone)]
+pub(crate) struct SuiteHealth {
+    pub(crate) repository: String,
+    pub(crate) suite: String,
+    pub(crate) ready: bool,
+    pub(crate) generation_id: Option<String>,
+    pub(crate) lease_deadline: Option<i64>,
+    pub(crate) lease_remaining_seconds: Option<i64>,
+    pub(crate) observed_age_seconds: Option<i64>,
+    pub(crate) confirmed_age_seconds: Option<i64>,
+    pub(crate) publication_lag_seconds: Option<i64>,
+    pub(crate) checkpoint_sequence: Option<u64>,
+    pub(crate) checkpoint_status: &'static str,
+    pub(crate) alert_state: &'static str,
+    pub(crate) last_error: Option<String>,
 }
 
 fn classify_suite_alert(
@@ -207,7 +270,7 @@ fn classify_suite_alert(
     }
 }
 
-fn suite_health(catalog: &Catalog, clock_valid: bool) -> Vec<SuiteHealth> {
+pub(crate) fn suite_health(catalog: &Catalog, clock_valid: bool) -> Vec<SuiteHealth> {
     let wall = UnixTime::now();
     let now = Instant::now();
     catalog
@@ -283,7 +346,7 @@ fn suite_health(catalog: &Catalog, clock_valid: bool) -> Vec<SuiteHealth> {
         .collect()
 }
 
-/// Admin router: `/healthz`, `/livez`, `/readyz`, `/readyz/{repository}/{suite}`, `/metrics`.
+/// Loopback administration listener. Probes are minimal; detailed routes require authentication.
 pub fn router(state: Arc<HealthState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -291,6 +354,11 @@ pub fn router(state: Arc<HealthState>) -> Router {
         .route("/readyz", get(readyz))
         .route("/readyz/{repository}/{suite}", get(suite_readyz))
         .route("/metrics", get(metrics))
+        .merge(crate::admin::routes())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::admin::security_boundary,
+        ))
         .with_state(state)
 }
 
@@ -315,18 +383,7 @@ async fn readyz(State(state): State<Arc<HealthState>>) -> Response {
             .capture
             .as_ref()
             .is_none_or(|capture| capture.coverage_ready().unwrap_or(false));
-    let body = Readiness {
-        ready,
-        generation_id: view.as_ref().map(|view| view.generation_id.to_hex()),
-        confirmed_at: view.as_ref().map(|view| view.confirmed_at_unix.as_secs()),
-        valid_until: view
-            .as_ref()
-            .and_then(|view| view.valid_until)
-            .map(|valid_until| valid_until.as_secs()),
-        last_error: state.catalog.last_error(),
-        suites,
-        verifier_version: state.verifier_version.clone(),
-    };
+    let body = Readiness { ready };
     let status = if ready {
         StatusCode::OK
     } else {
@@ -354,18 +411,24 @@ async fn suite_readyz(State(state): State<Arc<HealthState>>, uri: Uri) -> Respon
         .as_ref()
         .is_none_or(|capture| capture.coverage_ready().unwrap_or(false));
     health.ready = health.ready && capture_ready;
-    if !health.ready {
-        health.alert_state = "page";
-    }
     let status = if health.ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(health)).into_response()
+    (
+        status,
+        Json(Readiness {
+            ready: health.ready,
+        }),
+    )
+        .into_response()
 }
 
-async fn metrics(State(state): State<Arc<HealthState>>) -> Response {
+async fn metrics(State(state): State<Arc<HealthState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = crate::admin::authorize_metrics(&state, &headers).await {
+        return response;
+    }
     let text = render_metrics(&state);
     (
         StatusCode::OK,
@@ -378,6 +441,64 @@ async fn metrics(State(state): State<Arc<HealthState>>) -> Response {
 fn render_metrics(state: &HealthState) -> String {
     let metrics = &state.metrics;
     let mut text = String::with_capacity(2048);
+    for (slot, source) in CACHE_SOURCES.iter().enumerate() {
+        let _ = writeln!(
+            text,
+            "ferrum_cache_sources_total{{source=\"{source}\"}} {}",
+            metrics.cache_sources[slot].load(Ordering::Relaxed)
+        );
+    }
+    for (slot, source) in PRODUCER_SOURCES.iter().enumerate() {
+        let _ = writeln!(
+            text,
+            "ferrum_producer_sources_total{{source=\"{source}\"}} {}",
+            metrics.producer_sources[slot].load(Ordering::Relaxed)
+        );
+    }
+    for repository in 0..25 {
+        let name = crate::config::Repository::ALL
+            .get(repository)
+            .map_or("fixture", |item| item.name());
+        for (outcome, label) in ["ok", "error"].iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "ferrum_repository_requests_total{{repository=\"{name}\",outcome=\"{label}\"}} {}",
+                metrics.repo_requests[repository][outcome].load(Ordering::Relaxed)
+            );
+        }
+        let _ = writeln!(
+            text,
+            "ferrum_repository_bytes_total{{repository=\"{name}\"}} {}",
+            metrics.repo_bytes[repository].load(Ordering::Relaxed)
+        );
+    }
+    for (class, label) in REQUEST_CLASSES.iter().enumerate() {
+        let mut cumulative = 0u64;
+        for (bucket, boundary) in ["0.001", "0.005", "0.025", "0.1", "0.5", "2", "10", "+Inf"]
+            .iter()
+            .enumerate()
+        {
+            cumulative = cumulative.saturating_add(
+                metrics.request_ttfb_buckets[class][bucket].load(Ordering::Relaxed),
+            );
+            let _ = writeln!(
+                text,
+                "ferrum_request_ttfb_seconds_bucket{{class=\"{label}\",le=\"{boundary}\"}} {cumulative}"
+            );
+        }
+    }
+    let mut cumulative = 0u64;
+    for (bucket, boundary) in ["0.001", "0.005", "0.025", "0.1", "0.5", "2", "10", "+Inf"]
+        .iter()
+        .enumerate()
+    {
+        cumulative = cumulative
+            .saturating_add(metrics.fill_duration_buckets[bucket].load(Ordering::Relaxed));
+        let _ = writeln!(
+            text,
+            "ferrum_fill_duration_seconds_bucket{{le=\"{boundary}\"}} {cumulative}"
+        );
+    }
     let _ = writeln!(text, "# TYPE ferrum_requests_total counter");
     for (class_index, class) in REQUEST_CLASSES.iter().enumerate() {
         for (outcome_index, outcome) in REQUEST_OUTCOMES.iter().enumerate() {
@@ -597,5 +718,29 @@ mod tests {
                 .iter()
                 .all(|suite| !suite.ready)
         );
+    }
+
+    #[test]
+    fn sync_trigger_matches_all_repository_or_exact_suite() {
+        let keys = vec![
+            SuiteKey::new("debian", "trixie").expect("suite"),
+            SuiteKey::new("debian", "trixie-updates").expect("suite"),
+            SuiteKey::new("archlinux", "core").expect("suite"),
+        ];
+        let trigger = crate::sync::SyncTrigger::new(keys.clone());
+        assert_eq!(
+            trigger.trigger(Some("debian"), None),
+            Some(vec![keys[0].clone(), keys[1].clone()])
+        );
+        assert_eq!(trigger.take_pending(), vec![0, 1]);
+        assert_eq!(
+            trigger.trigger(Some("archlinux"), Some("core")),
+            Some(vec![keys[2].clone()])
+        );
+        assert_eq!(trigger.take_pending(), vec![2]);
+        assert_eq!(trigger.trigger(None, None), Some(keys));
+        assert_eq!(trigger.take_pending(), vec![0, 1, 2]);
+        assert!(trigger.trigger(Some("unknown"), None).is_none());
+        assert!(trigger.trigger(Some("debian"), Some("unknown")).is_none());
     }
 }

@@ -40,6 +40,8 @@ const SPOOL_IO_WORKERS: usize = 8;
 pub struct RunningGateway {
     pub public_addr: SocketAddr,
     pub admin_addr: SocketAddr,
+    #[cfg(feature = "test-harness")]
+    pub admin_state_dir: std::path::PathBuf,
     shutdown: CancellationToken,
     supervisor: JoinHandle<anyhow::Result<()>>,
     #[cfg(feature = "test-harness")]
@@ -264,6 +266,10 @@ async fn start_inner(
     let config = Arc::new(config);
     let limits = config.limits;
     let spool_dir = config.spool_dir();
+    anyhow::ensure!(
+        !crate::admin::migration::legacy_present(&spool_dir)?,
+        "legacy admin users require offline `ferrum admin migrate --config <path>` before startup"
+    );
     #[cfg(feature = "test-harness")]
     let mut bootstrap_audit = None;
     let (spool, s3, publisher, capture, backup) = if let Some(durable) = config.durable() {
@@ -351,9 +357,11 @@ async fn start_inner(
         let capture = Arc::new(
             CaptureManager::new(spool.clone(), Arc::clone(&store)).context("capture manager")?,
         );
-        capture
-            .begin_reconciliation(now)
-            .context("disable captures until proof reconciliation")?;
+        if !capture.coverage_ready().unwrap_or(false) {
+            capture
+                .begin_reconciliation(now)
+                .context("disable captures until proof reconciliation")?;
+        }
         let backup = BackupService::new(spool.clone(), Arc::clone(&store), backup_ceiling)
             .context("online catalog backup service")?;
         (
@@ -448,13 +456,8 @@ async fn start_inner(
     let admin_addr = admin_listener.local_addr().context("admin address")?;
     let public_addr = public_listener.local_addr().context("public address")?;
 
-    let health_router = health::router(Arc::new(HealthState {
-        catalog: Arc::clone(&catalog),
-        metrics: Arc::clone(&metrics),
-        spool: spool.clone(),
-        capture: capture.clone(),
-        verifier_version,
-    }));
+    let request_slots = Arc::new(Semaphore::new(limits.request_slots));
+    let active_bodies = Arc::new(Semaphore::new(limits.active_bodies));
     let public_router = server::router(Arc::new(AppState {
         catalog: Arc::clone(&catalog),
         spool: spool.clone(),
@@ -465,8 +468,8 @@ async fn start_inner(
         registry: registry.clone(),
         metrics: Arc::clone(&metrics),
         limits,
-        request_slots: Arc::new(Semaphore::new(limits.request_slots)),
-        active_bodies: Arc::new(Semaphore::new(limits.active_bodies)),
+        request_slots: Arc::clone(&request_slots),
+        active_bodies: Arc::clone(&active_bodies),
         cold_clients: Default::default(),
         authority: config
             .listen
@@ -585,6 +588,59 @@ async fn start_inner(
     } else {
         None
     };
+    let admin = Arc::new(
+        match crate::admin::AdminStore::open(&config.admin.state_dir) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::error!(%error, "administration unavailable; existing gateway authority preserved");
+                crate::admin::AdminStore::unavailable()
+            }
+        },
+    );
+    if let Err(error) = crate::admin::jobs::JobRegistry::reconcile_startup(&admin).await {
+        tracing::warn!(%error, "could not reconcile interrupted admin operation jobs at startup");
+    }
+    if let Err(error) = crate::admin::settings::reconcile_config_proposals(&admin, &config).await {
+        tracing::warn!(%error, "could not reconcile admin configuration proposals at startup");
+    }
+    let jobs = Arc::new(crate::admin::jobs::JobRegistry::new((*admin).clone()));
+    let durable_sync = durable_sync.map(|sync| sync.with_job_registry(Arc::clone(&jobs)));
+    let fixture_sync = fixture_sync.map(|sync| sync.with_job_registry(Arc::clone(&jobs)));
+    let sync_trigger = durable_sync
+        .as_ref()
+        .map(DurableSynchronizer::trigger_handle)
+        .or_else(|| fixture_sync.as_ref().map(Synchronizer::trigger_handle));
+    let admin_http = Arc::new(
+        crate::admin::AdminHttpState::new(&config.admin.origin_for_listener(admin_addr))
+            .map_err(anyhow::Error::msg)?,
+    );
+    let telemetry = Arc::new(crate::admin::telemetry::TelemetryHub::new());
+    let health_state = Arc::new(HealthState {
+        catalog: Arc::clone(&catalog),
+        metrics: Arc::clone(&metrics),
+        spool: spool.clone(),
+        capture: capture.clone(),
+        sync_trigger,
+        admin,
+        admin_http,
+        jobs,
+        telemetry,
+        config: Arc::clone(&config),
+        publisher: publisher.clone(),
+        s3: s3.clone(),
+        fills: Some(registry.clone()),
+        request_slots: Some(request_slots),
+        active_bodies: Some(active_bodies),
+        verifier_version,
+    });
+    let sampler_state = Arc::clone(&health_state);
+    let sampler_cancel = shutdown.child_token();
+    workers.spawn(async move {
+        crate::admin::telemetry::spawn_sampler(sampler_state, sampler_cancel)
+            .await
+            .context("telemetry sampler")
+    });
+    let health_router = health::router(health_state);
     if !config.is_fixture() {
         let catalog = Arc::clone(&catalog);
         let cancel = shutdown.child_token();
@@ -826,6 +882,8 @@ async fn start_inner(
     Ok(RunningGateway {
         public_addr,
         admin_addr,
+        #[cfg(feature = "test-harness")]
+        admin_state_dir: config.admin.state_dir.clone(),
         shutdown,
         supervisor,
         #[cfg(feature = "test-harness")]
@@ -936,6 +994,194 @@ async fn refresh_clock(catalog: &Catalog) {
     }
 }
 
+/// Triggers synchronization through the authenticated loopback admin API.
+/// A direct offline pass requires the explicit `offline` flag.
+pub async fn sync(
+    config: Config,
+    target: Option<String>,
+    repository: Option<String>,
+    suite: Option<String>,
+    offline: bool,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(target.is_some() && (repository.is_some() || suite.is_some())),
+        "specify either a positional target or --repository/--suite, not both"
+    );
+    let (repository, suite) = if let Some(target) = target {
+        if target == "all" {
+            (None, None)
+        } else if let Some((repo, suite)) = target.split_once('/') {
+            anyhow::ensure!(
+                !repo.is_empty() && !suite.is_empty() && !suite.contains('/'),
+                "invalid sync target {target}; expected <repository> or <repository>/<suite>"
+            );
+            (Some(repo.to_owned()), Some(suite.to_owned()))
+        } else {
+            (Some(target), None)
+        }
+    } else {
+        anyhow::ensure!(
+            suite.is_none() || repository.is_some(),
+            "--suite requires --repository"
+        );
+        (repository, suite)
+    };
+    let configured: Vec<ferrum_storage::checkpoint::SuiteKey> = if config.is_fixture() {
+        vec![ferrum_storage::checkpoint::SuiteKey::new(
+            "fixture",
+            crate::config::SUITE,
+        )?]
+    } else {
+        config
+            .suites()?
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect()
+    };
+    let matched: Vec<ferrum_storage::checkpoint::SuiteKey> = configured
+        .iter()
+        .filter(|key| match (repository.as_deref(), suite.as_deref()) {
+            (None, None) | (Some("all"), None) => true,
+            (Some(repo), None) => key.repository() == repo,
+            (Some(repo), Some(suite)) => key.repository() == repo && key.suite() == suite,
+            (None, Some(_)) => false,
+        })
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        !matched.is_empty(),
+        "no configured mirror/suite matches target"
+    );
+    if !offline {
+        let token = crate::admin::migration::read_control_token(&config.admin.state_dir)
+            .context("read protected local admin control token")?;
+        let origin = url::Url::parse(&config.admin.origin).context("configured admin origin")?;
+        let authority = &origin[url::Position::BeforeHost..url::Position::AfterPort];
+        let url = format!("http://{}/api/admin/sync", config.listen.admin);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .context("admin HTTP client")?;
+        let response = client
+            .post(&url)
+            .header(reqwest::header::HOST, authority)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .bearer_auth(token)
+            .body(serde_json::to_vec(&serde_json::json!({
+                "repository": repository,
+                "suite": suite,
+            }))?)
+            .send()
+            .await
+            .context("live gateway unreachable; offline synchronization requires --offline")?;
+        let status = response.status();
+        anyhow::ensure!(status.is_success(), "admin sync request refused ({status})");
+        let body = response.text().await.context("admin sync response")?;
+        println!(
+            "triggered_live=true admin={} response={body}",
+            config.listen.admin
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !config.is_fixture(),
+        "offline synchronization requires durable mode"
+    );
+    config.validate_runtime().context("runtime configuration")?;
+    crate::clock::require_synchronized_clock()
+        .await
+        .context("trusted synchronized host clock required before offline synchronization")?;
+    let verifier = SignatureVerifier::new(config.verifier.binary.clone(), config.verifier.timeout)
+        .await
+        .context("signature verifier capability check")?;
+    let durable = config.durable().context("durable configuration required")?;
+    let spool_dir = config.spool_dir();
+    anyhow::ensure!(
+        spool_dir.join("state.sqlite").is_file(),
+        "existing durable catalog required; run `ferrum storage init` first"
+    );
+    let limits = config.limits;
+    let mut disk = DurableSpoolConfig::new(spool_dir.clone());
+    disk.catalog_ceiling = disk
+        .catalog_ceiling
+        .min((limits.managed_ceiling_bytes / 4).max(16 * 1024 * 1024));
+    disk.spool.managed_ceiling = limits.managed_ceiling_bytes;
+    disk.spool.max_object_size = limits.max_object_bytes;
+    disk.spool.read_chunk = limits.reader_buffer_bytes;
+    disk.eviction_high_watermark = limits.managed_ceiling_bytes / 10 * 9;
+    disk.eviction_low_watermark = limits.managed_ceiling_bytes / 5 * 4;
+    disk.metadata_ceiling = disk.metadata_ceiling.min(limits.managed_ceiling_bytes / 2);
+    disk.temporary_ceiling = disk.temporary_ceiling.min(limits.managed_ceiling_bytes / 4);
+    disk.metadata_temporary_reserve = disk
+        .metadata_temporary_reserve
+        .min(disk.temporary_ceiling / 2);
+    let spool = tokio::task::spawn_blocking(move || Spool::open_durable(disk))
+        .await
+        .context("durable spool startup task")?
+        .with_context(|| format!("durable state {}", spool_dir.display()))?;
+    let provider = durable
+        .store_config()
+        .provider_identity(durable.qualification_run_id.as_deref())?;
+    let ledger = BudgetLedger::open_for_provider(spool.clone(), durable.budget, &provider)
+        .context("existing remote budget and matching provider identity required")?;
+    let store = Arc::new(match &durable.qualification_run_id {
+        Some(run) => S3Store::open_qualification(durable.store_config(), ledger, run)
+            .context("existing correlated private qualification namespaces")?,
+        None => S3Store::open(durable.store_config(), ledger)
+            .context("fixed NONISOLATED S3 operation identities")?,
+    });
+    let publisher = Arc::new(
+        CheckpointPublisher::new(
+            spool.clone(),
+            Arc::clone(&store),
+            RecoveryProfile::SharedNonisolated,
+        )
+        .context("checkpoint publisher")?,
+    );
+    let catalog =
+        Arc::new(Catalog::configured(configured, Arc::clone(&publisher)).context("suite catalog")?);
+    catalog.set_clock_synchronized(true);
+    let metrics = Arc::new(Metrics::default());
+    let mut synchronizer = DurableSynchronizer::new(
+        Arc::new(config),
+        verifier,
+        spool.clone(),
+        publisher,
+        catalog,
+        metrics,
+    )
+    .await
+    .context("durable suite synchronizer")?;
+    let cancel = CancellationToken::new();
+    let guard = cancel.clone();
+    tokio::pin!(shutdown);
+    for key in &matched {
+        let outcome = tokio::select! {
+            () = &mut shutdown => {
+                guard.cancel();
+                anyhow::bail!("synchronization interrupted");
+            }
+            result = synchronizer.synchronize_once(key, &cancel) => {
+                result.with_context(|| format!("synchronize {}/{}", key.repository(), key.suite()))?
+            }
+        };
+        println!(
+            "synced suite={}/{} outcome={}",
+            key.repository(),
+            key.suite(),
+            match outcome {
+                crate::sync::SyncOutcome::Published => "published",
+                crate::sync::SyncOutcome::Renewed => "renewed",
+            }
+        );
+    }
+    spool.checkpoint().context("checkpoint durable catalog")?;
+    Ok(())
+}
+
 #[cfg(all(test, feature = "test-harness"))]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
@@ -962,9 +1208,8 @@ mod tests {
         let text = format!(
             "mode = \"private-durable\"\n[listen]\npublic = \"127.0.0.1:0\"\nadmin = \"127.0.0.1:0\"\n\
              [durable]\nstate_dir = \"{}\"\n\
-             [durable.provider]\nendpoint = \"https://s3.us-central-1.idrivee2.com\"\nregion = \"us-central-1\"\n\
-             bucket = \"s3-andrew\"\npackage_prefix = \"linux-packages/\"\n\
-             checkpoint_prefix = \"linux-checkpoints/\"\nshared_nonisolated = true\ncredentials_file = \"{}\"\n\
+             [durable.provider]\nregion = \"us-east-1\"\n\
+             bucket = \"ferrum\"\ncredentials_file = \"{}\"\n\
              [durable.keyrings]\ndebian = \"{}\"\nubuntu = \"{}\"\n\
              [durable.budget]\nmode = \"existing\"\n[verifier]\n",
             state_dir.display(),

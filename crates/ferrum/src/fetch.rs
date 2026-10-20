@@ -17,6 +17,13 @@ use futures_util::StreamExt;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+tokio::task_local! {
+    pub(crate) static PRODUCER_SOURCE: std::cell::Cell<usize>;
+}
+pub(crate) fn mark_producer_source(source: usize) {
+    let _ = PRODUCER_SOURCE.try_with(|slot| slot.set(source));
+}
+
 pub use self::flight::{FillRegistry, JoinOutcome};
 pub use self::upstream::{SourceError, SourceResponse, UpstreamClient};
 use crate::config::Limits;
@@ -141,9 +148,9 @@ impl From<ferrum_storage::capture::CaptureError> for FillError {
     }
 }
 
-/// Production package source selection. Only authenticated index authority can
-/// enter this path; a new upstream capture reserves durable outbox capacity
-/// before the first source body, whereas receipted rehydration does not.
+/// Production package source selection. Signed metadata carries index authority;
+/// Pacman database records carry only candidate identity until this producer
+/// verifies that package's own signature. Raw candidate bytes cannot be captured.
 pub(crate) async fn fill_authorized_package(
     client: &UpstreamClient,
     store: &S3Store,
@@ -153,18 +160,55 @@ pub(crate) async fn fill_authorized_package(
     limits: &Limits,
     cancel: &CancellationToken,
 ) -> Result<VerifiedObject, FillError> {
+    if proof.requires_package_signature() {
+        let (object, authenticated) =
+            authenticate_pacman_package(client, store, capture, proof, spool, limits, cancel)
+                .await?;
+        let package_proof = authenticated.authenticated_package_proof()?;
+        let _package_reservation = if package_proof.path() != authenticated.path()
+            && capture.lookup(package_proof.repository(), package_proof.path())?
+                != Some(package_proof.identity())
+        {
+            Some(capture.reserve(
+                &package_proof,
+                ferrum_apt::release::UnixTime::now().as_secs(),
+            )?)
+        } else {
+            None
+        };
+        if capture.lookup(authenticated.repository(), authenticated.path())?
+            != Some(authenticated.identity())
+        {
+            if capture.is_durable(authenticated.identity())? {
+                let deadline = tokio::time::Instant::now() + limits.producer_deadline;
+                capture
+                    .capture_verified_hit(&authenticated, deadline, cancel)
+                    .await?;
+            } else {
+                let _reservation = capture.reserve(
+                    &authenticated,
+                    ferrum_apt::release::UnixTime::now().as_secs(),
+                )?;
+            }
+        }
+        return Ok(object);
+    }
     let identity = proof.identity();
     let deadline = tokio::time::Instant::now() + limits.producer_deadline;
     if capture.is_durable(identity)? {
-        return capture
-            .rehydrate(identity, deadline, cancel)
-            .await
-            .map_err(Into::into);
+        let object = capture.rehydrate(identity, deadline, cancel).await?;
+        mark_producer_source(0);
+        return Ok(object);
     }
     let reservation = spool.reserve(identity.size)?;
     let mut writer = spool.begin_write(reservation, identity).await?;
     let mut capture_reservation = None;
-    let from_s3 = match attempt_s3(store, &mut writer, identity, deadline).await {
+    let s3_outcome = if !capture.coverage_ready()? || capture.has_remote_candidate(identity)? {
+        attempt_s3(store, &mut writer, identity, deadline).await
+    } else {
+        Err(FillError::NotFound)
+    };
+    let from_s3 = match s3_outcome {
         Ok(()) => true,
         Err(error) => {
             if matches!(error, FillError::Corrupt(_)) {
@@ -223,7 +267,136 @@ pub(crate) async fn fill_authorized_package(
             .await?;
     }
     drop(capture_reservation);
+    mark_producer_source(if from_s3 { 0 } else { 1 });
     Ok(object)
+}
+
+/// Pacman index records are transport-trusted candidates, not signed metadata.
+/// This boundary is shared by cold producers and warm GET/capture paths.
+pub(crate) async fn authenticate_pacman_package(
+    client: &UpstreamClient,
+    store: &S3Store,
+    capture: &ferrum_storage::capture::CaptureManager,
+    proof: &ferrum_storage::capture::VerifiedCaptureProof,
+    spool: &Spool,
+    limits: &Limits,
+    cancel: &CancellationToken,
+) -> Result<
+    (
+        VerifiedObject,
+        std::sync::Arc<ferrum_storage::capture::VerifiedCaptureProof>,
+    ),
+    FillError,
+> {
+    if !capture.coverage_ready()? {
+        return Err(FillError::Admission);
+    }
+    let deadline = tokio::time::Instant::now() + limits.producer_deadline;
+    let (package_path, identity) = proof.package_candidate()?;
+    let package = if let Some(object) = spool.lookup(identity) {
+        object
+    } else if capture.is_durable(identity)? {
+        let object = capture.rehydrate(identity, deadline, cancel).await?;
+        mark_producer_source(0);
+        object
+    } else {
+        fill_candidate_object(client, Some(store), spool, identity, &package_path, limits).await?
+    };
+    let package_source = PRODUCER_SOURCE
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(usize::MAX);
+    mark_producer_source(usize::MAX);
+    let signature_path = RepositoryPath::parse_decoded(&format!("{package_path}.sig"))
+        .map_err(|error| FillError::Corrupt(error.to_string()))?;
+    let expected = proof.candidate_signature_identity()?;
+    let signature = if let Some(object) = expected.and_then(|identity| spool.lookup(identity)) {
+        object
+    } else if let Some(bytes) = proof.embedded_package_signature(deadline, cancel).await? {
+        install_package_signature(spool, bytes, expected).await?
+    } else if let Some(identity) = expected {
+        fill_candidate_object(
+            client,
+            Some(store),
+            spool,
+            identity,
+            &signature_path,
+            limits,
+        )
+        .await?
+    } else {
+        let maximum = ferrum_apt::pacman::MAX_PACMAN_SIG_BYTES;
+        let _scratch = spool.reserve_class(
+            maximum as u64,
+            ferrum_storage::disk::ReservationClass::Metadata,
+        )?;
+        let response = client.get(&signature_path, None).await?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum as u64)
+        {
+            return Err(FillError::Corrupt(
+                "Pacman signature exceeds size limit".into(),
+            ));
+        }
+        let declared = response.content_length();
+        let mut bytes = Vec::with_capacity(maximum);
+        let mut stream = response.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if chunk.len() > maximum - bytes.len() {
+                return Err(FillError::Corrupt(
+                    "Pacman signature exceeds size limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if declared.is_some_and(|length| length != bytes.len() as u64) {
+            return Err(FillError::Corrupt(
+                "Pacman signature length mismatch".into(),
+            ));
+        }
+        let object = install_package_signature(spool, bytes, expected).await?;
+        mark_producer_source(1);
+        object
+    };
+    let authenticated = proof
+        .authenticate_package(&package, &signature, deadline, cancel)
+        .await?;
+    let object = if proof.path().as_str().ends_with(".sig") {
+        signature
+    } else {
+        package
+    };
+    if !proof.path().as_str().ends_with(".sig") {
+        mark_producer_source(package_source);
+    }
+    Ok((object, authenticated))
+}
+
+async fn install_package_signature(
+    spool: &Spool,
+    bytes: Vec<u8>,
+    expected: Option<ObjectIdentity>,
+) -> Result<VerifiedObject, FillError> {
+    let identity = ObjectIdentity {
+        sha256: ferrum_apt::digest::Sha256Digest::of(&bytes),
+        size: bytes.len() as u64,
+    };
+    if expected.is_some_and(|expected| expected != identity) {
+        return Err(FillError::Corrupt(
+            "Pacman signature identity mismatch".into(),
+        ));
+    }
+    if let Some(object) = spool.lookup(identity) {
+        return Ok(object);
+    }
+    let reservation = spool.reserve_class(
+        identity.size,
+        ferrum_storage::disk::ReservationClass::Metadata,
+    )?;
+    let mut writer = spool.begin_write(reservation, identity).await?;
+    writer.write(bytes.into()).await?;
+    Ok(writer.commit().await?)
 }
 
 /// Fetches `path` from the origin and installs it as `identity`.
@@ -260,6 +433,29 @@ pub async fn fill_package_object(
     path: &RepositoryPath,
     limits: &Limits,
 ) -> Result<VerifiedObject, FillError> {
+    fill_package_source(client, s3, spool, identity, path, limits, false).await
+}
+
+async fn fill_candidate_object(
+    client: &UpstreamClient,
+    s3: Option<&S3Store>,
+    spool: &Spool,
+    identity: ObjectIdentity,
+    path: &RepositoryPath,
+    limits: &Limits,
+) -> Result<VerifiedObject, FillError> {
+    fill_package_source(client, s3, spool, identity, path, limits, true).await
+}
+
+async fn fill_package_source(
+    client: &UpstreamClient,
+    s3: Option<&S3Store>,
+    spool: &Spool,
+    identity: ObjectIdentity,
+    path: &RepositoryPath,
+    limits: &Limits,
+    candidate: bool,
+) -> Result<VerifiedObject, FillError> {
     let reservation = spool.reserve(identity.size)?;
     let mut writer = spool.begin_write(reservation, identity).await?;
     let deadline = tokio::time::Instant::now() + limits.producer_deadline;
@@ -276,12 +472,20 @@ pub async fn fill_package_object(
         };
         match result {
             Ok(()) => {
-                let result = writer.commit().await.map_err(FillError::from);
+                let result = if candidate {
+                    writer.commit_candidate().await
+                } else {
+                    writer.commit().await
+                }
+                .map_err(FillError::from);
                 if use_s3
                     && matches!(result, Err(FillError::Corrupt(_)))
                     && let Some(store) = s3
                 {
                     store.quarantine(identity).map_err(FillError::from)?;
+                }
+                if result.is_ok() {
+                    mark_producer_source(if use_s3 { 0 } else { 1 });
                 }
                 return result;
             }

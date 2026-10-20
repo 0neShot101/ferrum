@@ -130,9 +130,10 @@ pub struct ActiveView {
     pub suite: String,
     /// SHA-256 of the exact InRelease or Pacman database bytes.
     pub generation_id: Sha256Digest,
-    /// Authenticated Release date or latest Pacman package build date.
+    /// Signed Release date; Pacman retains a descriptive max package build time,
+    /// never a cryptographic revision or freshness bound.
     pub release_date: UnixTime,
-    /// Authenticated Release/database content digest (for same-date conflict detection).
+    /// Exact signed metadata content or transport-candidate database content digest.
     pub content_sha256: Sha256Digest,
     /// Authenticated `Valid-Until`, if present.
     pub valid_until: Option<UnixTime>,
@@ -243,6 +244,11 @@ impl ActiveView {
         view.suite.clone_from(&manifest.suite);
         let descriptors = Arc::make_mut(&mut view.descriptors);
         for artifact in &manifest.artifacts {
+            // Canary objects are proof closure, not metadata serving authority.
+            // Every Pacman package and .sig follows the package verifier path.
+            if is_pacman && artifact.path != manifest.artifacts[0].path {
+                continue;
+            }
             let identity = artifact.identity()?;
             let object = proof
                 .artifact(&artifact.path)
@@ -285,12 +291,15 @@ impl ActiveView {
             } else {
                 let public = if view.repository == "cachyos" {
                     format!(
-                        "x86_64/{}/{}",
+                        "{}/{}/{}",
+                        ferrum_apt::pacman::cachyos_suite_arch(&view.suite)
+                            .ok_or(CheckpointError::Proof)?,
                         view.suite,
                         artifact
                             .path
-                            .strip_prefix("x86_64/")
-                            .unwrap_or(&artifact.path)
+                            .split_once('/')
+                            .ok_or(CheckpointError::Proof)?
+                            .1
                     )
                 } else if is_pacman {
                     format!("{}/{}", view.suite, artifact.path)

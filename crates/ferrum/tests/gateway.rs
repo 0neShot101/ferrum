@@ -72,8 +72,11 @@ async fn empty_error(response: reqwest::Response, expected: StatusCode) {
 }
 
 async fn metrics(client: &Client, gateway: &RunningGateway) -> String {
+    let token = ferrum::admin::migration::read_control_token(&gateway.admin_state_dir)
+        .expect("protected local metrics token");
     client
         .get(admin_url(gateway, "/metrics"))
+        .bearer_auth(token)
         .send()
         .await
         .expect("metrics response")

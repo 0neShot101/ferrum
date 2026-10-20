@@ -16,9 +16,9 @@ use tokio_util::sync::CancellationToken;
 
 fn s3_config(root: &std::path::Path) -> PrivateS3Config {
     PrivateS3Config {
-        endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-        region: "us-central-1".into(),
-        bucket: "s3-andrew".into(),
+        endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+        region: "us-east-1".into(),
+        bucket: "ferrum".into(),
         package_prefix: "linux-packages/_ferrum-b05/0123456789abcdef0123456789abcdef/".into(),
         credentials_file: root.join("provider.env"),
         transfer_journal: root.join("journal"),
@@ -413,9 +413,9 @@ async fn production_budget_refuses_get_and_head_before_provider_or_origin_contac
     )
     .expect("explicit bounded allowance");
     let config = S3Config {
-        endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-        region: "us-central-1".into(),
-        bucket: "s3-andrew".into(),
+        endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+        region: "us-east-1".into(),
+        bucket: "ferrum".into(),
         package_prefix: "linux-packages/".into(),
         checkpoint_prefix: "linux-checkpoints/".into(),
         credentials_file: root.path().join("unused-scripted-credentials"),

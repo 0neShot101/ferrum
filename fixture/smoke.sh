@@ -115,7 +115,7 @@ origin_assert_ranges_null() {
 
 # metric_value <name{labels}> -> value from the admin /metrics text exposition
 metric_value() {
-    dexec curl -sS "$ADMIN_URL/metrics" | awk -v m="$1" '$1 == m { print $2; found = 1 } END { if (!found) print "missing" }'
+    dexec bash -c 'token="$(target/release/ferrum admin control-token --config fixture/ferrum.toml)" && curl -sS -H "Authorization: Bearer $token" "$1/metrics"' -- "$ADMIN_URL" | awk -v m="$1" '$1 == m { print $2; found = 1 } END { if (!found) print "missing" }'
 }
 
 origin_start() {

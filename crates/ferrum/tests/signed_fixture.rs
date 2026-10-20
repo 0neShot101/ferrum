@@ -1,5 +1,5 @@
 //! Explicit signed-fixture suite: generate fixture/public first and run with
-//! ferrum-verifier 0.1.0 on PATH plus /usr/bin/prlimit. No test substitutes a verifier.
+//! ferrum-verifier 0.2.0 on PATH plus /usr/bin/prlimit. No test substitutes a verifier.
 #![allow(clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -44,7 +44,7 @@ async fn wait_health(gateway: &app::RunningGateway, expected: &str) -> String {
     let client = client();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let text = client
+            let mut text = client
                 .get(admin_url(gateway, "/readyz"))
                 .send()
                 .await
@@ -52,6 +52,10 @@ async fn wait_health(gateway: &app::RunningGateway, expected: &str) -> String {
                 .text()
                 .await
                 .expect("health body");
+            if let Some(error) = gateway.catalog().last_error() {
+                text.push(' ');
+                text.push_str(&error);
+            }
             if text.contains(expected) {
                 return text;
             }
@@ -75,7 +79,7 @@ async fn assert_unavailable(gateway: &app::RunningGateway) {
 }
 
 #[tokio::test]
-#[ignore = "requires generated fixture/public, ferrum-verifier 0.1.0 on PATH and /usr/bin/prlimit"]
+#[ignore = "requires generated fixture/public, ferrum-verifier 0.2.0 on PATH and /usr/bin/prlimit"]
 async fn signed_fixture_publishes_exact_complete_metadata_and_reauthenticates_after_restart() {
     let fixture = fixture();
     let directory = tempfile::tempdir().expect("work directory");
@@ -195,7 +199,7 @@ async fn signed_fixture_publishes_exact_complete_metadata_and_reauthenticates_af
 }
 
 #[tokio::test]
-#[ignore = "requires generated fixture/public, ferrum-verifier 0.1.0 on PATH and /usr/bin/prlimit"]
+#[ignore = "requires generated fixture/public, ferrum-verifier 0.2.0 on PATH and /usr/bin/prlimit"]
 async fn unknown_signer_corrupt_index_and_incomplete_detached_pair_never_publish() {
     let fixture = fixture();
     let release = Release::parse(
@@ -267,7 +271,7 @@ async fn unknown_signer_corrupt_index_and_incomplete_detached_pair_never_publish
 }
 
 #[tokio::test]
-#[ignore = "requires generated fixture/public, ferrum-verifier 0.1.0 on PATH and /usr/bin/prlimit"]
+#[ignore = "requires generated fixture/public, ferrum-verifier 0.2.0 on PATH and /usr/bin/prlimit"]
 async fn expired_signed_release_never_publishes_or_replaces_an_active_view() {
     let fixture = fixture();
     let directory = tempfile::tempdir().expect("work directory");
@@ -311,7 +315,7 @@ async fn expired_signed_release_never_publishes_or_replaces_an_active_view() {
 }
 
 #[tokio::test]
-#[ignore = "requires generated fixture/public, ferrum-verifier 0.1.0 on PATH and /usr/bin/prlimit"]
+#[ignore = "requires generated fixture/public, ferrum-verifier 0.2.0 on PATH and /usr/bin/prlimit"]
 async fn observed_unpublishable_successor_prevents_old_payload_from_renewing_freshness() {
     let fixture = fixture();
     let directory = tempfile::tempdir().expect("work directory");
@@ -363,7 +367,7 @@ async fn observed_unpublishable_successor_prevents_old_payload_from_renewing_fre
 }
 
 #[tokio::test]
-#[ignore = "requires generated fixture/public, ferrum-verifier 0.1.0 on PATH and /usr/bin/prlimit"]
+#[ignore = "requires generated fixture/public, ferrum-verifier 0.2.0 on PATH and /usr/bin/prlimit"]
 async fn unowned_scratch_directory_is_refused_without_deleting_user_files() {
     let fixture = fixture();
     let directory = tempfile::tempdir().expect("work directory");

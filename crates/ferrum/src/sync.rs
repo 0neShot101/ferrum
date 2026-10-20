@@ -11,7 +11,7 @@ pub mod scheduler;
 pub mod view;
 
 pub use catalog::Catalog;
-pub use publication::DurableSynchronizer;
+pub use publication::{DurableSynchronizer, SyncTrigger};
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::view::ViewParts;
 pub use self::view::{ActiveView, ByHashKey, CacheClass, HashAlgorithm, Resolution};
+use crate::admin::jobs::JobRegistry;
 use crate::config::{ARCHITECTURE, COMPONENT, Config, MAX_METADATA_BYTES, SUITE};
 use crate::fetch::{FillError, SourceError, UpstreamClient, fill_object};
 use crate::health::Metrics;
@@ -189,7 +190,9 @@ pub struct Synchronizer {
     limits: ParseLimits,
     trust: ferrum_storage::recovery::TrustPolicy,
     key: ferrum_storage::checkpoint::SuiteKey,
+    trigger: SyncTrigger,
     observed: Mutex<Option<(UnixTime, Sha256Digest)>>,
+    jobs: Option<Arc<JobRegistry>>,
 }
 
 /// Verified descriptors of the three mutable suite files.
@@ -272,6 +275,7 @@ impl Synchronizer {
             keyring: config.fixture.keyring.clone(),
         };
         let key = ferrum_storage::checkpoint::SuiteKey::new("fixture", SUITE)?;
+        let trigger = SyncTrigger::new(vec![key.clone()]);
         Ok(Self {
             config,
             verifier,
@@ -284,8 +288,33 @@ impl Synchronizer {
             limits: ParseLimits::default(),
             trust,
             key,
+            trigger,
             observed: Mutex::new(None),
+            jobs: None,
         })
+    }
+
+    pub fn with_job_registry(mut self, jobs: Arc<JobRegistry>) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    async fn job_phase(
+        &self,
+        phase: &str,
+        generation: Option<String>,
+        completed: Option<u64>,
+        total: Option<u64>,
+        path: Option<String>,
+    ) {
+        if let Some(jobs) = &self.jobs {
+            jobs.phase_changed(&self.key, phase, generation, completed, total, path)
+                .await;
+        }
+    }
+
+    pub fn trigger_handle(&self) -> SyncTrigger {
+        self.trigger.clone()
     }
 
     /// Runs the first authentication, then repeats every `sync_interval` with
@@ -301,6 +330,9 @@ impl Synchronizer {
             let interval = jittered(self.config.limits.sync_interval);
             tokio::select! {
                 () = cancel.cancelled() => return,
+                () = self.trigger.notified() => {
+                    let _ = self.trigger.take_pending();
+                }
                 () = tokio::time::sleep(interval) => {}
             }
         }
@@ -308,6 +340,9 @@ impl Synchronizer {
 
     /// One pass with logging, metrics and health bookkeeping.
     pub async fn authenticate_and_record(&self) -> Result<SyncOutcome, SyncError> {
+        if let Some(jobs) = &self.jobs {
+            jobs.pass_started(&self.key, "observing").await;
+        }
         let result = self.authenticate_once().await;
         match &result {
             Ok(SyncOutcome::Published) => {
@@ -352,6 +387,34 @@ impl Synchronizer {
                 }
             }
         }
+        if let Some(jobs) = &self.jobs {
+            let generation = self.catalog.load().map(|view| view.generation_id.to_hex());
+            let (outcome, error) = match &result {
+                Ok(SyncOutcome::Published) => ("published", None),
+                Ok(SyncOutcome::Renewed) => ("renewed", None),
+                Err(error) => (
+                    if error.is_rejection() {
+                        "rejected"
+                    } else {
+                        "failed"
+                    },
+                    Some(error.summary()),
+                ),
+            };
+            if jobs
+                .pass_completed(
+                    &self.key,
+                    outcome,
+                    if result.is_ok() { generation } else { None },
+                    error,
+                )
+                .await
+            {
+                let _ = self
+                    .trigger
+                    .trigger(Some(self.key.repository()), Some(self.key.suite()));
+            }
+        }
         result
     }
 
@@ -388,6 +451,14 @@ impl Synchronizer {
         let inrelease_path = self.scratch.path.join("InRelease");
         let inrelease =
             download_bounded(&self.client, "dists/ferrum-test/InRelease", &inrelease_path).await?;
+        self.job_phase(
+            "verifying_metadata",
+            None,
+            None,
+            None,
+            Some("InRelease".into()),
+        )
+        .await;
         let authenticated = self
             .verifier
             .verify_cleartext_owned(
@@ -409,6 +480,14 @@ impl Synchronizer {
             })?;
         check_identity(&candidate, &self.trust, &self.key)?;
         let generation_id = Sha256Digest::of(&inrelease);
+        self.job_phase(
+            "verifying_metadata",
+            Some(generation_id.to_hex()),
+            None,
+            Some(6),
+            Some("Release.gpg".into()),
+        )
+        .await;
         {
             let mut observed = self
                 .observed
@@ -447,6 +526,14 @@ impl Synchronizer {
         }
 
         let suite = self.verify_detached_release(inrelease, candidate).await?;
+        self.job_phase(
+            "staging",
+            Some(generation_id.to_hex()),
+            Some(0),
+            Some(6),
+            None,
+        )
+        .await;
         let (metadata_indexes, by_hash) = self.stage_indexes(&suite.parsed).await?;
         let packages_object = metadata_indexes
             .iter()
@@ -469,6 +556,14 @@ impl Synchronizer {
             let object = install_bytes(&self.spool, bytes).await?;
             let path = suite_path(name)?;
             metadata.insert(path, (object, CacheClass::Mutable));
+            self.job_phase(
+                "staging",
+                Some(generation_id.to_hex()),
+                Some(metadata.len() as u64 + 3),
+                Some(6),
+                Some(name.into()),
+            )
+            .await;
         }
         for (path, object) in metadata_indexes {
             metadata.insert(path, (object, CacheClass::Canonical));
@@ -504,6 +599,14 @@ impl Synchronizer {
             packages = view.package_count(),
             "candidate generation verified"
         );
+        self.job_phase(
+            "publishing",
+            Some(generation_id.to_hex()),
+            Some(6),
+            Some(6),
+            None,
+        )
+        .await;
         self.catalog.publish(view);
         Ok(SyncOutcome::Published)
     }
@@ -591,6 +694,14 @@ impl Synchronizer {
                 size: entry.size,
             };
             let canonical = suite_path(relative.as_str())?;
+            self.job_phase(
+                "staging",
+                None,
+                Some(staged.len() as u64),
+                Some(6),
+                Some(canonical.as_str().into()),
+            )
+            .await;
             let object = self.stage_one(identity, &canonical, &directory).await?;
             if let Some(expected) = entry.sha512 {
                 if hash_sha512(&object, Arc::clone(&self.cpu_jobs)).await? != expected {
@@ -614,6 +725,8 @@ impl Synchronizer {
                 object.clone(),
             );
             staged.push((canonical, object));
+            self.job_phase("staging", None, Some(staged.len() as u64), Some(6), None)
+                .await;
         }
         let plain = staged
             .iter()

@@ -41,8 +41,12 @@ pub const MAX_REQUEST_PATH_BYTES: usize = 8 * 1024;
 /// Byte limit for the request head (§3.1: larger heads answer 431).
 pub const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
 
+mod admin;
 mod distribution;
-pub use distribution::{ALL_DISTRIBUTION_SUITES, DEFAULT_DISTRIBUTION_SUITES, DistributionSuite};
+pub use admin::AdminConfig;
+pub use distribution::{
+    ALL_DISTRIBUTION_SUITES, DEFAULT_DISTRIBUTION_SUITES, DistributionSuite, Repository,
+};
 
 /// Resolves an optional `durable.suites` list against the fixed distribution allowlist.
 pub fn resolve_distribution_suites(
@@ -53,6 +57,12 @@ pub fn resolve_distribution_suites(
     };
     if entries.is_empty() {
         return Err("must not be empty".into());
+    }
+    if entries.len() > ferrum_storage::checkpoint::MAX_SUITES {
+        return Err(format!(
+            "must contain at most {} suites",
+            ferrum_storage::checkpoint::MAX_SUITES
+        ));
     }
     if entries.len() == 1 && entries[0] == "all" {
         return Ok(ALL_DISTRIBUTION_SUITES.to_vec());
@@ -107,12 +117,15 @@ pub struct Config {
     pub fixture: Fixture,
     pub verifier: Verifier,
     pub limits: Limits,
+    pub admin: AdminConfig,
     /// Optional private fixture rehydration, separate from durable distribution storage.
     pub s3: Option<ferrum_storage::s3::PrivateS3Config>,
     /// Fixed in normal builds; only the opt-in integration harness may override it.
     pub(crate) origin_base: Url,
     durable: Option<DurableConfig>,
     public_durable: bool,
+    source_path: Option<PathBuf>,
+    base_dir: PathBuf,
     #[cfg(feature = "test-harness")]
     test_suites: Option<(Url, PathBuf)>,
 }
@@ -253,6 +266,8 @@ struct RawConfig {
     #[serde(default)]
     limits: RawLimits,
     #[serde(default)]
+    admin: admin::RawAdmin,
+    #[serde(default)]
     s3: Option<ferrum_storage::s3::PrivateS3Config>,
 }
 
@@ -369,8 +384,11 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
-        Self::parse(&text, base)
+        let abs_path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let base = abs_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut config = Self::parse(&text, base)?;
+        config.source_path = Some(abs_path);
+        Ok(config)
     }
 
     /// Parses TOML text; relative fixture paths resolve against `base_dir`.
@@ -648,12 +666,24 @@ impl Config {
         }
         let origin_base = Url::parse(ORIGIN_BASE_URL)
             .map_err(|error| invalid("origin", format!("constant origin URL: {error}")))?;
+        let spool = durable.as_ref().map_or_else(
+            || fixture.work_dir.join("spool"),
+            |durable| durable.state_dir.clone(),
+        );
+        let admin = AdminConfig::resolve(
+            raw.admin,
+            base_dir,
+            &spool,
+            &fixture.work_dir.join("scratch"),
+            raw.listen.admin,
+        )?;
         Ok(Self {
             listen: Listen {
                 public: raw.listen.public,
                 admin: raw.listen.admin,
                 public_host,
             },
+            admin,
             fixture,
             durable,
             public_durable,
@@ -666,6 +696,8 @@ impl Config {
             limits,
             s3: raw.s3,
             origin_base,
+            source_path: None,
+            base_dir: base_dir.to_path_buf(),
         })
     }
     /// Selects an ephemeral loopback fixture origin in integration-test builds.
@@ -732,6 +764,8 @@ impl Config {
     pub(crate) fn validate_runtime(&self) -> Result<(), ConfigError> {
         require_loopback("listen.public", self.listen.public)?;
         require_loopback("listen.admin", self.listen.admin)?;
+        self.admin
+            .validate_separation(&self.spool_dir(), &self.scratch_dir(), true)?;
         match &self.listen.public_host {
             Some(host) if self.public_durable => {
                 validate_public_host(host)?;
@@ -796,6 +830,21 @@ impl Config {
 
     pub fn durable(&self) -> Option<&DurableConfig> {
         self.durable.as_ref()
+    }
+
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    pub fn set_source_path(&mut self, path: PathBuf) {
+        if let Some(parent) = path.parent() {
+            self.base_dir = parent.to_path_buf();
+        }
+        self.source_path = Some(path);
     }
 
     /// Returns only the configured fixed identities; TOML cannot add routes.
@@ -1566,6 +1615,20 @@ mode = "existing"
     }
 
     #[test]
+    fn configured_suite_limit_is_rejected_before_entry_resolution() {
+        let entries =
+            vec!["not-a-valid-profile".to_owned(); ferrum_storage::checkpoint::MAX_SUITES + 1];
+        let reason = resolve_distribution_suites(Some(&entries)).expect_err("bounded inventory");
+        assert_eq!(
+            reason,
+            format!(
+                "must contain at most {} suites",
+                ferrum_storage::checkpoint::MAX_SUITES
+            )
+        );
+    }
+
+    #[test]
     fn durable_resolves_explicit_vendor_keyrings() {
         let assignments = [
             ("docker", "docker-debian"),
@@ -1925,14 +1988,66 @@ mode = "existing"
             provider.credentials_file,
             root.path().join("credentials.toml")
         );
+        let minimal = DURABLE
+            .replace("endpoint = \"https://s3.example.org\"\n", "")
+            .replace("package_prefix = \"linux-packages/\"\n", "")
+            .replace("checkpoint_prefix = \"linux-checkpoints/\"\n", "")
+            .replace("shared_nonisolated = true\n", "");
+        let minimal = Config::parse(&minimal, root.path()).expect("defaulted S3 provider");
+        let defaulted = &minimal.durable().expect("durable").provider;
+        assert_eq!(defaulted.endpoint, "https://s3.us-east-1.amazonaws.com");
+        assert_eq!(defaulted.package_prefix, "linux-packages/");
+        assert_eq!(defaulted.checkpoint_prefix, "linux-checkpoints/");
+        assert!(defaulted.shared_nonisolated);
+
+        let custom_prefixes = DURABLE
+            .replace("linux-packages/", "custom-packages/")
+            .replace("linux-checkpoints/", "custom-checkpoints/");
+        Config::parse(&custom_prefixes, root.path()).expect("custom S3 prefixes");
+        let r2_preset = DURABLE
+            .replace(
+                "endpoint = \"https://s3.example.org\"\nregion = \"us-east-1\"",
+                "provider = \"cloudflare-r2\"\naccount_id = \"0123456789abcdef0123456789abcdef\"",
+            )
+            .replace("package_prefix = \"linux-packages/\"\n", "")
+            .replace("checkpoint_prefix = \"linux-checkpoints/\"\n", "")
+            .replace("shared_nonisolated = true\n", "");
+        let r2 = Config::parse(&r2_preset, root.path()).expect("Cloudflare R2 preset");
+        let r2_provider = &r2.durable().expect("durable").provider;
+        assert_eq!(
+            r2_provider.endpoint,
+            "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+        );
+        assert_eq!(r2_provider.region, "auto");
+
+        let idrive_preset = DURABLE
+            .replace(
+                "endpoint = \"https://s3.example.org\"\nregion = \"us-east-1\"",
+                "provider = \"idrive-e2\"\nregion = \"us-central-1\"",
+            )
+            .replace("package_prefix = \"linux-packages/\"\n", "")
+            .replace("checkpoint_prefix = \"linux-checkpoints/\"\n", "")
+            .replace("shared_nonisolated = true\n", "");
+        let idrive = Config::parse(&idrive_preset, root.path()).expect("IDrive e2 preset");
+        let idrive_provider = &idrive.durable().expect("durable").provider;
+        assert_eq!(
+            idrive_provider.endpoint,
+            "https://s3.us-central-1.idrivee2.com"
+        );
+        assert_eq!(idrive_provider.region, "us-central-1");
+
         for (field, value, replacement) in [
             (
                 "endpoint",
                 "https://s3.example.org",
                 "http://s3.example.org",
             ),
-            ("package_prefix", "linux-packages/", "other/"),
-            ("checkpoint_prefix", "linux-checkpoints/", "other/"),
+            ("package_prefix", "linux-packages/", "linux-checkpoints/"),
+            (
+                "checkpoint_prefix",
+                "linux-checkpoints/",
+                "invalid-no-slash",
+            ),
             ("shared_nonisolated", "true", "false"),
         ] {
             let text = DURABLE.replace(value, replacement);
@@ -1946,7 +2061,7 @@ mode = "existing"
             Config::parse(&legacy, root.path()),
             Err(ConfigError::Parse)
         ));
-        let missing = DURABLE.replace("endpoint = \"https://s3.example.org\"\n", "");
+        let missing = DURABLE.replace("bucket = \"ferrum\"\n", "");
         assert!(matches!(
             Config::parse(&missing, root.path()),
             Err(ConfigError::Parse)

@@ -15,13 +15,11 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use axum::{Extension, Router};
-use ferrum_apt::digest::{ObjectIdentity, Sha256Digest};
-use ferrum_apt::pacman::MAX_PACMAN_SIG_BYTES;
+use ferrum_apt::digest::ObjectIdentity;
 use ferrum_apt::path::RepositoryPath;
 use ferrum_apt::release::UnixTime;
 use ferrum_storage::capture::{CaptureManager, VerifiedCaptureProof};
 use ferrum_storage::checkpoint::PackageDescriptor;
-use ferrum_storage::disk::ReservationClass;
 use ferrum_storage::s3::{S3Error, S3Store};
 use ferrum_storage::{Spool, VerifiedObject};
 use futures_util::StreamExt;
@@ -44,6 +42,18 @@ use crate::http::response::{self, Representation, ResponsePlan};
 use crate::http::{BodyPermits, BodyStream};
 use crate::sync::view::{ActiveView, DerivedDescriptor};
 use crate::sync::{CacheClass, Catalog, Resolution};
+
+tokio::task_local! {
+    pub(crate) static REQUEST_SOURCE: std::cell::Cell<usize>;
+    static REQUEST_REPOSITORY: usize;
+}
+fn repository_slot(path: &str) -> usize {
+    let repository = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    crate::config::Repository::ALL
+        .iter()
+        .position(|item| item.name() == repository)
+        .unwrap_or(usize::MAX)
+}
 
 /// Time allowed for a client to send a complete request head.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -153,7 +163,12 @@ pub async fn serve(
             drop(stream);
             continue;
         };
-        let service = TowerToHyperService::new(router.clone().layer(Extension(peer.ip())));
+        let service = TowerToHyperService::new(
+            router
+                .clone()
+                .layer(Extension(peer.ip()))
+                .layer(Extension(axum::extract::ConnectInfo(peer))),
+        );
         let io = TokioIo::new(TimedIo::new(stream, write_idle));
         let connection = http.serve_connection(io, service);
         let watched = graceful.watch(connection);
@@ -261,8 +276,29 @@ async fn handle(
     let started = Instant::now();
     let request_id = state.request_ids.fetch_add(1, Ordering::Relaxed) + 1;
     let (parts, _body) = request.into_parts();
-    let (class, validated_path, response) =
-        pipeline(&state, peer, &parts.method, &parts.uri, &parts.headers).await;
+    let repository = if state.catalog.is_fixture() {
+        24
+    } else {
+        repository_slot(parts.uri.path())
+    };
+    let ((class, validated_path, response), source) = REQUEST_REPOSITORY
+        .scope(
+            repository,
+            REQUEST_SOURCE.scope(std::cell::Cell::new(usize::MAX), async {
+                let result =
+                    pipeline(&state, peer, &parts.method, &parts.uri, &parts.headers).await;
+                (result, REQUEST_SOURCE.with(std::cell::Cell::get))
+            }),
+        )
+        .await;
+    state
+        .metrics
+        .record_repository_request(repository, response.status());
+    if response.status() == StatusCode::NOT_MODIFIED {
+        state.metrics.record_cache_source(1);
+    } else if response.status().is_success() && parts.method == Method::GET {
+        state.metrics.record_cache_source(source);
+    }
     state
         .metrics
         .record_request_timed(class, response.status(), started.elapsed());
@@ -339,6 +375,39 @@ async fn pipeline(
     let authorized = match state.catalog.resolve(&valid.path, &state.prefix).await {
         Ok(Some(authorized)) => authorized,
         Ok(None) => {
+            if valid.method == RequestMethod::Head {
+                return (
+                    RequestClass::Other,
+                    validated_path,
+                    response::error(StatusCode::NOT_FOUND),
+                );
+            }
+            let unresolved_signature =
+                valid
+                    .path
+                    .as_str()
+                    .split_once('/')
+                    .is_some_and(|(repository, relative)| {
+                        matches!(
+                            repository,
+                            "archlinux" | "chaotic-aur" | "cachyos" | "archlinuxcn" | "endeavouros"
+                        ) && relative.ends_with(".sig")
+                            && ferrum_storage::capture::is_package_path(relative)
+                    });
+            if unresolved_signature
+                && ["if-match", "if-none-match", "if-range"]
+                    .iter()
+                    .any(|header| headers.contains_key(*header))
+            {
+                // There is no authenticated descriptor on which to decide a
+                // precondition. Discovery must not turn a conditional probe into
+                // a package download and capture before answering 304/412.
+                return (
+                    RequestClass::Package,
+                    validated_path,
+                    response::service_unavailable(),
+                );
+            }
             match tokio::time::timeout(
                 state.limits.waiter_timeout,
                 resolve_package_signature(state, client_ip, &valid.path),
@@ -532,16 +601,17 @@ async fn resolve_package_signature(
     else {
         return Ok(None);
     };
-    let (Resolution::Package { identity, path }, Some(package)) =
-        (authorized.resolution, authorized.package)
+    let (
+        Resolution::Package {
+            identity,
+            path: candidate_path,
+        },
+        Some(package),
+    ) = (authorized.resolution, authorized.package)
     else {
         return Ok(None);
     };
     let _cold_client = ColdClient::acquire(state, peer).ok_or(FillError::Admission)?;
-    let (verifier, keyring) = state
-        .catalog
-        .package_signature_authority(&package)
-        .map_err(|error| FillError::Internal(error.to_string()))?;
     let client = state
         .clients
         .iter()
@@ -549,95 +619,28 @@ async fn resolve_package_signature(
         .map(|(_, client)| Arc::clone(client))
         .ok_or(FillError::Admission)?;
     let proof = Arc::new(package.authorize()?);
-    let request = PackageRequest {
-        identity,
-        path,
-        client,
-        proof: Some(Arc::clone(&proof)),
-        deadline: tokio::time::Instant::now() + state.limits.waiter_timeout,
-    };
-    let package_object = if let Some(object) = state.spool.lookup(identity) {
-        object
-    } else {
-        let capture = state.capture.as_ref().ok_or(FillError::Admission)?;
-        match state
-            .registry
-            .join_authorized(
-                identity,
-                &request.path,
-                Arc::clone(&request.client),
-                Arc::clone(capture),
-                proof,
-            )
-            .await
-        {
-            JoinOutcome::Verified(object) => object,
-            JoinOutcome::Failed(error) => return Err(error),
-            JoinOutcome::Timeout | JoinOutcome::TooManyWaiters => return Err(FillError::Timeout),
-        }
-    };
-    retain_package_reference(state, &request).await?;
-    let signature_path = RepositoryPath::parse_decoded(relative)
-        .map_err(|error| FillError::Internal(error.to_string()))?;
-    let scratch = state
-        .spool
-        .reserve_class(MAX_PACMAN_SIG_BYTES as u64, ReservationClass::Metadata)?;
-    let response = request.client.get(&signature_path, None).await?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_PACMAN_SIG_BYTES as u64)
-    {
-        return Err(FillError::Corrupt(
-            "Pacman signature exceeds size limit".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(MAX_PACMAN_SIG_BYTES);
-    let mut stream = response.into_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if chunk.len() > MAX_PACMAN_SIG_BYTES - bytes.len() {
-            return Err(FillError::Corrupt(
-                "Pacman signature exceeds size limit".into(),
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let signature_identity = ObjectIdentity {
-        sha256: Sha256Digest::of(&bytes),
-        size: bytes.len() as u64,
-    };
-    let signature = if let Some(object) = state.spool.lookup(signature_identity) {
-        object
-    } else {
-        let reservation = state
-            .spool
-            .reserve_class(signature_identity.size, ReservationClass::Metadata)?;
-        let mut writer = state
-            .spool
-            .begin_write(reservation, signature_identity)
-            .await?;
-        writer.write(bytes.into()).await?;
-        writer.commit().await?
-    };
-    verifier
-        .verify_detached_owned(
-            &keyring,
-            package_object.path(),
-            signature.path(),
-            (
-                scratch,
-                package_object.clone(),
-                signature.clone(),
-                Arc::clone(package.proof()),
-            ),
+    let capture = state.capture.as_ref().ok_or(FillError::Admission)?;
+    match state
+        .registry
+        .join_authorized(
+            identity,
+            &candidate_path,
+            client,
+            Arc::clone(capture),
+            proof,
         )
         .await
-        .map_err(|error| FillError::Corrupt(error.to_string()))?;
-    let signature = state
+    {
+        JoinOutcome::Verified(_) => {}
+        JoinOutcome::Failed(error) => return Err(error),
+        JoinOutcome::Timeout | JoinOutcome::TooManyWaiters => return Err(FillError::Timeout),
+    }
+    let resolved = state
         .catalog
-        .register_package_signature(&package, &signature_path, signature_identity)
-        .map_err(|error| FillError::Corrupt(error.to_string()))?;
-    Ok(Some(signature))
+        .resolve(path, &state.prefix)
+        .await
+        .map_err(|error| FillError::Internal(error.to_string()))?;
+    Ok(resolved.and_then(|resolved| resolved.package))
 }
 
 fn fresh_view(state: &AppState, view: Option<&ActiveView>) -> bool {
@@ -675,7 +678,59 @@ async fn serve_package(
 ) -> Response<Body> {
     let identity = request.identity;
     let path = &request.path;
-    if let Some(object) = state.spool.lookup(identity) {
+    let requires_signature = request
+        .proof
+        .as_ref()
+        .is_some_and(|proof| proof.requires_package_signature());
+    let initial_plan = response::plan(
+        valid.method,
+        headers,
+        &Representation {
+            identity,
+            class: CacheClass::Package,
+        },
+    );
+    let body_request = valid.method != RequestMethod::Head
+        && matches!(
+            initial_plan,
+            ResponsePlan::Full | ResponsePlan::Partial { .. }
+        );
+    if requires_signature
+        && (initial_plan == ResponsePlan::NotModified
+            || (valid.method == RequestMethod::Head
+                && matches!(
+                    initial_plan,
+                    ResponsePlan::Full | ResponsePlan::Partial { .. }
+                )))
+    {
+        let Some(proof) = &request.proof else {
+            return response::service_unavailable();
+        };
+        let (_, package_identity) = match proof.package_candidate() {
+            Ok(candidate) => candidate,
+            Err(error) => return fill_error_response(&error.into()),
+        };
+        let signature_identity = match proof.candidate_signature_identity() {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return response::service_unavailable(),
+            Err(error) => return fill_error_response(&error.into()),
+        };
+        let (Some(package), Some(signature)) = (
+            state.spool.lookup(package_identity),
+            state.spool.lookup(signature_identity),
+        ) else {
+            return response::service_unavailable();
+        };
+        if let Err(error) = proof
+            .verify_resident_package(&package, &signature, request.deadline)
+            .await
+        {
+            return fill_error_response(&error.into());
+        }
+    }
+    if (!requires_signature || !body_request)
+        && let Some(object) = state.spool.lookup(identity)
+    {
         if valid.method != RequestMethod::Head
             && matches!(
                 response::plan(
@@ -697,7 +752,9 @@ async fn serve_package(
     if let Some(error) = state.registry.replayed_failure(identity) {
         return fill_error_response(&error);
     }
-    if let Some(store) = &state.s3 {
+    if state.spool.lookup(identity).is_none()
+        && let Some(store) = &state.s3
+    {
         if store.circuit_open() {
             return response::service_unavailable();
         }
@@ -781,6 +838,42 @@ async fn retain_package_reference(
         };
     };
     let capture = state.capture.as_ref().ok_or(FillError::Admission)?;
+    let authenticated;
+    let proof = if let Some(authenticated) = proof.request_authentication() {
+        authenticated
+    } else if proof.requires_package_signature() {
+        let store = state.s3.as_ref().ok_or(FillError::Admission)?;
+        let cancel = CancellationToken::new();
+        let (_, verified) = tokio::time::timeout_at(
+            request.deadline,
+            crate::fetch::authenticate_pacman_package(
+                &request.client,
+                store,
+                capture,
+                proof,
+                &state.spool,
+                &state.limits,
+                &cancel,
+            ),
+        )
+        .await
+        .map_err(|_| FillError::Timeout)??;
+        authenticated = verified;
+        authenticated.as_ref()
+    } else {
+        proof.as_ref()
+    };
+    let _package_reservation =
+        if proof.requires_package_signature() && proof.path().as_str().ends_with(".sig") {
+            let package = proof.authenticated_package_proof()?;
+            if capture.lookup(package.repository(), package.path())? != Some(package.identity()) {
+                Some(capture.reserve(&package, UnixTime::now().as_secs())?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
     if capture.lookup(proof.repository(), proof.path())? == Some(request.identity) {
         return Ok(());
     }
@@ -908,6 +1001,7 @@ async fn serve_verified(
         class,
     };
     let plan = response::plan(valid.method, headers, &representation);
+    let _ = REQUEST_SOURCE.try_with(|slot| slot.set(0));
     match plan {
         ResponsePlan::PreconditionFailed => response::error(StatusCode::PRECONDITION_FAILED),
         ResponsePlan::NotModified => response::not_modified(&representation),
@@ -974,6 +1068,10 @@ fn send_body(
             return response::error(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let repository = REQUEST_REPOSITORY
+        .try_with(|slot| *slot)
+        .unwrap_or(usize::MAX);
+    let metrics = Arc::clone(&state.metrics);
     let expected_bytes = end.saturating_sub(start).saturating_add(1);
     let body = BodyStream::new(
         stream,
@@ -984,6 +1082,11 @@ fn send_body(
         state.limits.body_write_idle,
         state.limits.body_lifetime,
     );
+    let body = body.inspect(move |chunk| {
+        if let Ok(bytes) = chunk {
+            metrics.record_repository_bytes(repository, bytes.len() as u64);
+        }
+    });
     response::representation(representation, plan, Body::from_stream(body))
 }
 
@@ -1162,8 +1265,16 @@ mod tests {
                 "chaotic-aur/x86_64/chaotic-aur.db",
             ),
             ("cachyos", "cachyos", "x86_64/cachyos/cachyos.db"),
-            ("cachyos", "cachyos-v3", "x86_64/cachyos-v3/cachyos-v3.db"),
-            ("cachyos", "cachyos-v4", "x86_64/cachyos-v4/cachyos-v4.db"),
+            (
+                "cachyos",
+                "cachyos-v3",
+                "x86_64_v3/cachyos-v3/cachyos-v3.db",
+            ),
+            (
+                "cachyos",
+                "cachyos-v4",
+                "x86_64_v4/cachyos-v4/cachyos-v4.db",
+            ),
             (
                 "archlinuxcn",
                 "archlinuxcn",

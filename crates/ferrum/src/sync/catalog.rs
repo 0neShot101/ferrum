@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwapOption;
 use ferrum_apt::path::RepositoryPath;
 use ferrum_apt::release::UnixTime;
-use ferrum_apt::signature::SignatureVerifier;
 use ferrum_storage::checkpoint::{
     CheckpointError, CheckpointPublisher, MetadataDescriptor, MetadataHash, PackageDescriptor,
     SuiteKey,
@@ -28,13 +27,7 @@ pub struct Catalog {
     publisher: Option<Arc<CheckpointPublisher>>,
     last_error: Mutex<Option<String>>,
     clock: Mutex<(Option<UnixTime>, bool)>,
-    package_signatures: Mutex<Option<PackageSignatureAuthority>>,
     synchronized: AtomicBool,
-}
-
-struct PackageSignatureAuthority {
-    verifier: SignatureVerifier,
-    keyrings: Vec<(SuiteKey, std::path::PathBuf)>,
 }
 
 pub(crate) struct AuthorizedRequest<'a> {
@@ -53,67 +46,12 @@ impl Default for Catalog {
             publisher: None,
             last_error: Mutex::new(None),
             clock: Mutex::new((None, false)),
-            package_signatures: Mutex::new(None),
             synchronized: AtomicBool::new(true),
         }
     }
 }
 
 impl Catalog {
-    // Publication owns the verifier and installs its configured keyrings here;
-    // request-time signatures must use the package's exact retained suite proof.
-    pub(super) fn configure_package_signatures(
-        &self,
-        verifier: &SignatureVerifier,
-        suites: &[crate::config::SuiteConfig],
-    ) -> Result<(), CheckpointError> {
-        let keyrings = suites
-            .iter()
-            .filter(|suite| suite.policy.is_pacman())
-            .map(|suite| (suite.key.clone(), suite.policy.keyring().to_path_buf()))
-            .collect();
-        *self
-            .package_signatures
-            .lock()
-            .map_err(|_| CheckpointError::Proof)? = Some(PackageSignatureAuthority {
-            verifier: verifier.clone(),
-            keyrings,
-        });
-        Ok(())
-    }
-
-    pub(crate) fn package_signature_authority(
-        &self,
-        package: &PackageDescriptor,
-    ) -> Result<(SignatureVerifier, std::path::PathBuf), CheckpointError> {
-        let authority = self
-            .package_signatures
-            .lock()
-            .map_err(|_| CheckpointError::Proof)?;
-        let authority = authority.as_ref().ok_or(CheckpointError::Proof)?;
-        let manifest = package.proof().manifest();
-        let (_, keyring) = authority
-            .keyrings
-            .iter()
-            .find(|(key, _)| {
-                key.repository() == manifest.repository && key.suite() == manifest.suite
-            })
-            .ok_or(CheckpointError::Proof)?;
-        Ok((authority.verifier.clone(), keyring.clone()))
-    }
-
-    pub(crate) fn register_package_signature(
-        &self,
-        package: &PackageDescriptor,
-        path: &RepositoryPath,
-        identity: ferrum_apt::digest::ObjectIdentity,
-    ) -> Result<PackageDescriptor, CheckpointError> {
-        self.publisher
-            .as_ref()
-            .ok_or(CheckpointError::Invalid)?
-            .register_verified_package_signature(package, path, identity)
-    }
-
     /// Binds a newly registered descriptor to the originally requested public path.
     pub(crate) fn package_request<'a>(
         &self,
@@ -347,8 +285,7 @@ impl Catalog {
         let suite_path = if is_rpm {
             ferrum_apt::rpm::split_rpm_suite_path(rest)
         } else if repository == "cachyos" {
-            rest.strip_prefix("x86_64/")
-                .and_then(|tail| tail.split_once('/'))
+            ferrum_apt::pacman::split_cachyos_suite_path(rest)
         } else if is_pacman {
             rest.split_once('/')
         } else {
@@ -384,11 +321,19 @@ impl Catalog {
             let root = ferrum_apt::rpm::rpm_suite_root(suite).ok_or(CheckpointError::Invalid)?;
             std::borrow::Cow::Owned(format!("{root}/{relative}"))
         } else if repository == "cachyos" {
-            std::borrow::Cow::Owned(format!("x86_64/{relative}"))
+            let architecture =
+                ferrum_apt::pacman::cachyos_suite_arch(suite).ok_or(CheckpointError::Invalid)?;
+            std::borrow::Cow::Owned(format!("{architecture}/{relative}"))
         } else {
             std::borrow::Cow::Borrowed(relative)
         };
         if let Some((directory, algorithm, hex)) = split_by_hash(&relative) {
+            // Pacman has no by-hash protocol. In particular, old retained
+            // canary metadata rows must not expose a package through an APT
+            // metadata alias that bypasses its per-request signature check.
+            if is_pacman {
+                return Ok(None);
+            }
             let hash = match algorithm {
                 HashAlgorithm::Sha256 => match ferrum_apt::digest::Sha256Digest::from_hex(hex) {
                     Ok(digest) => MetadataHash::Sha256(digest),

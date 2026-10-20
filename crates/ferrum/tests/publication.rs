@@ -1,6 +1,6 @@
 //! Local-only B09 qualification, using ferrum-verifier and the production publisher/SDK adapter.
 //!
-//! Linux prerequisites: ferrum-verifier 0.1.0 on PATH, /usr/bin/prlimit, GnuPG, dpkg-deb, gzip,
+//! Linux prerequisites: ferrum-verifier 0.2.0 on PATH, /usr/bin/prlimit, GnuPG, dpkg-deb, gzip,
 //! OpenSSL, GNU coreutils, and enough local disk for the durable SQLite catalog.
 //! Includes exact trailing-LF Release publication, lost-local-floor recovery,
 //! and authenticated derived HTTP Range/corruption/deadline/retention regressions.
@@ -39,12 +39,60 @@ use ferrum_storage::recovery::{
     PublicationVerification, TrustPolicy,
 };
 use ferrum_storage::s3::testing::StatefulRemote;
-use ferrum_storage::s3::{ControlCondition, OperationIdentity, S3Config, S3Store};
+use ferrum_storage::s3::{ControlCondition, OperationIdentity, S3Store};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn all_configured_distribution_profiles_reach_the_bounded_catalog() {
+    let directory = tempfile::tempdir().expect("inventory state");
+    let root = directory.path();
+    let config = Config::parse(
+        r#"mode = "private-durable"
+[listen]
+public = "127.0.0.1:18080"
+admin = "127.0.0.1:19090"
+[durable]
+state_dir = "state"
+suites = ["all"]
+[durable.provider]
+region = "us-east-1"
+bucket = "ferrum"
+credentials_file = "unused.env"
+[durable.keyrings]
+debian = "debian.gpg"
+ubuntu = "ubuntu.gpg"
+[durable.budget]
+mode = "existing"
+[verifier]
+"#,
+        root,
+    )
+    .expect("all inventory configuration");
+    let suites = config.suites().expect("all suite identities");
+    assert_eq!(suites.len(), 106);
+    let mut disk = DurableSpoolConfig::new(root.join("state"));
+    disk.free_space_floor = 0;
+    let spool = Spool::open_durable(disk).expect("disposable durable state");
+    let ledger = BudgetLedger::initialize(spool.clone(), BudgetLimits::default())
+        .expect("explicit disposable test allowance");
+    let (store, remote) =
+        S3Store::stateful_production(config.durable().expect("durable").store_config(), ledger)
+            .expect("local-only scripted store");
+    let publisher = Arc::new(
+        CheckpointPublisher::new(spool, Arc::new(store), RecoveryProfile::SharedNonisolated)
+            .expect("checkpoint publisher"),
+    );
+    let keys: Vec<_> = suites.into_iter().map(|suite| suite.key).collect();
+    let catalog = Catalog::configured(keys.clone(), publisher.clone()).expect("full inventory");
+    assert_eq!(catalog.keys(), keys);
+    let too_many = vec![keys[0].clone(); ferrum_storage::checkpoint::MAX_SUITES + 1];
+    assert!(Catalog::configured(too_many, publisher).is_err());
+    assert!(remote.requests().expect("local request log").is_empty());
+}
+
 const PREREQUISITES: &str =
-    "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, generated fixture/public/b09";
+    "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, generated fixture/public/b09";
 const INDEX: &str = "main/binary-amd64/Packages.gz";
 const IDENTITIES: [(&str, &str); 6] = [
     ("debian", "trixie"),
@@ -111,9 +159,8 @@ impl Harness {
         let text = format!(
             "mode = \"private-durable\"\n[listen]\npublic = \"127.0.0.1:0\"\nadmin = \"127.0.0.1:0\"\n\
              [durable]\nstate_dir = \"{}\"\n\
-             [durable.provider]\nendpoint = \"https://s3.us-central-1.idrivee2.com\"\nregion = \"us-central-1\"\n\
-             bucket = \"s3-andrew\"\npackage_prefix = \"linux-packages/\"\n\
-             checkpoint_prefix = \"linux-checkpoints/\"\nshared_nonisolated = true\ncredentials_file = \"{}\"\n\
+             [durable.provider]\nregion = \"us-east-1\"\n\
+             bucket = \"ferrum\"\ncredentials_file = \"{}\"\n\
              [durable.keyrings]\ndebian = \"{}\"\nubuntu = \"{}\"\n\
              [durable.budget]\nmode = \"existing\"\n[verifier]\n[limits]\n",
             root.join("state").display(),
@@ -143,19 +190,9 @@ impl Harness {
         let spool = Spool::open_durable(disk).expect("real durable spool");
         let ledger = BudgetLedger::initialize(spool.clone(), BudgetLimits::default())
             .expect("explicit test allowance");
-        let (store, remote) = S3Store::stateful_production(
-            S3Config {
-                endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-                region: "us-central-1".into(),
-                bucket: "s3-andrew".into(),
-                package_prefix: "linux-packages/".into(),
-                checkpoint_prefix: "linux-checkpoints/".into(),
-                credentials_file: root.join("unused-provider.env"),
-                shared_nonisolated: true,
-            },
-            ledger,
-        )
-        .expect("production SDK with explicit local scripted transport");
+        let (store, remote) =
+            S3Store::stateful_production(config.durable().expect("durable").store_config(), ledger)
+                .expect("production SDK with explicit local scripted transport");
         let store = Arc::new(store);
         let publisher = Arc::new(
             CheckpointPublisher::new(
@@ -423,7 +460,7 @@ async fn representation(view: &ActiveView, relative: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn publication_context_does_not_age_confirmation_before_durable_readback() {
     let mut harness = Harness::new().await;
     let suite = harness.config.suites().expect("suites").remove(0);
@@ -493,7 +530,7 @@ async fn publication_context_does_not_age_confirmation_before_durable_readback()
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn one_hundred_actual_transitions_with_ten_thousand_held_release_sequences() {
     let mut harness = Harness::new().await;
     let key = keys().remove(0);
@@ -594,7 +631,7 @@ async fn one_hundred_actual_transitions_with_ten_thousand_held_release_sequences
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn incomplete_successor_and_its_exact_saved_304_never_renew_active_lease() {
     let mut harness = Harness::new().await;
     let key = keys().remove(0);
@@ -684,7 +721,7 @@ async fn incomplete_successor_and_its_exact_saved_304_never_renew_active_lease()
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn signature_key_policy_and_detached_pair_races_use_real_verifier() {
     let mut harness = Harness::new().await;
     let key = keys().remove(0);
@@ -810,7 +847,7 @@ fn six_suite_security_first_rounds_do_not_restart_after_failed_admission() {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn every_failed_suite_keeps_its_own_slot_while_five_others_publish() {
     let mut harness = Harness::new().await;
     let keys = keys();
@@ -879,7 +916,7 @@ async fn every_failed_suite_keeps_its_own_slot_while_five_others_publish() {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn live_actor_isolates_slow_bulk_and_checkpoint_failure_without_blocking_observations() {
     let mut harness = Harness::new().await;
     let keys = keys();
@@ -1097,7 +1134,7 @@ async fn live_actor_isolates_slow_bulk_and_checkpoint_failure_without_blocking_o
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn missing_selected_index_and_corrupt_canonical_fallback_never_replace_active() {
     let mut harness = Harness::new().await;
     let key = keys().remove(0);
@@ -1269,7 +1306,7 @@ fn expanded(harness: &Harness) -> Vec<u8> {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn trailing_lf_release_is_exactly_servable_only_after_durable_activation() {
     let harness = Harness::with_seed(false).await;
     let suite = harness.config.suites().expect("suites").remove(0);
@@ -1427,7 +1464,7 @@ async fn copy_remote(source: &Harness, target: &Harness) {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn absent_local_floor_recovers_intact_remote_without_bootstrap_or_canonical_fallback() {
     let source = Harness::new().await;
     let mut target = Harness::with_seed(false).await;
@@ -1502,7 +1539,7 @@ async fn absent_local_floor_recovers_intact_remote_without_bootstrap_or_canonica
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn absent_local_and_remote_floor_stays_closed_without_origin_bootstrap() {
     let mut harness = Harness::with_seed(false).await;
     let key = keys().remove(0);
@@ -1537,7 +1574,7 @@ async fn absent_local_and_remote_floor_stays_closed_without_origin_bootstrap() {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn derived_head_and_304_never_expand_and_cold_range_verifies_first() {
     let harness = Harness::new().await;
     let descriptor = derived(&harness);
@@ -1584,7 +1621,7 @@ async fn derived_head_and_304_never_expand_and_cold_range_verifies_first() {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn derived_corruption_has_no_representation_and_replayed_error_precedes_304() {
     use std::io::Write;
     let harness = Harness::new().await;
@@ -1620,7 +1657,7 @@ async fn derived_corruption_has_no_representation_and_replayed_error_precedes_30
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn derived_waiter_timeout_leaves_single_producer_for_retry() {
     let harness = Harness::new().await;
     let identity = derived(&harness).identity;
@@ -1662,7 +1699,7 @@ async fn derived_waiter_timeout_leaves_single_producer_for_retry() {
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn stale_canonical_derived_metadata_does_not_disable_retained_immutable_alias() {
     let mut harness = Harness::new().await;
     let key = keys().remove(0);
@@ -1719,7 +1756,7 @@ async fn stale_canonical_derived_metadata_does_not_disable_retained_immutable_al
 }
 
 #[tokio::test]
-#[ignore = "Linux, ferrum-verifier 0.1.0 on PATH, prlimit, and generated fixture/public/b09"]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
 async fn absent_local_floor_does_not_trust_malformed_remote_checkpoint() {
     let mut harness = Harness::with_seed(false).await;
     let key = keys().remove(0);
@@ -1781,6 +1818,352 @@ fn pacman_tar_entry(path: &str, body: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
+fn pacman_signed_test_package(
+    directory: &Path,
+    signing_home: &Path,
+    name: &str,
+    size: u64,
+    fill: u8,
+) -> (ObjectIdentity, Vec<u8>) {
+    use std::io::Write;
+    let path = directory.join(name);
+    let mut file = std::fs::File::create(&path).expect("signed test package");
+    let chunk = [fill; 64 * 1024];
+    let mut remaining = size;
+    let mut hash = ferrum_apt::digest::Sha256Hasher::new();
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(chunk.len() as u64)).expect("bounded chunk");
+        file.write_all(&chunk[..count]).expect("test package bytes");
+        hash.update(&chunk[..count]);
+        remaining -= count as u64;
+    }
+    drop(file);
+    let status = std::process::Command::new("gpg")
+        .args([
+            "--homedir",
+            signing_home.to_str().expect("utf8"),
+            "--batch",
+            "--passphrase",
+            "",
+            "--detach-sign",
+            path.to_str().expect("utf8"),
+        ])
+        .status()
+        .expect("sign test package");
+    assert!(status.success());
+    let signature = std::fs::read(format!("{}.sig", path.display())).expect("test signature");
+    (
+        ObjectIdentity {
+            sha256: hash.finalize(),
+            size,
+        },
+        signature,
+    )
+}
+
+#[cfg(target_os = "linux")]
+type PacmanTestPackage = (String, ObjectIdentity, Vec<u8>);
+
+#[cfg(target_os = "linux")]
+struct PacmanTestContext<'a> {
+    state: &'a Arc<AppState>,
+    publisher: &'a CheckpointPublisher,
+    capture: &'a ferrum_storage::capture::CaptureManager,
+    verifier: &'a SignatureVerifier,
+    cancel: &'a CancellationToken,
+    key: &'a SuiteKey,
+    deadline: tokio::time::Instant,
+}
+
+#[cfg(target_os = "linux")]
+impl PacmanTestContext<'_> {
+    async fn check_current_policy(
+        &self,
+        package: (&str, ObjectIdentity),
+        keyrings: (&Path, &Path),
+    ) {
+        let canary_only = TrustPolicy::ChaoticAur {
+            keyring: keyrings.0.canonicalize().expect("canary-only keyring"),
+        };
+        // These control-plane futures contain the complete recovery state
+        // machine. Keep them off the enclosing HTTP test's inline future frame.
+        Box::pin(self.publisher.restore_retained(
+            self.key,
+            &canary_only,
+            self.verifier,
+            self.deadline,
+            self.cancel,
+        ))
+        .await
+        .expect("canary passes the replacement trust policy");
+        let etag = format!("\"sha256-{}\"", package.1.sha256);
+        let reply = request(
+            self.state,
+            Method::GET,
+            package.0,
+            Some(("if-none-match", &etag)),
+        )
+        .await;
+        assert_eq!(
+            reply.status(),
+            StatusCode::BAD_GATEWAY,
+            "a revalidated cached proof must not retain a removed package signer"
+        );
+        let combined = TrustPolicy::ChaoticAur {
+            keyring: keyrings.1.to_path_buf(),
+        };
+        Box::pin(self.publisher.restore_retained(
+            self.key,
+            &combined,
+            self.verifier,
+            self.deadline,
+            self.cancel,
+        ))
+        .await
+        .expect("restore current combined policy");
+    }
+
+    async fn check_capture_lifetimes(
+        &self,
+        roots: &[ObjectIdentity],
+        packages: &[PacmanTestPackage],
+        keyrings: (&Path, &Path),
+    ) {
+        let (pending_name, pending_identity, pending_signature) = &packages[0];
+        let pending_public = format!("/chaotic-aur/chaotic-aur/x86_64/{pending_name}");
+        let reply = request(
+            self.state,
+            Method::GET,
+            &pending_public,
+            Some(("range", "bytes=0-0")),
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            to_bytes(reply.into_body(), 16)
+                .await
+                .expect("pending package range")
+                .len(),
+            1
+        );
+        let signature_identity = ObjectIdentity {
+            sha256: Sha256Digest::of(pending_signature),
+            size: pending_signature.len() as u64,
+        };
+        for identity in roots {
+            Box::pin(self.capture.complete(*identity, self.deadline, self.cancel))
+                .await
+                .expect("persist package/signature closure");
+        }
+        self.state
+            .spool
+            .reclaim(u64::MAX)
+            .expect("reclaim after the first package completes");
+        assert!(
+            self.state.spool.lookup(signature_identity).is_some(),
+            "completing package A cannot unpin package B's unuploaded metadata signature"
+        );
+        assert!(
+            self.state.spool.lookup(*pending_identity).is_some(),
+            "capture admission must revoke provisional package eviction before upload"
+        );
+        self.check_current_policy((&pending_public, *pending_identity), keyrings)
+            .await;
+        Box::pin(self.capture.complete(*pending_identity, self.deadline, self.cancel)).await
+            .expect("package B completes after package A and eviction, without reacquiring origin signatures");
+        for (name, identity, _) in packages.iter().skip(1) {
+            let path = format!("/chaotic-aur/chaotic-aur/x86_64/{name}");
+            let reply = request(self.state, Method::GET, &path, Some(("range", "bytes=0-0"))).await;
+            assert_eq!(reply.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                to_bytes(reply.into_body(), 16)
+                    .await
+                    .expect("archived package range")
+                    .len(),
+                1
+            );
+            Box::pin(self.capture.complete(*identity, self.deadline, self.cancel))
+                .await
+                .expect("persist the next package");
+        }
+        assert_eq!(self.capture.usage().expect("completed capture").entries, 0);
+    }
+
+    async fn check_origin_off_recovery(
+        &self,
+        config: &Config,
+        origin: RunningOrigin,
+        primary: (&str, ObjectIdentity),
+        packages: &[PacmanTestPackage],
+    ) {
+        origin.shutdown().await;
+        self.state
+            .spool
+            .reclaim(512 * 1024 * 1024)
+            .expect("evict durably captured payloads");
+        assert!(self.state.spool.lookup(primary.1).is_none());
+        self.capture
+            .begin_reconciliation(UnixTime::now().as_secs())
+            .expect("reset verification");
+        let trusts = config
+            .suites()
+            .expect("configured trust")
+            .into_iter()
+            .map(|suite| ferrum_storage::capture::CaptureTrust {
+                key: suite.key,
+                policy: suite.policy,
+                floor_trust: ferrum_storage::checkpoint::FloorTrust::IntactTrusted,
+            })
+            .collect::<Vec<_>>();
+        Box::pin(self.capture.reconcile(
+            &trusts,
+            self.verifier,
+            UnixTime::now().as_secs(),
+            self.deadline,
+            self.cancel,
+        ))
+        .await
+        .expect("origin-off cryptographic package and dynamic signature recovery");
+        assert!(self.capture.coverage_ready().expect("reconciled coverage"));
+        let signature_public = format!("{}.sig", primary.0);
+        for path in [primary.0, &signature_public] {
+            let reply = request(self.state, Method::GET, path, Some(("range", "bytes=0-0"))).await;
+            assert_eq!(reply.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                to_bytes(reply.into_body(), 16)
+                    .await
+                    .expect("origin-off range")
+                    .len(),
+                1
+            );
+        }
+        for (index, (name, _, _)) in packages.iter().enumerate() {
+            let path = format!("/chaotic-aur/chaotic-aur/x86_64/{name}");
+            let reply = request(self.state, Method::GET, &path, Some(("range", "bytes=0-0"))).await;
+            assert_eq!(reply.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                to_bytes(reply.into_body(), 16)
+                    .await
+                    .expect("archive larger than spool range")
+                    .as_ref(),
+                &[(index + 1) as u8]
+            );
+        }
+        let relative = primary
+            .0
+            .strip_prefix("/chaotic-aur/")
+            .expect("package repository");
+        let receipt_suffix = format!(
+            "v1/captures/chaotic-aur/{}/{}.json",
+            Sha256Digest::of(relative.as_bytes()),
+            primary.1.sha256
+        );
+        let store = self.state.s3.as_ref().expect("local disk-backed store");
+        let saved = Box::pin(store.control_get(
+            OperationIdentity::Object,
+            &receipt_suffix,
+            16 * 1024,
+            self.deadline,
+            self.cancel,
+        ))
+        .await
+        .expect("saved package/signature binding receipt");
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&saved.bytes).expect("receipt JSON");
+        let invalid_signature = b"not an OpenPGP package signature";
+        let invalid_digest = Sha256Digest::of(invalid_signature);
+        Box::pin(store.control_put(
+            OperationIdentity::Object,
+            &format!("v1/objects/sha256/{invalid_digest}"),
+            invalid_signature,
+            ControlCondition::Create,
+            self.deadline,
+            self.cancel,
+        ))
+        .await
+        .expect("untrusted remote signature pointer");
+        forged["package_signature"]["signature_sha256"] = invalid_digest.to_hex().into();
+        forged["package_signature"]["signature_size"] = (invalid_signature.len() as u64).into();
+        Box::pin(store.control_put(
+            OperationIdentity::Object,
+            &receipt_suffix,
+            &serde_json::to_vec(&forged).expect("forged binding receipt"),
+            ControlCondition::Match(saved.etag),
+            self.deadline,
+            self.cancel,
+        ))
+        .await
+        .expect("replace unsigned receipt");
+        self.capture
+            .begin_reconciliation(UnixTime::now().as_secs())
+            .expect("reset before forged recovery");
+        assert!(
+            Box::pin(self.capture.reconcile(
+                &trusts,
+                self.verifier,
+                UnixTime::now().as_secs(),
+                self.deadline,
+                self.cancel,
+            ))
+            .await
+            .is_err(),
+            "receipt/index rows alone must not authenticate a package signature"
+        );
+        assert!(
+            !self
+                .capture
+                .coverage_ready()
+                .expect("failed recovery remains closed")
+        );
+        assert!(self.capture.is_durable(primary.1).is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn recover_unchanged_repository_catalog(
+    config: Arc<Config>,
+    verifier: SignatureVerifier,
+    spool: Spool,
+    publisher: Arc<CheckpointPublisher>,
+) -> Arc<Catalog> {
+    let keys: Vec<_> = config
+        .suites()
+        .expect("configured repositories")
+        .into_iter()
+        .map(|suite| suite.key)
+        .collect();
+    let catalog = Arc::new(
+        Catalog::configured(keys.clone(), publisher.clone()).expect("fresh runtime catalog"),
+    );
+    catalog.set_test_clock_synchronized(true);
+    let mut synchronizer = DurableSynchronizer::new(
+        config,
+        verifier,
+        spool,
+        publisher.clone(),
+        catalog.clone(),
+        Arc::new(Metrics::default()),
+    )
+    .await
+    .expect("restarted synchronizer");
+    for key in keys {
+        let floor = publisher.state(&key).expect("existing floor").floor;
+        assert_eq!(
+            Box::pin(synchronizer.synchronize_once(&key, &CancellationToken::new()))
+                .await
+                .expect("unchanged authenticated origin recovers after restart"),
+            SyncOutcome::Published
+        );
+        assert_eq!(
+            publisher.state(&key).expect("recovered floor").floor,
+            floor,
+            "recovery must not manufacture a new publication checkpoint"
+        );
+    }
+    catalog
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detached_signatures() {
     use flate2::{Compression, write::GzEncoder};
@@ -1826,6 +2209,56 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
     let chaotic_dir = origin_root.join("chaotic-aur/chaotic-aur/x86_64");
     std::fs::create_dir_all(&arch_dir).expect("arch dir");
     std::fs::create_dir_all(&chaotic_dir).expect("chaotic dir");
+    let large_size = 32 * 1024 * 1024 + 1u64;
+    let large_name = "large-verified-1.0-1-x86_64.pkg.tar.zst";
+    let gpg_home = root.join("pacman-gnupg");
+    std::fs::create_dir(&gpg_home).expect("package signing home");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gpg_home, std::fs::Permissions::from_mode(0o700))
+            .expect("private signing home");
+    }
+    let status = std::process::Command::new("gpg")
+        .args([
+            "--homedir",
+            gpg_home.to_str().expect("utf8"),
+            "--batch",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            "PacmanTest <pacman@example.test>",
+            "ed25519",
+            "sign",
+            "1d",
+        ])
+        .status()
+        .expect("test-only signing key");
+    assert!(status.success());
+    let exported = std::process::Command::new("gpg")
+        .args([
+            "--homedir",
+            gpg_home.to_str().expect("utf8"),
+            "--batch",
+            "--export",
+            "PacmanTest",
+        ])
+        .output()
+        .expect("export package certificate");
+    assert!(exported.status.success());
+    let mut combined = std::fs::read(&keyring).expect("fixture certificate");
+    combined.extend_from_slice(&exported.stdout);
+    let keyring = root.join("pacman-combined-keyring.gpg");
+    std::fs::write(&keyring, combined).expect("combined package keyring");
+    let (large_identity, large_signature) =
+        pacman_signed_test_package(&chaotic_dir, &gpg_home, large_name, large_size, 0x5a);
+    let large_digest = large_identity.sha256;
+    let mut extra_packages = Vec::new();
+    for index in 1..=3u8 {
+        let name = format!("large-extra-{index}-1.0-1-x86_64.pkg.tar.zst");
+        let (identity, signature) =
+            pacman_signed_test_package(&chaotic_dir, &gpg_home, &name, large_size, index);
+        extra_packages.push((name, identity, signature));
+    }
 
     let build_date = UnixTime::now().as_secs().saturating_sub(60);
     let arch_desc = format!(
@@ -1859,6 +2292,64 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
         "yay-bin-12.4.2-1/desc",
         aur_desc.as_bytes(),
     ));
+    let large_desc = format!(
+        "%FILENAME%\n{large_name}\n\n%NAME%\nlarge-verified\n\n%VERSION%\n1.0-1\n\n%CSIZE%\n{large_size}\n\n%SHA256SUM%\n{large_digest}\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n{build_date}\n\n"
+    );
+    chaotic_tar.extend_from_slice(&pacman_tar_entry(
+        "large-verified-1.0-1/desc",
+        large_desc.as_bytes(),
+    ));
+    for (index, (name, identity, _)) in extra_packages.iter().enumerate() {
+        let desc = format!(
+            "%FILENAME%\n{name}\n\n%NAME%\nlarge-extra-{index}\n\n%VERSION%\n1.0-1\n\n%CSIZE%\n{}\n\n%SHA256SUM%\n{}\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n{build_date}\n\n",
+            identity.size, identity.sha256,
+        );
+        chaotic_tar.extend_from_slice(&pacman_tar_entry(
+            &format!("large-extra-{index}-1.0-1/desc"),
+            desc.as_bytes(),
+        ));
+    }
+    let mut unsigned_identities = Vec::new();
+    for (name, embedded, detached) in [
+        ("missing", false, false),
+        ("replaced", false, true),
+        ("invalid", false, true),
+        ("embedded-invalid", true, false),
+    ] {
+        let mut bytes = signed_pkg.clone();
+        bytes.extend_from_slice(name.as_bytes());
+        let identity = ObjectIdentity {
+            sha256: Sha256Digest::of(&bytes),
+            size: bytes.len() as u64,
+        };
+        let filename = format!("{name}-1.0-1-x86_64.pkg.tar.zst");
+        let embedded = if embedded {
+            format!("%PGPSIG%\n{sig_b64}\n\n")
+        } else {
+            String::new()
+        };
+        let desc = format!(
+            "%FILENAME%\n{filename}\n\n%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%CSIZE%\n{}\n\n%SHA256SUM%\n{}\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n{build_date}\n\n{embedded}",
+            identity.size, identity.sha256,
+        );
+        chaotic_tar.extend_from_slice(&pacman_tar_entry(
+            &format!("{name}-1.0-1/desc"),
+            desc.as_bytes(),
+        ));
+        std::fs::write(chaotic_dir.join(&filename), bytes).expect("distinct unsigned package");
+        if detached {
+            std::fs::write(
+                chaotic_dir.join(format!("{filename}.sig")),
+                if name == "invalid" {
+                    b"invalid signature".as_slice()
+                } else {
+                    signed_sig.as_slice()
+                },
+            )
+            .expect("invalid or replaced detached signature");
+        }
+        unsigned_identities.push((filename, identity));
+    }
     chaotic_tar.resize(chaotic_tar.len() + 1024, 0);
     std::fs::write(chaotic_dir.join("chaotic-aur.db"), &chaotic_tar).expect("write chaotic-aur.db");
     for name in [
@@ -1882,9 +2373,8 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
     let text = format!(
         "mode = \"private-durable\"\n[listen]\npublic = \"127.0.0.1:0\"\nadmin = \"127.0.0.1:0\"\n\
          [durable]\nstate_dir = \"{}\"\nsuites = [\"archlinux/core\", \"chaotic-aur/chaotic-aur\"]\n\
-         [durable.provider]\nendpoint = \"https://s3.us-central-1.idrivee2.com\"\nregion = \"us-central-1\"\n\
-         bucket = \"s3-andrew\"\npackage_prefix = \"linux-packages/\"\n\
-         checkpoint_prefix = \"linux-checkpoints/\"\nshared_nonisolated = true\ncredentials_file = \"{}\"\n\
+         [durable.provider]\nregion = \"us-east-1\"\n\
+         bucket = \"ferrum\"\ncredentials_file = \"{}\"\n\
          [durable.keyrings]\ndebian = \"{}\"\nubuntu = \"{}\"\narchlinux = \"{}\"\nchaoticaur = \"{}\"\n\
          [durable.budget]\nmode = \"existing\"\n[verifier]\n[limits]\n",
         root.join("state").display(),
@@ -1900,28 +2390,22 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
         .expect("loopback seam");
     let mut disk = DurableSpoolConfig::new(root.join("state"));
     disk.free_space_floor = 0;
-    disk.spool.managed_ceiling = 512 * 1024 * 1024;
-    disk.spool.max_object_size = 32 * 1024 * 1024;
-    disk.temporary_ceiling = 256 * 1024 * 1024;
-    disk.metadata_temporary_reserve = 128 * 1024 * 1024;
-    disk.metadata_ceiling = 256 * 1024 * 1024;
+    disk.spool.managed_ceiling = 128 * 1024 * 1024;
+    disk.spool.max_object_size = 64 * 1024 * 1024;
+    disk.temporary_ceiling = 96 * 1024 * 1024;
+    disk.metadata_temporary_reserve = 32 * 1024 * 1024;
+    disk.metadata_ceiling = 96 * 1024 * 1024;
     disk.catalog_ceiling = 64 * 1024 * 1024;
-    disk.eviction_high_watermark = 450 * 1024 * 1024;
-    disk.eviction_low_watermark = 400 * 1024 * 1024;
+    disk.eviction_high_watermark = 112 * 1024 * 1024;
+    disk.eviction_low_watermark = 64 * 1024 * 1024;
     disk.max_entries = 10_000;
     let spool = Spool::open_durable(disk).expect("durable spool");
     let ledger = BudgetLedger::initialize(spool.clone(), BudgetLimits::default()).expect("ledger");
-    let (store, _remote) = S3Store::stateful_production(
-        S3Config {
-            endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-            region: "us-central-1".into(),
-            bucket: "s3-andrew".into(),
-            package_prefix: "linux-packages/".into(),
-            checkpoint_prefix: "linux-checkpoints/".into(),
-            credentials_file: root.join("unused-provider.env"),
-            shared_nonisolated: true,
-        },
+    let (store, _remote) = S3Store::disk_backed_production(
+        config.durable().expect("durable").store_config(),
         ledger,
+        root.join("remote"),
+        1024 * 1024 * 1024,
     )
     .expect("s3 store");
     let store = Arc::new(store);
@@ -1956,7 +2440,7 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
     let config = Arc::new(config);
     let mut synchronizer = DurableSynchronizer::new(
         config.clone(),
-        verifier,
+        verifier.clone(),
         spool.clone(),
         publisher.clone(),
         catalog.clone(),
@@ -1982,6 +2466,15 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
             SyncOutcome::Published
         );
     }
+    drop(synchronizer);
+    drop(catalog);
+    let catalog = Box::pin(recover_unchanged_repository_catalog(
+        config.clone(),
+        verifier.clone(),
+        spool.clone(),
+        publisher.clone(),
+    ))
+    .await;
 
     let limits = Limits::default();
     let arch_client = Arc::new(
@@ -2006,7 +2499,7 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
         spool,
         client: arch_client.clone(),
         s3: Some(store),
-        capture: Some(capture),
+        capture: Some(capture.clone()),
         clients: vec![
             ("archlinux".into(), arch_client),
             ("chaotic-aur".into(), chaotic_client),
@@ -2022,6 +2515,111 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
         request_ids: std::sync::atomic::AtomicU64::new(0),
         prefix: ferrum_apt::path::RepositoryPath::parse_decoded("fixture").expect("prefix"),
     });
+    let alias = format!("/archlinux/core/os/x86_64/by-hash/SHA256/{pkg_sha256}");
+    let reply = request(&state, Method::GET, &alias, None).await;
+    assert_eq!(
+        reply.status(),
+        StatusCode::NOT_FOUND,
+        "proof canaries cannot bypass package verification through metadata aliases"
+    );
+    let cold_signature = "/chaotic-aur/chaotic-aur/x86_64/missing-1.0-1-x86_64.pkg.tar.zst.sig";
+    let origin_requests = origin.origin().log().snapshot().len();
+    let usage = capture.usage().expect("capture usage before HEAD");
+    let reply = request(&state, Method::HEAD, cold_signature, None).await;
+    assert_eq!(reply.status(), StatusCode::NOT_FOUND);
+    assert_eq!(origin.origin().log().snapshot().len(), origin_requests);
+    assert_eq!(
+        capture.usage().expect("usage after HEAD").entries,
+        usage.entries
+    );
+    assert_eq!(state.registry.active_flights(), 0);
+    assert!(state.spool.lookup(unsigned_identities[0].1).is_none());
+    let reply = request(
+        &state,
+        Method::HEAD,
+        cold_signature,
+        Some(("if-none-match", "*")),
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::NOT_FOUND);
+    let reply = request(
+        &state,
+        Method::GET,
+        cold_signature,
+        Some(("if-none-match", "*")),
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let missing_package = "/chaotic-aur/chaotic-aur/x86_64/missing-1.0-1-x86_64.pkg.tar.zst";
+    let candidate_etag = format!("\"sha256-{}\"", unsigned_identities[0].1.sha256);
+    let reply = request(
+        &state,
+        Method::GET,
+        missing_package,
+        Some(("if-none-match", &candidate_etag)),
+    )
+    .await;
+    assert_eq!(
+        reply.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unsigned candidate checksum cannot authorize a positive 304"
+    );
+    assert_eq!(origin.origin().log().snapshot().len(), origin_requests);
+    assert_eq!(
+        capture.usage().expect("usage after conditional").entries,
+        usage.entries
+    );
+    let candidate_path = ferrum_apt::path::RepositoryPath::parse_decoded(&format!(
+        "chaotic-aur/x86_64/{}",
+        unsigned_identities[0].0
+    ))
+    .expect("candidate package path");
+    let candidate = publisher
+        .lookup_package("chaotic-aur", &candidate_path)
+        .expect("candidate lookup")
+        .expect("indexed unsigned candidate")
+        .authorize()
+        .expect("descriptor is not yet package authenticity");
+    assert!(matches!(
+        capture.reserve(&candidate, UnixTime::now().as_secs()),
+        Err(ferrum_storage::capture::CaptureError::Proof)
+    ));
+
+    for (filename, _) in &unsigned_identities {
+        let path = format!("/chaotic-aur/chaotic-aur/x86_64/{filename}");
+        for _ in 0..2 {
+            let reply = request(&state, Method::GET, &path, None).await;
+            assert!(
+                matches!(
+                    reply.status(),
+                    StatusCode::NOT_FOUND | StatusCode::BAD_GATEWAY
+                ),
+                "unsigned package must not be served, cold or warm: {filename}"
+            );
+            assert!(
+                capture
+                    .lookup(
+                        "chaotic-aur",
+                        &ferrum_apt::path::RepositoryPath::parse_decoded(&format!(
+                            "chaotic-aur/x86_64/{filename}"
+                        ))
+                        .expect("path")
+                    )
+                    .expect("capture mapping")
+                    .is_none()
+            );
+        }
+    }
+    state
+        .spool
+        .reclaim(u64::MAX)
+        .expect("discard rejected provisional candidates");
+    for (_, identity) in &unsigned_identities {
+        assert!(
+            state.spool.lookup(*identity).is_none(),
+            "rejected package candidates must not permanently consume the spool"
+        );
+    }
 
     let reply = request(
         &state,
@@ -2099,6 +2697,102 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
             .expect("verified on-demand chaotic-aur sig"),
         signed_sig.as_slice()
     );
+    let dynamic_signature =
+        "/chaotic-aur/chaotic-aur/x86_64/yay-bin-12.4.2-1-x86_64.pkg.tar.zst.sig";
+    let before_conditional = origin.origin().log().snapshot().len();
+    let etag = format!("\"sha256-{}\"", Sha256Digest::of(&signed_sig));
+    let reply = request(
+        &state,
+        Method::GET,
+        dynamic_signature,
+        Some(("if-none-match", &etag)),
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(origin.origin().log().snapshot().len(), before_conditional);
+
+    let large_public = format!("/chaotic-aur/chaotic-aur/x86_64/{large_name}");
+    for _ in 0..2 {
+        use futures_util::StreamExt;
+        let reply = request(&state, Method::GET, &large_public, None).await;
+        assert_eq!(reply.status(), StatusCode::OK);
+        let mut body = reply.into_body().into_data_stream();
+        let mut hash = ferrum_apt::digest::Sha256Hasher::new();
+        let mut size = 0u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.expect("streamed verified large package");
+            size += chunk.len() as u64;
+            hash.update(&chunk);
+        }
+        assert_eq!(size, large_size);
+        assert_eq!(hash.finalize(), large_digest);
+    }
+    let large_signature_public = format!("{large_public}.sig");
+    let reply = request(&state, Method::GET, &large_signature_public, None).await;
+    assert_eq!(reply.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(reply.into_body(), 64 * 1024)
+            .await
+            .expect("large signature"),
+        large_signature.as_slice()
+    );
+
+    let checks = PacmanTestContext {
+        state: &state,
+        publisher: publisher.as_ref(),
+        capture: capture.as_ref(),
+        verifier: &verifier,
+        cancel: &cancel,
+        key: &chaotic_key,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(600),
+    };
+    checks
+        .check_capture_lifetimes(
+            &[
+                ObjectIdentity {
+                    sha256: Sha256Digest::of(&signed_pkg),
+                    size: signed_pkg.len() as u64,
+                },
+                ObjectIdentity {
+                    sha256: Sha256Digest::of(&signed_sig),
+                    size: signed_sig.len() as u64,
+                },
+                large_identity,
+                ObjectIdentity {
+                    sha256: Sha256Digest::of(&large_signature),
+                    size: large_signature.len() as u64,
+                },
+            ],
+            &extra_packages,
+            (&data_dir.join("keyring.gpg"), &keyring),
+        )
+        .await;
+    assert!(
+        large_size
+            + extra_packages
+                .iter()
+                .map(|(_, identity, _)| identity.size)
+                .sum::<u64>()
+            > 128 * 1024 * 1024,
+        "the remote retained package set must exceed the entire local spool"
+    );
+    assert_eq!(
+        publisher
+            .retained_proofs(&chaotic_key)
+            .expect("candidate proof")[0]
+            .release()
+            .authority(),
+        ferrum_apt::release::MetadataAuthority::TransportCandidate
+    );
+
+    checks
+        .check_origin_off_recovery(
+            &config,
+            origin,
+            (&large_public, large_identity),
+            &extra_packages,
+        )
+        .await;
 
     let reply = request(
         &state,
@@ -2110,7 +2804,7 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
     assert_eq!(reply.status(), StatusCode::NOT_FOUND);
 
     state.registry.shutdown().await;
-    origin.shutdown().await;
+    // The origin is already stopped before reset/recovery above.
 }
 
 #[cfg(target_os = "linux")]
@@ -2248,9 +2942,8 @@ async fn rpm_almalinux_bootstrap_serves_repomd_primary_and_packages() {
     let text = format!(
         "mode = \"private-durable\"\n[listen]\npublic = \"127.0.0.1:0\"\nadmin = \"127.0.0.1:0\"\n\
          [durable]\nstate_dir = \"{}\"\nsuites = [\"almalinux/9-baseos-x86-64\"]\n\
-         [durable.provider]\nendpoint = \"https://s3.us-central-1.idrivee2.com\"\nregion = \"us-central-1\"\n\
-         bucket = \"s3-andrew\"\npackage_prefix = \"linux-packages/\"\n\
-         checkpoint_prefix = \"linux-checkpoints/\"\nshared_nonisolated = true\ncredentials_file = \"{}\"\n\
+         [durable.provider]\nregion = \"us-east-1\"\n\
+         bucket = \"ferrum\"\ncredentials_file = \"{}\"\n\
          [durable.keyrings]\ndebian = \"{}\"\nubuntu = \"{}\"\nalmalinux = \"{}\"\n\
          [durable.budget]\nmode = \"existing\"\n[verifier]\n[limits]\n",
         root.join("state").display(),
@@ -2276,19 +2969,9 @@ async fn rpm_almalinux_bootstrap_serves_repomd_primary_and_packages() {
     disk.max_entries = 10_000;
     let spool = Spool::open_durable(disk).expect("durable spool");
     let ledger = BudgetLedger::initialize(spool.clone(), BudgetLimits::default()).expect("ledger");
-    let (store, _remote) = S3Store::stateful_production(
-        S3Config {
-            endpoint: "https://s3.us-central-1.idrivee2.com".into(),
-            region: "us-central-1".into(),
-            bucket: "s3-andrew".into(),
-            package_prefix: "linux-packages/".into(),
-            checkpoint_prefix: "linux-checkpoints/".into(),
-            credentials_file: root.join("unused-provider.env"),
-            shared_nonisolated: true,
-        },
-        ledger,
-    )
-    .expect("s3 store");
+    let (store, _remote) =
+        S3Store::stateful_production(config.durable().expect("durable").store_config(), ledger)
+            .expect("s3 store");
     let store = Arc::new(store);
     let publisher = Arc::new(
         CheckpointPublisher::new(
@@ -2315,7 +2998,7 @@ async fn rpm_almalinux_bootstrap_serves_repomd_primary_and_packages() {
     let config = Arc::new(config);
     let mut synchronizer = DurableSynchronizer::new(
         config.clone(),
-        verifier,
+        verifier.clone(),
         spool.clone(),
         publisher.clone(),
         catalog.clone(),
@@ -2338,6 +3021,15 @@ async fn rpm_almalinux_bootstrap_serves_repomd_primary_and_packages() {
             .expect("bootstrap rpm suite"),
         SyncOutcome::Published
     );
+    drop(synchronizer);
+    drop(catalog);
+    let catalog = Box::pin(recover_unchanged_repository_catalog(
+        config.clone(),
+        verifier,
+        spool.clone(),
+        publisher.clone(),
+    ))
+    .await;
 
     let limits = Limits::default();
     let alma_client = Arc::new(

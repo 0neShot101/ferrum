@@ -21,6 +21,23 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Trigger or run synchronization for all mirrors, one mirror repository, or one suite.
+    Sync {
+        /// Path to the TOML configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Optional target (`all`, `<repository>`, or `<repository>/<suite>`).
+        target: Option<String>,
+        /// Optional mirror repository name (e.g. `debian`, `ubuntu`, `archlinux`, `almalinux`).
+        #[arg(long)]
+        repository: Option<String>,
+        /// Optional suite name within the repository (e.g. `trixie`, `noble`, `core`).
+        #[arg(long)]
+        suite: Option<String>,
+        /// Run one direct offline synchronization pass instead of signaling a running gateway.
+        #[arg(long)]
+        offline: bool,
+    },
     /// Explicit owned-prefix private fixture operations (never production durability).
     PrivateS3 {
         #[arg(long)]
@@ -34,6 +51,37 @@ enum Command {
         config: PathBuf,
         #[command(subcommand)]
         operation: StorageOperation,
+    },
+    /// Local administration credentials and explicit offline state migration.
+    Admin {
+        #[command(subcommand)]
+        operation: AdminOperation,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminOperation {
+    /// Move legacy users out of the exclusively locked spool without changing its ledger.
+    Migrate {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Print the protected, one-time first-administrator setup token to this terminal.
+    SetupToken {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Print the protected status/sync token for local administrative tooling.
+    ControlToken {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Produce a validated, relative-path-resolved managed configuration copy.
+    AdoptConfig {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -107,6 +155,75 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Serve { config } => serve(&config).await,
+        Command::Admin { operation } => {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                match operation {
+                    AdminOperation::Migrate { config } => {
+                        let config = ferrum::config::Config::load(&config)?;
+                        let report = ferrum::admin::migration::migrate(
+                            &config.spool_dir(),
+                            &config.admin.state_dir,
+                        )?;
+                        println!(
+                            "users={} already_migrated={}",
+                            report.users, report.already_migrated
+                        );
+                    }
+                    AdminOperation::SetupToken { config } => {
+                        let config = ferrum::config::Config::load(&config)?;
+                        println!(
+                            "{}",
+                            ferrum::admin::migration::read_bootstrap_token(
+                                &config.admin.state_dir,
+                            )?
+                        );
+                    }
+                    AdminOperation::ControlToken { config } => {
+                        let config = ferrum::config::Config::load(&config)?;
+                        println!(
+                            "{}",
+                            ferrum::admin::migration::read_control_token(&config.admin.state_dir,)?
+                        );
+                    }
+                    AdminOperation::AdoptConfig { config, output } => {
+                        let report =
+                            ferrum::admin::settings::adopt_managed_config(&config, &output)
+                                .map_err(anyhow::Error::msg)?;
+                        println!(
+                            "source={} output={} revision={} restart_required={}",
+                            report.source_path.display(),
+                            report.output_path.display(),
+                            report.revision,
+                            report.restart_required
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("local administration task failed")))
+        }
+        Command::Sync {
+            config,
+            target,
+            repository,
+            suite,
+            offline,
+        } => {
+            async {
+                let loaded = ferrum::config::Config::load(&config)?;
+                ferrum::app::sync(
+                    loaded,
+                    target,
+                    repository,
+                    suite,
+                    offline,
+                    shutdown_signal(),
+                )
+                .await
+            }
+            .await
+        }
         Command::PrivateS3 { config, operation } => {
             use ferrum::fixture_s3::PrivateS3Command;
             let operation = match operation {

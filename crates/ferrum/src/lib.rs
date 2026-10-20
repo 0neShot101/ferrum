@@ -6,6 +6,7 @@
 // The composed publication/SDK futures exceed rustc's default query depth.
 #![recursion_limit = "256"]
 
+pub mod admin;
 pub mod app;
 pub mod clock;
 pub mod config;

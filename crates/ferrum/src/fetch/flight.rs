@@ -40,6 +40,9 @@ enum FillWork {
 }
 
 impl FillWork {
+    fn requires_signature(&self) -> bool {
+        matches!(self, Self::Package { proof, .. } if proof.requires_package_signature())
+    }
     fn label(&self) -> &str {
         match self {
             Self::Fixture(path) | Self::Package { path, .. } => path.as_str(),
@@ -52,7 +55,7 @@ impl FillWork {
 #[derive(Debug, Clone)]
 pub enum FlightState {
     Filling,
-    Verified(VerifiedObject),
+    Verified(VerifiedObject, usize),
     Failed(FillError),
 }
 
@@ -198,7 +201,10 @@ impl FillRegistry {
 
     async fn join_work(&self, identity: ObjectIdentity, work: FillWork) -> JoinOutcome {
         let (mut receiver, _guard) = match self.join_or_start(identity, work) {
-            Joined::Verified(object) => return JoinOutcome::Verified(object),
+            Joined::Verified(object) => {
+                let _ = crate::server::REQUEST_SOURCE.try_with(|slot| slot.set(0));
+                return JoinOutcome::Verified(object);
+            }
             Joined::Replayed(error) => return JoinOutcome::Failed(error),
             Joined::TooManyWaiters => return JoinOutcome::TooManyWaiters,
             Joined::Wait(receiver, guard) => (receiver, guard),
@@ -206,7 +212,11 @@ impl FillRegistry {
         let terminal = receiver.wait_for(|state| !matches!(state, FlightState::Filling));
         match tokio::time::timeout(self.inner.limits.waiter_timeout, terminal).await {
             Ok(Ok(state)) => match &*state {
-                FlightState::Verified(object) => JoinOutcome::Verified(object.clone()),
+                FlightState::Verified(object, source) => {
+                    let _ = crate::server::REQUEST_SOURCE
+                        .try_with(|slot| slot.set(if *source < 3 { source + 2 } else { 0 }));
+                    JoinOutcome::Verified(object.clone())
+                }
                 FlightState::Failed(error) => JoinOutcome::Failed(error.clone()),
                 FlightState::Filling => JoinOutcome::Failed(FillError::Internal(
                     "flight ended while filling".to_owned(),
@@ -225,16 +235,17 @@ impl FillRegistry {
     /// Synchronous part of `join`: lookup, backoff replay, or flight join/create.
     /// The flights lock is never held across an await.
     fn join_or_start(&self, identity: ObjectIdentity, work: FillWork) -> Joined {
+        let authenticated_hit = !work.requires_signature();
         if self.inner.cancel.is_cancelled() {
             return Joined::Replayed(FillError::Shutdown);
         }
-        if let Some(object) = self.inner.spool.lookup(identity) {
+        if authenticated_hit && let Some(object) = self.inner.spool.lookup(identity) {
             return Joined::Verified(object);
         }
         let mut flights = lock_unpoisoned(&self.inner.flights);
         // A producer may have committed and removed its flight since the first
         // lookup. Recheck while creation/removal is serialized.
-        if let Some(object) = self.inner.spool.lookup(identity) {
+        if authenticated_hit && let Some(object) = self.inner.spool.lookup(identity) {
             return Joined::Verified(object);
         }
         if let Some(flight) = flights.get(&identity) {
@@ -328,18 +339,29 @@ impl FillRegistry {
         while supervisors.try_join_next().is_some() {}
         let path = work.label().to_owned();
         let registry = self.clone();
+        let started = Instant::now();
+        let derived = matches!(&work, FillWork::Derived(_));
         let inner = Arc::clone(&self.inner);
-        let mut producer = tokio::spawn(async move {
-            match tokio::time::timeout(
-                inner.limits.producer_deadline,
-                produce(Arc::clone(&inner), identity, work),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(FillError::Timeout),
-            }
-        });
+        let mut producer = tokio::spawn(super::PRODUCER_SOURCE.scope(
+            std::cell::Cell::new(if derived { 2 } else { usize::MAX }),
+            async move {
+                let result = match tokio::time::timeout(
+                    inner.limits.producer_deadline,
+                    produce(Arc::clone(&inner), identity, work),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(FillError::Timeout),
+                };
+                let source = if derived {
+                    2
+                } else {
+                    super::PRODUCER_SOURCE.with(std::cell::Cell::get)
+                };
+                result.map(|object| (object, source))
+            },
+        ));
         let inner = Arc::clone(&self.inner);
         supervisors.spawn(async move {
             let outcome = tokio::select! {
@@ -354,11 +376,13 @@ impl FillRegistry {
                     Err(join_error) => Err(FillError::Internal(format!("producer failed: {join_error}"))),
                 },
             };
+            inner.metrics.record_fill_duration(started.elapsed());
             let state = match &outcome {
-                Ok(object) => {
+                Ok((object, source)) => {
                     tracing::info!(path = %path, size = object.size(), outcome = "verified", "fill finished");
                     inner.metrics.record_fill("verified");
-                    FlightState::Verified(object.clone())
+                    inner.metrics.record_producer(*source);
+                    FlightState::Verified(object.clone(), *source)
                 }
                 Err(error) => {
                     tracing::warn!(path = %path, outcome = error.metrics_label(), error = %error, "fill failed");
@@ -399,6 +423,13 @@ impl FillRegistry {
     /// Live flights (for tests and health).
     pub fn active_flights(&self) -> usize {
         lock_unpoisoned(&self.inner.flights).len()
+    }
+
+    pub fn available_fill_slots(&self) -> usize {
+        self.inner.fill_slots.available_permits()
+    }
+    pub fn max_fill_slots(&self) -> usize {
+        self.inner.limits.concurrent_fills.max(1)
     }
 }
 

@@ -637,9 +637,9 @@ fn build_config(
         durable: HarnessDurableToml {
             state_dir,
             provider: HarnessProviderToml {
-                endpoint: "https://s3.us-central-1.idrivee2.com",
-                region: "us-central-1",
-                bucket: "s3-andrew",
+                endpoint: "https://s3.us-east-1.amazonaws.com",
+                region: "us-east-1",
+                bucket: "ferrum",
                 package_prefix: "linux-packages/",
                 checkpoint_prefix: "linux-checkpoints/",
                 shared_nonisolated: true,
