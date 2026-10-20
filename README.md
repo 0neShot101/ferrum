@@ -145,7 +145,7 @@ Before proceeding:
 2. Set your private S3 bucket in `durable.provider` (and matching `provider` in `maintenance.toml`). For AWS S3, set `region` (`endpoint` defaults to `https://s3.<region>.amazonaws.com`). For Cloudflare R2, set `provider = 'cloudflare-r2'` and `account_id = '<account_id>'` (or `endpoint = 'https://<account_id>.r2.cloudflarestorage.com'`, with `region` defaulting to `'auto'`). For IDrive e2, set `provider = 'idrive-e2'` and `region = 'us-central-1'` (or `endpoint = 'https://s3.us-central-1.idrivee2.com'`). Any other HTTPS S3-compatible endpoint URL is also supported. `package_prefix` (`linux-packages/`), `checkpoint_prefix` (`linux-checkpoints/`), and `shared_nonisolated` (`true`) are optional and may be customized if non-overlapping.
 3. Review the example 1 TiB storage/monthly-download caps and 100 GiB control headroom. The counters are admission limits, not a billing guarantee. Disable lifecycle expiration for Ferrum objects and review versioning costs.
 4. Install the Debian archive keyring from the distribution package. For Ubuntu, copy the archive keyring from a trusted Ubuntu installation to the configured root-owned path. Obtain any other keyrings independently through the corresponding distribution's trusted installation process, not from a package request.
-5. Omitted suite lists select Debian trixie and Ubuntu noble, including their update/security pockets. If selecting a subset, set matching `durable.suites` and maintenance `suites` arrays of `repository/suite` names. Do not enable `all` merely because entries exist in the allowlist. Published suites cannot yet be removed from the selection: startup rejects that change to preserve recovery trust.
+5. Omitted suite lists select Debian trixie and Ubuntu noble, including their update/security pockets. If selecting a subset, set matching `durable.suites` and maintenance `suites` arrays of `repository/suite` names. Do not enable `all` merely because entries exist in the allowlist. To retire a published suite, stop Ferrum, move it from `durable.suites` to `durable.retired_suites` (and make the matching maintenance change), retain its current keyring, then restart. Removing it from both lists is rejected.
 
 Create `/var/lib/ferrum/private/provider.env` with your bucket credentials (optional `AWS_ENDPOINT_URL_S3`, `AWS_REGION`, `FERRUM_S3_BUCKET`, and `FERRUM_S3_PREFIX` are also verified against the TOML configuration if present):
 
@@ -183,6 +183,19 @@ ferrum sync --config /etc/ferrum/gateway.toml debian
 ferrum sync --config /etc/ferrum/gateway.toml archlinux/core
 ferrum sync --config /etc/ferrum/gateway.toml --offline debian/trixie
 ```
+
+Prewarm explicitly selected package paths through the running private listener:
+
+```sh
+ferrum prewarm --config /etc/ferrum/gateway.toml run \
+  --max-bytes 1073741824 "$AUTHENTICATED_PACKAGE_PATH"
+ferrum prewarm --config /etc/ferrum/gateway.toml status "$JOB_ID"
+ferrum prewarm --config /etc/ferrum/gateway.toml cancel "$JOB_ID"
+```
+
+Use package paths from the active authenticated catalog, not arbitrary URLs. One prewarm job runs at a time; its hard bounds are 128 package/signature objects, 8 GiB of admitted bytes, four workers and one hour. Defaults are one worker and five minutes. It reserves foreground fill capacity, uses normal verification/capture, and rejects the complete batch before transfer if its declared budget cannot cover it. The byte cap counts authenticated package sizes plus conservative detached-signature allowance, **not wire traffic or billing**; retries and capture verification remain subject to the existing transfer ledger. Cancellation stops unshared background work, but a foreground-shared fill may finish. Activity and task details expose progress and cancellation.
+
+Retired suites have no public routes or new synchronization work. Retirement preserves rollback floors, historical capture authority and accounting; it is not deletion or garbage collection. Current keyrings remain required for retained proofs. Reactivation moves the identity back to the active list and requires normal verified recovery/synchronization before serving.
 
 For the HTTPS edge, merge `deploy/nginx/ferrum-http.conf` into Nginx's `http` settings, replacing duplicate directives such as `keepalive_timeout` rather than including them twice. Install `ferrum-site.conf` as the virtual host and `ferrum-proxy.conf` as `/etc/nginx/snippets/ferrum-boundary.conf`. Replace every example hostname and both certificate paths with your own. Integrate the default reject listeners with existing virtual hosts; do not duplicate `default_server` declarations. Validate with `sudo nginx -t` before reloading. Never expose port 9090.
 
@@ -243,6 +256,8 @@ This is an on-demand gateway, not an official full mirror or historical snapshot
 
 Cold fills may outlast APT's retry window: Ferrum returns bounded 503 responses while the shared producer continues, so a later invocation may be needed. APT/RPM warm objects are not rehashed on every read; clients still verify their downloads.
 
+For supported APT archives, Ferrum serves optional authenticated PDiffs: signed Release hashes authenticate the plain `.diff/Index`, which authenticates the complete gzip patch closure. Unsupported, incomplete or invalid optional closures fall back to full indexes. Limits are 32 PDiff roots per suite, a 1 MiB Index, 64 patches per root, 16 MiB per compressed patch, 64 MiB of combined compressed/expanded closure bytes, and 256 MiB of optional suite staging. Patches are canonical generation-bound paths, not new by-hash aliases. This can reduce client update traffic; Ferrum still acquires full indexes for its own authenticated catalog.
+
 **Pacman has a different trust boundary:** repository databases are unsigned transport candidates, not authenticated indexes. Every served package must pass its own signature check under the configured current keyring; a valid canary does not authorize other packages. Local checkpoint sequences and origin-confirmation leases do not provide cryptographic repository-version rollback protection.
 
 Pacman verification currently rereads the entire package for each GET, including Range and signature requests, and for positive resident HEAD/304 responses. Recovery also verifies retained package/signature pairs. Those costs invalidate earlier warm-throughput claims for Pacman. Re-signing a dynamically discovered detached signature without changing the database can remain unavailable after a keyring change; automatic signature revision is not qualified. It fails closed rather than accepting the obsolete signer.
@@ -259,6 +274,7 @@ Additional repository profiles include Arch Linux, Chaotic-AUR, CachyOS, ArchLin
 | `PATH="$PWD/target/debug:$PATH" cargo test --workspace --locked --features ferrum/test-harness` | Run unit and integration tests using the built verifier |
 | `cargo clippy --workspace --all-targets --locked --features ferrum/test-harness -- -D warnings` | Check correctness/style/performance warnings |
 | `cargo fmt --all -- --check` | Check standard Rust formatting |
+| `cargo run --release --locked -p ferrum --features test-harness --example throughput -- serve` | Start a disposable loopback gateway for verified before/after HTTP measurements |
 
 Signed publication tests require generated fixture data; [fixture/README.md](fixture/README.md) documents setup. `tools/distribution-inventory` and `tools/e2-probe` are separate Cargo workspaces. Provider probes require explicit disposable namespaces and allowances; never point a cleanup probe at live data.
 

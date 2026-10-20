@@ -4,8 +4,8 @@ mod assets;
 pub mod migration;
 pub mod model;
 mod overview;
-mod password;
-mod routes;
+pub(crate) mod password;
+pub(crate) mod routes;
 pub mod store;
 
 pub mod inventory;

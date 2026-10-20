@@ -32,6 +32,10 @@ state_dir = '/var/lib/ferrum/state'
 #   'ubuntu/noble-updates',
 #   'ubuntu-security/noble-security',
 # ]
+# To retire published identities, stop the gateway and move them from suites to
+# this list. Keep their keyrings and matching maintenance selection, then restart.
+# Retirement preserves floors, capture authority and accounting; it deletes nothing.
+retired_suites = []
 
 [durable.provider]
 # Supported S3-compatible object storage providers:

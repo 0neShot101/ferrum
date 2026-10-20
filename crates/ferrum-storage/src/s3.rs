@@ -1,7 +1,8 @@
 //! Concrete locked S3 adapter with explicit private and production admission profiles.
 mod production;
 pub use production::{
-    ControlCondition, ControlObject, OperationIdentity, S3Config, S3Store, VerifiedUpload,
+    ControlCondition, ControlObject, FetchError, OperationIdentity, S3Config, S3Store,
+    VerifiedFetch, VerifiedUpload,
 };
 pub(crate) mod config;
 mod journal;
@@ -9,6 +10,9 @@ mod journal;
 #[cfg(any(test, feature = "test-harness"))]
 pub mod testing;
 mod wire;
+
+#[cfg(test)]
+pub(crate) use production::body::object_body as object_body_for_test;
 
 use std::pin::Pin;
 use std::sync::Arc;

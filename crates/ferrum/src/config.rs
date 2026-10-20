@@ -88,6 +88,38 @@ pub fn resolve_distribution_suites(
     Ok(selected)
 }
 
+/// Resolves disjoint serving and retained-trust selections without dropping identities.
+pub fn resolve_suite_selection(
+    configured: Option<&[String]>,
+    retired: &[String],
+) -> Result<(Vec<DistributionSuite>, Vec<DistributionSuite>), String> {
+    if retired.iter().any(|entry| entry == "all") {
+        return Err("retired_suites requires explicit <repository>/<suite> identities".into());
+    }
+
+    let retired = if retired.is_empty() {
+        Vec::new()
+    } else {
+        resolve_distribution_suites(Some(retired))?
+    };
+    let active = if configured.is_some_and(|entries| entries.is_empty()) && !retired.is_empty() {
+        Vec::new()
+    } else {
+        resolve_distribution_suites(configured)?
+    };
+
+    if active.iter().any(|entry| retired.contains(entry)) {
+        return Err(
+            "suites and retired_suites must not overlap; move each identity between lists".into(),
+        );
+    }
+    if active.len() + retired.len() > ferrum_storage::checkpoint::MAX_SUITES {
+        return Err("combined active and retired selection exceeds the suite limit".into());
+    }
+
+    Ok((active, retired))
+}
+
 /// Why a configuration file was refused, without retaining raw configuration text.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -161,6 +193,8 @@ pub struct DurableConfig {
     pub qualification_run_id: Option<String>,
     pub trust: DurableTrust,
     pub suites: Option<Vec<String>>,
+    /// Explicitly retained trust identities, never served or synchronized.
+    pub retired_suites: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +329,8 @@ struct RawDurable {
     fixture_keyring: Option<PathBuf>,
     qualification_run_id: Option<String>,
     suites: Option<Vec<String>>,
+    #[serde(default)]
+    retired_suites: Vec<String>,
     budget: RawBudget,
 }
 
@@ -465,7 +501,10 @@ impl Config {
                 validate_qualification_run(run)?;
             }
             let trust = if durable_fixture {
-                if state.keyrings.is_some() || state.suites.is_some() {
+                if state.keyrings.is_some()
+                    || state.suites.is_some()
+                    || !state.retired_suites.is_empty()
+                {
                     return Err(invalid(
                         "durable.keyrings",
                         "distribution trust and suite lists are forbidden in durable fixture mode",
@@ -534,8 +573,8 @@ impl Config {
                     rockylinux: resolve_optional(keyrings.rockylinux, "rockylinux-keyring.gpg"),
                 }))
             };
-            if let Some(suites) = &state.suites {
-                resolve_distribution_suites(Some(suites))
+            if !durable_fixture {
+                resolve_suite_selection(state.suites.as_deref(), &state.retired_suites)
                     .map_err(|reason| invalid("durable.suites", reason))?;
             }
             let defaults = ferrum_storage::budget::BudgetLimits::default();
@@ -580,6 +619,7 @@ impl Config {
                 qualification_run_id: state.qualification_run_id,
                 trust,
                 suites: state.suites,
+                retired_suites: state.retired_suites,
                 budget,
             };
             let keyrings_absolute = match &state.trust {
@@ -847,8 +887,17 @@ impl Config {
         self.source_path = Some(path);
     }
 
-    /// Returns only the configured fixed identities; TOML cannot add routes.
+    /// Fixed identities actively served and synchronized; TOML cannot add routes.
     pub fn suites(&self) -> Result<Vec<SuiteConfig>, ConfigError> {
+        self.selected_suites(false)
+    }
+
+    /// Active and explicitly retired identities used for recovery and capture trust.
+    pub fn trust_suites(&self) -> Result<Vec<SuiteConfig>, ConfigError> {
+        self.selected_suites(true)
+    }
+
+    fn selected_suites(&self, include_retired: bool) -> Result<Vec<SuiteConfig>, ConfigError> {
         use ferrum_storage::checkpoint::SuiteKey;
         use ferrum_storage::recovery::TrustPolicy;
         if self.is_fixture() {
@@ -917,8 +966,12 @@ impl Config {
                 &keyrings.rockylinux,
             ),
         };
-        let selected = resolve_distribution_suites(durable.suites.as_deref())
-            .map_err(|reason| invalid("durable.suites", reason))?;
+        let (mut selected, retired) =
+            resolve_suite_selection(durable.suites.as_deref(), &durable.retired_suites)
+                .map_err(|reason| invalid("durable.suites", reason))?;
+        if include_retired {
+            selected.extend(retired);
+        }
         selected
             .into_iter()
             .map(|entry| {
@@ -1573,6 +1626,43 @@ mode = "existing"
             config.durable().expect("durable").state_dir
         );
         assert_eq!(config.limits.max_object_bytes, 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn retirement_preserves_trust_and_requires_explicit_reactivation() {
+        let root = std::env::temp_dir();
+        let retired = DURABLE.replace(
+            "state_dir = \"state\"",
+            "state_dir = \"state\"\nsuites = []\nretired_suites = [\"debian/trixie\"]",
+        );
+        let config = Config::parse(&retired, &root).expect("retired-only configuration");
+        assert!(config.suites().expect("active selection").is_empty());
+        let trust = config.trust_suites().expect("retained trust");
+        assert_eq!(trust.len(), 1);
+        assert_eq!(trust[0].key.suite(), "trixie");
+        assert_eq!(trust[0].policy.keyring(), root.join("keyrings/debian.gpg"));
+
+        let active = retired.replace(
+            "suites = []\nretired_suites = [\"debian/trixie\"]",
+            "suites = [\"debian/trixie\"]\nretired_suites = []",
+        );
+        let reactivated = Config::parse(&active, &root).expect("reactivation");
+        assert_eq!(reactivated.suites().expect("active").len(), 1);
+        assert_eq!(reactivated.trust_suites().expect("trust").len(), 1);
+
+        for selection in [
+            "suites = [\"debian/trixie\"]\nretired_suites = [\"debian/trixie\"]",
+            "suites = []\nretired_suites = []",
+            "suites = []\nretired_suites = [\"all\"]",
+            "suites = []\nretired_suites = [\"debian/unknown\"]",
+            "suites = []\nretired_suites = [\"debian/trixie\", \"debian/trixie\"]",
+        ] {
+            let text = DURABLE.replace(
+                "state_dir = \"state\"",
+                &format!("state_dir = \"state\"\n{selection}"),
+            );
+            assert!(Config::parse(&text, &root).is_err(), "{selection}");
+        }
     }
 
     #[test]

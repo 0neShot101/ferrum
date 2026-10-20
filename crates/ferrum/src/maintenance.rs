@@ -13,7 +13,7 @@ use ferrum_storage::{DurableSpoolConfig, Spool};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ALL_DISTRIBUTION_SUITES, resolve_distribution_suites};
+use crate::config::{ALL_DISTRIBUTION_SUITES, resolve_suite_selection};
 
 #[derive(Clone)]
 pub enum MaintenanceCommand {
@@ -50,6 +50,8 @@ struct MaintenanceConfig {
     qualification_run_id: Option<String>,
     #[serde(default)]
     suites: Option<Vec<String>>,
+    #[serde(default)]
+    retired_suites: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -117,10 +119,8 @@ impl MaintenanceConfig {
                 "invalid private qualification identity"
             );
         }
-        if let Some(suites) = &config.suites {
-            resolve_distribution_suites(Some(suites))
-                .map_err(|reason| anyhow::anyhow!("invalid maintenance suites: {reason}"))?;
-        }
+        resolve_suite_selection(config.suites.as_deref(), &config.retired_suites)
+            .map_err(|reason| anyhow::anyhow!("invalid maintenance suites: {reason}"))?;
         Ok(config)
     }
 }
@@ -157,6 +157,18 @@ pub async fn run(
                 remote.storage, remote.download, remote.package_download, remote.certain
             );
             println!("local_storage={:?}", spool.usage()?);
+            let (active, retired) =
+                resolve_suite_selection(config.suites.as_deref(), &config.retired_suites)
+                    .map_err(|reason| anyhow::anyhow!(reason))?;
+            for (status, suites) in [("active", active), ("retired", retired)] {
+                for suite in suites {
+                    println!(
+                        "suite={}/{} status={status}",
+                        suite.repository.name(),
+                        suite.suite
+                    );
+                }
+            }
             Ok(())
         }
         MaintenanceCommand::Init {
@@ -179,8 +191,9 @@ pub async fn run(
             }
             let spool = Spool::open_durable(disk)?;
             let _ledger = BudgetLedger::initialize_for_provider(spool.clone(), limits, &provider)?;
-            let configured = resolve_distribution_suites(config.suites.as_deref())
-                .map_err(|reason| anyhow::anyhow!(reason))?;
+            let (configured, _) =
+                resolve_suite_selection(config.suites.as_deref(), &config.retired_suites)
+                    .map_err(|reason| anyhow::anyhow!(reason))?;
             for entry in &configured {
                 let key = SuiteKey::new(entry.repository.name(), entry.suite)?;
                 let audit =
@@ -222,9 +235,11 @@ pub async fn run(
         } => {
             let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
             let _ = BootstrapAudit::acknowledge_reset(&operator, &reason, now, &disclosure)?;
+            let (active, retired) =
+                resolve_suite_selection(config.suites.as_deref(), &config.retired_suites)
+                    .map_err(|reason| anyhow::anyhow!(reason))?;
             let targets: Vec<SuiteKey> = match (repository, suite) {
-                (None, None) => resolve_distribution_suites(config.suites.as_deref())
-                    .map_err(|reason| anyhow::anyhow!(reason))?
+                (None, None) => active
                     .into_iter()
                     .map(|entry| SuiteKey::new(entry.repository.name(), entry.suite))
                     .collect::<Result<_, _>>()?,
@@ -236,6 +251,12 @@ pub async fn run(
                             && repo == crate::config::REPOSITORY_PREFIX
                             && name == crate::config::SUITE);
                     ensure!(allowed, "unconfigured repository/suite for bootstrap");
+                    ensure!(
+                        !retired.iter().any(|entry| {
+                            entry.repository.name() == repo && entry.suite == name
+                        }),
+                        "retired suite cannot be authorized for bootstrap; reactivate it first"
+                    );
                     vec![SuiteKey::new(&repo, &name)?]
                 }
                 _ => anyhow::bail!("--repository and --suite must be supplied together or omitted"),

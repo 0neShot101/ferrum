@@ -1,5 +1,6 @@
 //! Signed generation proof and profile-aware recovery. Historical proof authenticity
 //! and permission to activate fresh mutable metadata are deliberately separate.
+mod pdiff;
 mod publication;
 use crate::{
     Spool, VerifiedObject,
@@ -17,6 +18,7 @@ use ferrum_apt::{
     signature::SignatureVerifier,
 };
 use futures_util::StreamExt;
+pub use pdiff::verify_patch as verify_pdiff_patch;
 pub use publication::materialize_derived;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
@@ -1289,21 +1291,25 @@ pub async fn verify_historical_proof(
         historical_architectures,
     )
     .map_err(|_| CheckpointError::Proof)?;
+    let pdiffs = pdiff::authenticate(spool, manifest, &release, &selected, &artifacts).await?;
     let selected_by_path: std::collections::HashMap<_, _> = selected
         .iter()
         .map(|target| (target.path.as_str(), target))
         .collect();
     let pinned = selected.iter().filter(|target| target.pinned).count();
-    if manifest.artifacts.len() != pinned + 3 || manifest.derived.len() != selected.len() - pinned {
+    if manifest.artifacts.len() != pinned + 3 + pdiffs.len()
+        || manifest.derived.len() != selected.len() - pinned
+    {
         return Err(CheckpointError::Proof);
     }
     for artifact in &manifest.artifacts {
         if !matches!(
             artifact.path.as_str(),
             "InRelease" | "Release" | "Release.gpg"
-        ) && selected_by_path
-            .get(artifact.path.as_str())
-            .is_none_or(|target| !target.pinned)
+        ) && !pdiffs.contains_key(&artifact.path)
+            && selected_by_path
+                .get(artifact.path.as_str())
+                .is_none_or(|target| !target.pinned)
         {
             return Err(CheckpointError::Proof);
         }
@@ -1327,6 +1333,13 @@ pub async fn verify_historical_proof(
             "InRelease" | "Release" | "Release.gpg"
         ) {
             None
+        } else if let Some(expected) = pdiffs.get(&descriptor.path) {
+            if descriptor.identity()? != *expected {
+                return Err(CheckpointError::Proof);
+            }
+            let path = RepositoryPath::parse_decoded(&descriptor.path)
+                .map_err(|_| CheckpointError::Proof)?;
+            release.entry(&path)
         } else {
             let path = RepositoryPath::parse_decoded(&descriptor.path)
                 .map_err(|_| CheckpointError::Proof)?;
@@ -3418,7 +3431,7 @@ mod transport_tests {
         let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ferrum-apt/tests/data");
         std::fs::copy(data.join("keyring-revoked.gpg"), policy.keyring()).unwrap();
     }
-    fn assert_serving(
+    async fn assert_serving(
         publisher: &CheckpointPublisher,
         proof: &VerifiedHistoricalProof,
         authorized: bool,
@@ -3426,19 +3439,21 @@ mod transport_tests {
         let path =
             RepositoryPath::parse_decoded("pool/main/f/ferrum-fixture/ferrum-fixture_1.0_all.deb")
                 .unwrap();
-        let package = publisher.lookup_package("fixture", &path);
-        let metadata = publisher.lookup_by_hash(
-            &proof.manifest().key().unwrap(),
-            "main/binary-amd64",
-            crate::checkpoint::MetadataHash::Sha256(
-                proof
-                    .identity("main/binary-amd64/Packages.gz")
-                    .unwrap()
-                    .sha256,
-            ),
-        );
+        let package = publisher.lookup_package("fixture", &path).await;
+        let metadata = publisher
+            .lookup_by_hash(
+                &proof.manifest().key().unwrap(),
+                "main/binary-amd64",
+                crate::checkpoint::MetadataHash::Sha256(
+                    proof
+                        .identity("main/binary-amd64/Packages.gz")
+                        .unwrap()
+                        .sha256,
+                ),
+            )
+            .await;
         if authorized {
-            package.unwrap().unwrap().authorize().unwrap();
+            package.unwrap().unwrap().authorize().await.unwrap();
             assert!(metadata.unwrap().is_some());
         } else {
             assert!(matches!(package, Err(CheckpointError::Proof)));
@@ -3454,7 +3469,7 @@ mod transport_tests {
     async fn cached_floor_recovery_rejects_removed_signer() {
         let directory = tempfile::tempdir().unwrap();
         let (fixture, publisher, requests, proof) = warm_publisher(directory.path(), 2).await;
-        assert_serving(&publisher, &proof, true);
+        assert_serving(&publisher, &proof, true).await;
         let key = fixture.manifest.key().unwrap();
         publisher
             .recover_floor_artifacts(
@@ -3467,7 +3482,7 @@ mod transport_tests {
             )
             .await
             .unwrap();
-        assert_serving(&publisher, &proof, true);
+        assert_serving(&publisher, &proof, true).await;
         remove_signer(&fixture.policy);
         assert!(matches!(
             publisher
@@ -3482,7 +3497,7 @@ mod transport_tests {
                 .await,
             Err(CheckpointError::Signature(_))
         ));
-        assert_serving(&publisher, &proof, false);
+        assert_serving(&publisher, &proof, false).await;
         assert_eq!(
             requests.snapshot().unwrap().len(),
             7 + fixture.manifest.artifacts.len()
@@ -3504,7 +3519,7 @@ mod transport_tests {
             )
             .await
             .unwrap();
-        assert_serving(&publisher, &proof, true);
+        assert_serving(&publisher, &proof, true).await;
         remove_signer(&fixture.policy);
         assert!(matches!(
             publisher
@@ -3518,9 +3533,144 @@ mod transport_tests {
                 .await,
             Err(CheckpointError::Signature(_))
         ));
-        assert_serving(&publisher, &proof, false);
+        assert_serving(&publisher, &proof, false).await;
         assert_eq!(requests.snapshot().unwrap().len(), request_count);
     }
+
+    #[tokio::test]
+    async fn stale_cache_work_cannot_remove_or_resurrect_new_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_fixture, publisher, _requests, proof) = warm_publisher(directory.path(), 0).await;
+        let scope = proof.manifest().scope_id().to_hex();
+        let old = publisher
+            .proofs
+            .lock()
+            .unwrap()
+            .get(&scope)
+            .unwrap()
+            .clone();
+
+        // Republishing even the exact same proof Arc creates a new insertion.
+        publisher.cache_proof(proof.clone()).unwrap();
+        publisher.remove_cached(&scope, &old).unwrap();
+        assert_serving(&publisher, &proof, true).await;
+        assert!(matches!(
+            publisher.rebind_cached(&scope, &old, proof.clone()),
+            Err(CheckpointError::Conflict)
+        ));
+
+        let current = publisher
+            .proofs
+            .lock()
+            .unwrap()
+            .get(&scope)
+            .unwrap()
+            .clone();
+        // A successful revalidation keeps the insertion lineage. A later
+        // rejection of that lineage must revoke the rebound handle as well.
+        publisher
+            .rebind_cached(&scope, &current, proof.clone())
+            .unwrap();
+        publisher.remove_cached(&scope, &current).unwrap();
+        assert_serving(&publisher, &proof, false).await;
+        assert!(matches!(
+            publisher.rebind_cached(&scope, &current, proof.clone()),
+            Err(CheckpointError::Conflict)
+        ));
+        assert_serving(&publisher, &proof, false).await;
+    }
+
+    #[tokio::test]
+    async fn package_scope_rejects_retired_suites_without_removing_retained_proofs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_fixture, publisher, _requests, proof) = warm_publisher(directory.path(), 0).await;
+        let path =
+            RepositoryPath::parse_decoded("pool/main/f/ferrum-fixture/ferrum-fixture_1.0_all.deb")
+                .unwrap();
+        let active =
+            crate::checkpoint::PackageScope::new(&[proof.manifest().key().unwrap()]).unwrap();
+        let retired = crate::checkpoint::PackageScope::new(&[]).unwrap();
+
+        assert!(
+            publisher
+                .lookup_package_in("fixture", &path, &active)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            publisher
+                .lookup_package_in("fixture", &path, &retired)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_serving(&publisher, &proof, true).await;
+    }
+
+    #[tokio::test]
+    async fn cache_pruning_does_not_hold_proof_lock_while_catalog_is_busy() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_fixture, publisher, _requests, proof) = warm_publisher(directory.path(), 0).await;
+        let publisher = Arc::new(publisher);
+        let scope = proof.manifest().scope_id().to_hex();
+        let previous = publisher
+            .proofs
+            .lock()
+            .unwrap()
+            .get(&scope)
+            .unwrap()
+            .clone();
+        let (ready, started) = std::sync::mpsc::sync_channel(3);
+        let mut gates = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..3 {
+            let spool = publisher.spool.clone();
+            let ready = ready.clone();
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            gates.push(release);
+            workers.push(std::thread::spawn(move || {
+                spool
+                    .durable_catalog()
+                    .unwrap()
+                    .read(move |_| {
+                        ready.send(()).unwrap();
+                        let _ = wait.recv();
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+        }
+        for _ in 0..3 {
+            started.recv().unwrap();
+        }
+
+        let updating = publisher.clone();
+        let update = std::thread::spawn(move || updating.cache_proof(proof));
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = publisher.proofs.try_lock().is_ok_and(|proofs| {
+                    proofs
+                        .get(&scope)
+                        .is_some_and(|entry| !Arc::ptr_eq(entry, &previous))
+                });
+                if changed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+
+        // Always release blocked workers before asserting, including a regression.
+        drop(gates);
+        update.join().unwrap().unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        observed.expect("proof lock remains available while the live-set query waits");
+    }
+
     #[tokio::test]
     async fn lost_ack_is_reconciled_only_by_exact_intent_readback() {
         let first = intent(1);

@@ -332,7 +332,7 @@ async fn run(args: Arguments) -> anyhow::Result<()> {
 
     let readyz_status = verify_admin_readyz(gateway.admin_addr).await?;
     let ready_at_unix = UnixTime::now().as_secs();
-    let suite_evidence = collect_suite_evidence(&gateway, &suites, &manifests_dir)?;
+    let suite_evidence = collect_suite_evidence(&gateway, &suites, &manifests_dir).await?;
 
     let ready_snapshot = build_evidence(
         "ready",
@@ -419,7 +419,7 @@ async fn run(args: Arguments) -> anyhow::Result<()> {
     signal_watcher.abort();
     tracing::info!("draining B10 distribution gateway");
 
-    let final_suites = collect_suite_evidence(&gateway, &suites, &manifests_dir)?;
+    let final_suites = collect_suite_evidence(&gateway, &suites, &manifests_dir).await?;
     let completed_fills_count = gateway.completed_fills().len();
     let public_addr = gateway.public_addr;
     let admin_addr = gateway.admin_addr;
@@ -701,7 +701,7 @@ async fn verify_admin_readyz(admin_addr: SocketAddr) -> anyhow::Result<u16> {
     Ok(status.as_u16())
 }
 
-fn collect_suite_evidence(
+async fn collect_suite_evidence(
     gateway: &RunningGateway,
     suites: &[SuiteConfig],
     manifests_dir: &Path,
@@ -723,7 +723,7 @@ fn collect_suite_evidence(
             )
         })?;
         ensure!(
-            catalog.current_view_available(&view) && view.is_fresh(now, wall),
+            catalog.current_view_available(&view).await && view.is_fresh(now, wall),
             "suite {}/{} is not fresh and active",
             suite.key.repository(),
             suite.key.suite()

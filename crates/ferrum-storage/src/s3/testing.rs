@@ -1,6 +1,7 @@
 //! Opt-in deterministic SDK transport for consumer regressions. No endpoint override or network server.
 use std::collections::VecDeque;
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -338,6 +339,76 @@ fn remote_failure(status: u16) -> Result<Response<SdkBody>, ConnectorError> {
     remote_response(status, bytes, None, size)
 }
 
+fn remote_listing(
+    state: &RemoteState,
+    url: &url::Url,
+) -> Result<Response<SdkBody>, ConnectorError> {
+    let mut parameters = std::collections::BTreeMap::new();
+
+    for (name, value) in url.query_pairs() {
+        if !matches!(
+            name.as_ref(),
+            "list-type" | "prefix" | "max-keys" | "continuation-token" | "x-id"
+        ) || parameters.insert(name, value).is_some()
+        {
+            return Err(remote_error("unsupported local listing parameter"));
+        }
+    }
+
+    let value = |name: &str| parameters.get(name).map(|value| value.as_ref());
+    let prefix = value("prefix").ok_or_else(|| remote_error("missing listing prefix"))?;
+    let maximum = value("max-keys")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|maximum| (1..=64).contains(maximum))
+        .ok_or_else(|| remote_error("invalid local listing bound"))?;
+    let after = value("continuation-token");
+
+    if value("list-type") != Some("2")
+        || value("x-id").is_some_and(|value| value != "ListObjectsV2")
+        || !prefix.ends_with('/')
+        || !remote_key(&format!("{prefix}entry"))
+        || after.is_some_and(|after| !remote_key(after) || !after.starts_with(prefix))
+    {
+        return Err(remote_error("invalid local listing scope"));
+    }
+
+    let mut entries = state.objects.iter().filter(|(key, _)| {
+        key.starts_with(prefix) && after.is_none_or(|after| key.as_str() > after)
+    });
+    let mut contents = String::new();
+    let mut last = None;
+
+    for (key, (bytes, _)) in entries.by_ref().take(maximum) {
+        // Stored keys and validated prefixes exclude XML metacharacters.
+        write!(
+            contents,
+            "<Contents><Key>{key}</Key><Size>{}</Size></Contents>",
+            bytes.len()
+        )
+        .map_err(|_| remote_error("local listing formatting failed"))?;
+        last = Some(key);
+    }
+
+    let truncated = entries.next().is_some();
+    let mut body = format!(
+        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <IsTruncated>{truncated}</IsTruncated>{contents}"
+    );
+
+    if truncated {
+        write!(
+            body,
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            last.ok_or_else(|| remote_error("local listing did not advance"))?
+        )
+        .map_err(|_| remote_error("local listing formatting failed"))?;
+    }
+
+    body.push_str("</ListBucketResult>");
+    let size = body.len();
+    remote_response(200, body.into_bytes(), None, size)
+}
+
 impl HttpConnector for StatefulRemote {
     fn call(&self, mut request: HttpRequest) -> HttpConnectorFuture {
         let remote = self.clone();
@@ -362,26 +433,31 @@ impl HttpConnector for StatefulRemote {
                 }
                 _ => return Err(remote_error("local transport refuses arbitrary endpoint")),
             };
-            let (bucket, key) = url
+            let path = url
                 .path()
                 .strip_prefix('/')
-                .and_then(|path| path.split_once('/'))
-                .filter(|(bucket, _)| config::valid_bucket(bucket))
-                .ok_or_else(|| remote_error("local transport refuses arbitrary bucket"))?;
+                .ok_or_else(|| remote_error("invalid local bucket path"))?;
+            let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+
+            if !config::valid_bucket(bucket) {
+                return Err(remote_error("local transport refuses arbitrary bucket"));
+            }
             let bucket = bucket.to_owned();
             let key = key.to_owned();
             let method = request.method().to_owned();
+            let listing = method == "GET" && key.is_empty();
             let operation = match method.as_str() {
                 "PUT" => "PutObject",
                 "GET" => "GetObject",
                 "HEAD" => "HeadObject",
                 _ => return Err(remote_error("unsupported local SDK operation")),
             };
-            if !remote_key(&key)
-                || url.query_pairs().count() > 1
-                || !url
-                    .query_pairs()
-                    .all(|(name, value)| name == "x-id" && value == operation)
+            if !listing
+                && (!remote_key(&key)
+                    || url.query_pairs().count() > 1
+                    || !url
+                        .query_pairs()
+                        .all(|(name, value)| name == "x-id" && value == operation))
             {
                 return Err(remote_error("unsupported local object key or operation"));
             }
@@ -405,6 +481,9 @@ impl HttpConnector for StatefulRemote {
                 state.requests.push((method.clone(), key.clone()));
                 if let Some(status) = state.faults.get(&key) {
                     return remote_failure(*status);
+                }
+                if listing {
+                    return remote_listing(&state, &url);
                 }
             }
             // Consume the actual SDK file body, including the production

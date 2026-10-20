@@ -43,6 +43,10 @@ required-features = ["test-harness"]
 name = "distribution_harness"
 required-features = ["test-harness"]
 
+[[example]]
+name = "throughput"
+required-features = ["test-harness"]
+
 [[bin]]
 name = "ferrum"
 path = "src/main.rs"

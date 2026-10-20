@@ -1,5 +1,9 @@
 # State, provider, suites and budgets must match gateway.toml.
 state_directory = '/var/lib/ferrum/state'
+# If overriding gateway suites, repeat that exact active selection here.
+# suites = ['debian/trixie', 'ubuntu/noble']
+# Move retired identities here as well as gateway durable.retired_suites.
+retired_suites = []
 
 [provider]
 # Supported S3 providers:

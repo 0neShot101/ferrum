@@ -219,7 +219,9 @@ impl DurableSynchronizer {
             .iter()
             .map(|suite| suite.configuration.key.clone())
             .collect();
-        FairRounds::new(&keys)?;
+        if !keys.is_empty() {
+            FairRounds::new(&keys)?;
+        }
         let slots = (0..suites.len()).map(|_| Slot::new()).collect();
         let trigger = SyncTrigger::new(keys);
         Ok(Self {
@@ -298,6 +300,10 @@ impl DurableSynchronizer {
             .iter()
             .map(|suite| suite.configuration.key.clone())
             .collect();
+        if keys.is_empty() {
+            cancel.cancelled().await;
+            return;
+        }
         let mut observations = match FairRounds::new(&keys) {
             Ok(rounds) => rounds,
             Err(error) => {
@@ -905,6 +911,7 @@ impl DurableSynchronizer {
             self.jobs.as_deref(),
         )
         .await?;
+        stage_pdiffs(&self.shared, index, &mut candidate, cancel).await?;
         let suite = &self.shared.suites[index];
         let manifest = manifest_from_candidate(&suite.configuration.key, &mut candidate)?;
         let persist_deadline =
@@ -1244,6 +1251,9 @@ async fn stage_inner(
             return Ok(object);
         }
         let canonical = suite_path(&suite.configuration.key, &work.path)?;
+        if ferrum_apt::pdiff::is_patch_path(&work.path) {
+            return download_known(shared, &suite.client, &canonical, identity, work.sha512).await;
+        }
         if suite.configuration.policy.is_pacman() || suite.configuration.policy.is_rpm() {
             return download_known(shared, &suite.client, &canonical, identity, work.sha512).await;
         }
@@ -1408,7 +1418,6 @@ async fn finish(
         return Err(CheckpointError::Proof.into());
     }
     let suite = &shared.suites[index];
-    let deadline = tokio::time::Instant::now() + shared.config.limits.producer_deadline;
     let state = shared.publisher.state(&suite.configuration.key)?;
     if state
         .floor
@@ -1423,6 +1432,7 @@ async fn finish(
             verifier: &shared.verifier,
             origin: &suite.origin,
         };
+        let deadline = tokio::time::Instant::now() + shared.config.limits.producer_deadline;
         let generation = shared
             .publisher
             .recover_suite(
@@ -1439,6 +1449,10 @@ async fn finish(
             shared.config.limits.active_lease,
         )?);
     }
+    stage_pdiffs(shared, index, &mut candidate, cancel).await?;
+    // Optional history acquisition has its own deadline. A timeout there must
+    // not consume the proof/persistence window for the mandatory full indexes.
+    let deadline = tokio::time::Instant::now() + shared.config.limits.producer_deadline;
     let manifest = manifest_from_candidate(&suite.configuration.key, &mut candidate)?;
     // Authenticate every local compressed/derived byte and stream all Packages
     // indexes before any candidate artifact becomes a remote publication input.
@@ -1486,6 +1500,139 @@ async fn finish(
         generation.confirmed_at(),
         shared.config.limits.active_lease,
     )?)
+}
+
+/// PDiff is optional: never publish a partial chain or prevent a valid full-index
+/// generation from advancing because origin history rotated during acquisition.
+async fn stage_pdiffs(
+    shared: &Shared,
+    index: usize,
+    candidate: &mut Candidate,
+    cancel: &CancellationToken,
+) -> Result<(), SyncError> {
+    let policy = &shared.suites[index].configuration.policy;
+    if policy.is_pacman() || policy.is_rpm() {
+        return Ok(());
+    }
+    let (selected, _) = ferrum_apt::selection::select_for_architectures(
+        &candidate.release,
+        policy.components_for_suite(&candidate.release.codename),
+        matches!(
+            policy,
+            ferrum_storage::recovery::TrustPolicy::Ubuntu { .. }
+                | ferrum_storage::recovery::TrustPolicy::UbuntuPorts { .. }
+        ),
+        policy.architectures(),
+    )
+    .map_err(|error| SyncError::Identity(error.to_string()))?;
+    let roots = ferrum_apt::selection::pdiffs(&candidate.release, &selected);
+    let deadline = tokio::time::Instant::now() + shared.config.limits.producer_deadline;
+    let mut budget = ferrum_apt::pdiff::MAX_SUITE_BYTES;
+    for root in roots {
+        let result = tokio::select! {
+            () = cancel.cancelled() => return Err(CheckpointError::Origin.into()),
+            result = tokio::time::timeout_at(deadline,
+                stage_pdiff(shared, index, &candidate.release, root, &mut budget, cancel)) => result,
+        };
+        match result {
+            Ok(Ok(artifacts)) if candidate.artifacts.len() + artifacts.len() <= 8192 => {
+                candidate.artifacts.extend(artifacts);
+            }
+            Ok(Ok(_)) => break,
+            Ok(Err(error)) => {
+                if cancel.is_cancelled() {
+                    return Err(CheckpointError::Origin.into());
+                }
+                tracing::warn!(path = %root.path, %error, "PDiff unavailable; serving full index");
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+async fn stage_pdiff(
+    shared: &Shared,
+    index: usize,
+    release: &Release,
+    root: &ferrum_apt::release::ReleaseEntry,
+    budget: &mut u64,
+    cancel: &CancellationToken,
+) -> Result<Vec<(String, VerifiedObject)>, SyncError> {
+    let expected = ObjectIdentity {
+        sha256: root.sha256.ok_or(CheckpointError::Proof)?,
+        size: root.size,
+    };
+    *budget = budget
+        .checked_sub(expected.size)
+        .ok_or(CheckpointError::Proof)?;
+    let object = stage(
+        shared,
+        index,
+        Work {
+            path: root.path.as_str().to_owned(),
+            expected: Some(expected),
+            sha512: root.sha512,
+        },
+        cancel,
+    )
+    .await?;
+    let bytes = object
+        .read_bounded(ferrum_apt::pdiff::MAX_INDEX_BYTES)
+        .await?;
+    if Sha256Digest::of(&bytes) != expected.sha256 {
+        return Err(CheckpointError::Proof.into());
+    }
+    let base = root
+        .path
+        .as_str()
+        .strip_suffix(".diff/Index")
+        .ok_or(CheckpointError::Proof)?;
+    let path = RepositoryPath::parse_decoded(base).map_err(|_| CheckpointError::Proof)?;
+    let full = release.entry(&path).ok_or(CheckpointError::Proof)?;
+    let pdiff = ferrum_apt::pdiff::Index::parse(
+        &bytes,
+        ObjectIdentity {
+            sha256: full.sha256.ok_or(CheckpointError::Proof)?,
+            size: full.size,
+        },
+    )
+    .map_err(|_| CheckpointError::Proof)?;
+    let mut size = 0u64;
+    for patch in &pdiff.patches {
+        size = size
+            .checked_add(patch.download.size)
+            .and_then(|size| size.checked_add(patch.expanded.size))
+            .ok_or(CheckpointError::Proof)?;
+    }
+    // Debit before downloads, including failed or timed-out closures, so origin
+    // rotation cannot repeatedly consume the suite's optional transfer budget.
+    *budget = budget.checked_sub(size).ok_or(CheckpointError::Proof)?;
+    let mut artifacts = Vec::with_capacity(pdiff.patches.len() + 1);
+    artifacts.push((root.path.as_str().to_owned(), object));
+    for patch in &pdiff.patches {
+        let path = format!("{base}.diff/{}.gz", patch.name);
+        let parsed = RepositoryPath::parse_decoded(&path).map_err(|_| CheckpointError::Proof)?;
+        if let Some(entry) = release.entry(&parsed)
+            && (entry.sha256 != Some(patch.download.sha256) || entry.size != patch.download.size)
+        {
+            return Err(CheckpointError::Proof.into());
+        }
+        let object = stage(
+            shared,
+            index,
+            Work {
+                path: path.clone(),
+                expected: Some(patch.download),
+                sha512: None,
+            },
+            cancel,
+        )
+        .await?;
+        ferrum_storage::recovery::verify_pdiff_patch(&shared.spool, &object, patch).await?;
+        artifacts.push((path, object));
+    }
+    Ok(artifacts)
 }
 
 async fn stage_candidate(

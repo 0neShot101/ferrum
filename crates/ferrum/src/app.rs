@@ -263,6 +263,9 @@ async fn start_inner(
 ) -> anyhow::Result<RunningGateway> {
     config.validate_runtime().context("runtime configuration")?;
     let suites = config.suites().context("fixed suite configuration")?;
+    let trust_suites = config
+        .trust_suites()
+        .context("retained suite trust configuration")?;
     let config = Arc::new(config);
     let limits = config.limits;
     let spool_dir = config.spool_dir();
@@ -353,7 +356,7 @@ async fn start_inner(
         let retained = publisher
             .retained_suites()
             .context("read retained checkpoint suites before changing capture coverage")?;
-        validate_retained_suites(&retained, &suites)?;
+        validate_retained_suites(&retained, &trust_suites)?;
         let capture = Arc::new(
             CaptureManager::new(spool.clone(), Arc::clone(&store)).context("capture manager")?,
         );
@@ -458,7 +461,7 @@ async fn start_inner(
 
     let request_slots = Arc::new(Semaphore::new(limits.request_slots));
     let active_bodies = Arc::new(Semaphore::new(limits.active_bodies));
-    let public_router = server::router(Arc::new(AppState {
+    let app_state = Arc::new(AppState {
         catalog: Arc::clone(&catalog),
         spool: spool.clone(),
         client: Arc::clone(&client),
@@ -479,7 +482,8 @@ async fn start_inner(
         trust_proxy_ip: config.listen.public_host.is_some(),
         request_ids: std::sync::atomic::AtomicU64::new(0),
         prefix: RepositoryPath::parse_decoded(REPOSITORY_PREFIX).context("repository prefix")?,
-    }));
+    });
+    let public_router = server::router(Arc::clone(&app_state));
     let mut workers: JoinSet<anyhow::Result<()>> = JoinSet::new();
     // Complete all fallible construction before spawning any unowned tasks.
     let capture_verifier = match &capture {
@@ -548,7 +552,7 @@ async fn start_inner(
             );
         }
         if let (Some(capture), Some(verifier)) = (&capture, &capture_verifier) {
-            let trusts: Vec<_> = suites
+            let trusts: Vec<_> = trust_suites
                 .iter()
                 .map(|suite| CaptureTrust {
                     key: suite.key.clone(),
@@ -615,6 +619,7 @@ async fn start_inner(
             .map_err(anyhow::Error::msg)?,
     );
     let telemetry = Arc::new(crate::admin::telemetry::TelemetryHub::new());
+    let prewarm = Arc::new(crate::prewarm::Prewarm::new(Arc::clone(&app_state)));
     let health_state = Arc::new(HealthState {
         catalog: Arc::clone(&catalog),
         metrics: Arc::clone(&metrics),
@@ -632,6 +637,7 @@ async fn start_inner(
         request_slots: Some(request_slots),
         active_bodies: Some(active_bodies),
         verifier_version,
+        prewarm: Some(Arc::clone(&prewarm)),
     });
     let sampler_state = Arc::clone(&health_state);
     let sampler_cancel = shutdown.child_token();
@@ -658,13 +664,13 @@ async fn start_inner(
         (&capture, &capture_verifier, &publisher)
         && !capture.coverage_ready().unwrap_or(false)
         && catalog.clock_valid()
-        && suites.iter().any(|suite| {
+        && trust_suites.iter().any(|suite| {
             publisher
                 .state(&suite.key)
                 .is_ok_and(|state| state.floor.is_some())
         })
     {
-        let trusts: Vec<_> = suites
+        let trusts: Vec<_> = trust_suites
             .iter()
             .map(|suite| CaptureTrust {
                 key: suite.key.clone(),
@@ -705,7 +711,7 @@ async fn start_inner(
     #[cfg(feature = "test-harness")]
     let capture_handle = capture.clone();
     if let (Some(capture), Some(verifier)) = (capture, capture_verifier) {
-        let trusts: Vec<_> = suites
+        let trusts: Vec<_> = trust_suites
             .into_iter()
             .map(|suite| CaptureTrust {
                 key: suite.key,
@@ -836,6 +842,7 @@ async fn start_inner(
                 break;
             }
         }
+        prewarm.shutdown().await;
         transports.cancel();
         registry.shutdown().await;
         // Do not abort filesystem/signature work: bounded operations own their
@@ -895,8 +902,8 @@ async fn start_inner(
     })
 }
 
-/// Retained checkpoints still participate in recovery even when their routes are removed.
-/// Refuse that unsupported cutover before capture coverage or verification is cleared.
+/// Retired checkpoints retain their key policy and capture authority across restarts.
+/// Refuse missing trust before reconciliation can alter capture coverage.
 fn validate_retained_suites(
     retained: &[ferrum_storage::checkpoint::SuiteKey],
     suites: &[crate::config::SuiteConfig],
@@ -904,12 +911,22 @@ fn validate_retained_suites(
     for key in retained {
         let repository = key.repository();
         let suite = key.suite();
+        let configured = suites.iter().find(|configured| &configured.key == key);
         anyhow::ensure!(
-            suites.iter().any(|configured| &configured.key == key),
-            "durable.suites omits retained checkpoint {repository}/{suite}; removing a published \
-             suite is not supported: restore this suite to the serving selection; retained \
-             checkpoints and capture coverage have not been cleared",
+            configured.is_some(),
+            "retained checkpoint {repository}/{suite} requires durable.suites or \
+             durable.retired_suites and its original keyring policy; checkpoints and capture \
+             coverage have not been cleared",
         );
+        if let Some(configured) = configured {
+            anyhow::ensure!(
+                std::fs::File::open(configured.policy.keyring())
+                    .and_then(|file| file.metadata())
+                    .is_ok_and(|metadata| metadata.is_file()),
+                "retained checkpoint {repository}/{suite} requires a readable keyring at {}",
+                configured.policy.keyring().display(),
+            );
+        }
     }
     Ok(())
 }
@@ -1141,6 +1158,14 @@ pub async fn sync(
         )
         .context("checkpoint publisher")?,
     );
+    validate_retained_suites(
+        &publisher
+            .retained_suites()
+            .context("read retained checkpoint suites")?,
+        &config
+            .trust_suites()
+            .context("retained suite trust configuration")?,
+    )?;
     let catalog =
         Arc::new(Catalog::configured(configured, Arc::clone(&publisher)).context("suite catalog")?);
     catalog.set_clock_synchronized(true);
@@ -1268,17 +1293,22 @@ mod tests {
     fn retained_suite_selection_rejects_removal_but_allows_additions() {
         let root = tempfile::tempdir().expect("root");
         let config = test_durable_config(root.path(), &root.path().join("state"));
+        std::fs::write(root.path().join("policy.gpg"), b"selection test keyring")
+            .expect("selection keyring");
         let suites = config.suites().expect("configured suites");
         let retained =
             vec![ferrum_storage::checkpoint::SuiteKey::new("debian", "trixie").expect("suite")];
         validate_retained_suites(&retained, &suites).expect("retained suite selected");
         let selected: Vec<_> = suites
-            .into_iter()
+            .iter()
             .filter(|suite| suite.key.suite() != "trixie")
+            .cloned()
             .collect();
         let error =
             validate_retained_suites(&retained, &selected).expect_err("removed retained suite");
         assert!(error.to_string().contains("debian/trixie"));
         validate_retained_suites(&[], &selected).expect("fresh selection");
+        std::fs::remove_file(root.path().join("policy.gpg")).expect("remove retained keyring");
+        assert!(validate_retained_suites(&retained, &suites).is_err());
     }
 }

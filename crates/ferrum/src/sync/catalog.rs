@@ -8,7 +8,7 @@ use ferrum_apt::path::RepositoryPath;
 use ferrum_apt::release::UnixTime;
 use ferrum_storage::checkpoint::{
     CheckpointError, CheckpointPublisher, MetadataDescriptor, MetadataHash, PackageDescriptor,
-    SuiteKey,
+    PackageScope, SuiteKey,
 };
 use ferrum_storage::recovery::VerifiedHistoricalProof;
 
@@ -25,6 +25,7 @@ pub struct Catalog {
     fixture: ArcSwapOption<ActiveView>,
     slots: Vec<SuiteSlot>,
     publisher: Option<Arc<CheckpointPublisher>>,
+    package_scope: Option<PackageScope>,
     last_error: Mutex<Option<String>>,
     clock: Mutex<(Option<UnixTime>, bool)>,
     synchronized: AtomicBool,
@@ -44,6 +45,7 @@ impl Default for Catalog {
             fixture: ArcSwapOption::empty(),
             slots: Vec::new(),
             publisher: None,
+            package_scope: None,
             last_error: Mutex::new(None),
             clock: Mutex::new((None, false)),
             synchronized: AtomicBool::new(true),
@@ -86,7 +88,8 @@ impl Catalog {
         keys: Vec<SuiteKey>,
         publisher: Arc<CheckpointPublisher>,
     ) -> Result<Self, CheckpointError> {
-        if keys.is_empty() || keys.len() > ferrum_storage::checkpoint::MAX_SUITES {
+        let package_scope = PackageScope::new(&keys)?;
+        if keys.len() > ferrum_storage::checkpoint::MAX_SUITES {
             return Err(CheckpointError::Invalid);
         }
         let mut slots: Vec<SuiteSlot> = Vec::with_capacity(keys.len());
@@ -105,13 +108,14 @@ impl Catalog {
         Ok(Self {
             slots,
             publisher: Some(publisher),
+            package_scope: Some(package_scope),
             synchronized: AtomicBool::new(false),
             ..Self::default()
         })
     }
 
     pub fn is_fixture(&self) -> bool {
-        self.slots.is_empty()
+        self.publisher.is_none() && self.slots.is_empty()
     }
     pub fn load(&self) -> Option<Arc<ActiveView>> {
         self.fixture.load_full()
@@ -159,33 +163,39 @@ impl Catalog {
     pub fn publisher(&self) -> Option<&Arc<CheckpointPublisher>> {
         self.publisher.as_ref()
     }
-    pub fn suite_available(&self, view: &ActiveView) -> bool {
+    pub async fn suite_available(&self, view: &ActiveView) -> bool {
         let Some(publisher) = &self.publisher else {
             return true;
         };
         let Ok(key) = SuiteKey::new(&view.repository, &view.suite) else {
             return false;
         };
+        if !self.slots.iter().any(|slot| slot.key == key) {
+            return false;
+        }
         publisher
-            .state(&key)
-            .is_ok_and(|state| !state.blocked && state.pending.is_none() && state.active.is_some())
+            .available_generation(&key)
+            .await
+            .is_ok_and(|generation| generation.is_some())
     }
     /// New requests/readiness must select the handle matching durable activation.
     /// Already held requests may finish on the prior, still-retained generation.
-    pub fn current_view_available(&self, view: &ActiveView) -> bool {
+    pub async fn current_view_available(&self, view: &ActiveView) -> bool {
         let Some(publisher) = &self.publisher else {
             return true;
         };
         let Ok(key) = SuiteKey::new(&view.repository, &view.suite) else {
             return false;
         };
-        publisher.state(&key).is_ok_and(|state| {
-            !state.blocked
-                && state.pending.is_none()
-                && state
-                    .active
-                    .is_some_and(|active| active.generation_id == view.generation_id.to_hex())
-        })
+        if !self.slots.iter().any(|slot| slot.key == key) {
+            return false;
+        }
+        publisher
+            .available_generation(&key)
+            .await
+            .is_ok_and(|generation| {
+                generation.is_some_and(|generation| generation == view.generation_id.to_hex())
+            })
     }
     pub fn clock_valid(&self) -> bool {
         let now = UnixTime::now();
@@ -268,7 +278,14 @@ impl Catalog {
             let publisher = self.publisher.as_ref().ok_or(CheckpointError::Invalid)?;
             let package_path =
                 RepositoryPath::parse_decoded(rest).map_err(|_| CheckpointError::Invalid)?;
-            let Some(package) = publisher.lookup_package(repository, &package_path)? else {
+            let scope = self
+                .package_scope
+                .as_ref()
+                .ok_or(CheckpointError::Invalid)?;
+            let Some(package) = publisher
+                .lookup_package_in(repository, &package_path, scope)
+                .await?
+            else {
                 return Ok(None);
             };
             return Ok(Some(AuthorizedRequest {
@@ -344,7 +361,8 @@ impl Catalog {
                     Err(_) => return Ok(None),
                 },
             };
-            let Some(descriptor) = publisher.lookup_by_hash(&slot.key, directory, hash)? else {
+            let Some(descriptor) = publisher.lookup_by_hash(&slot.key, directory, hash).await?
+            else {
                 return Ok(None);
             };
             let historical = Some(descriptor.proof());
@@ -360,12 +378,12 @@ impl Catalog {
             return Ok(None);
         }
         let view = slot.view.load_full().ok_or(CheckpointError::Proof)?;
-        if !self.current_view_available(&view) {
+        if !self.current_view_available(&view).await {
             return Err(CheckpointError::Conflict);
         }
         let relative =
             RepositoryPath::parse_decoded(&relative).map_err(|_| CheckpointError::Invalid)?;
-        let Some(descriptor) = publisher.lookup_metadata(&slot.key, &relative)? else {
+        let Some(descriptor) = publisher.lookup_metadata(&slot.key, &relative).await? else {
             return Ok(None);
         };
         let proof = descriptor.proof();

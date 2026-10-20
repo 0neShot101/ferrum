@@ -10,7 +10,7 @@ struct UploadPart<'a> {
 impl Production {
     async fn upload_part(
         &self,
-        object: &UploadFile<'_>,
+        object: &VerifiedObject,
         part: UploadPart<'_>,
         class: BudgetClass,
         deadline: Instant,
@@ -40,14 +40,7 @@ impl Production {
                 Ok(())
             })
             .map_err(database)?;
-        let body = ByteStream::read_from()
-            .path(object.path())
-            .offset(offset)
-            .length(Length::Exact(size))
-            .buffer_size(CHUNK)
-            .build()
-            .await
-            .map_err(|_| S3Error::Unavailable)?;
+        let body = body::object_body(object, offset, size)?;
         let _slots = self
             .slot(class == BudgetClass::Control, deadline, cancel)
             .await?;
@@ -100,7 +93,7 @@ impl Production {
     }
     pub(super) async fn multipart(
         &self,
-        object: &UploadFile<'_>,
+        object: &VerifiedObject,
         key: &str,
         class: BudgetClass,
         deadline: Instant,
@@ -242,72 +235,68 @@ impl Production {
         // No part may be sent until the ID and exact key association are durable.
         self.record_upload(key, &id, now()?, object.identity().size, false)?;
         let count = object.identity().size.div_ceil(PART) as i32;
-        let mut parts = Vec::with_capacity(count as usize);
+        let upload = |number| {
+            self.upload_part(
+                object,
+                UploadPart {
+                    key,
+                    upload_id: &id,
+                    number,
+                },
+                class,
+                deadline,
+                cancel,
+            )
+        };
+        let mut pending = futures_util::stream::FuturesUnordered::new();
         let mut number = 1;
-        while number <= count {
-            let result = if number < count {
-                let (first, second) = tokio::join!(
-                    self.upload_part(
-                        object,
-                        UploadPart {
-                            key,
-                            upload_id: &id,
-                            number
-                        },
-                        class,
-                        deadline,
-                        cancel
-                    ),
-                    self.upload_part(
-                        object,
-                        UploadPart {
-                            key,
-                            upload_id: &id,
-                            number: number + 1
-                        },
-                        class,
-                        deadline,
-                        cancel
-                    )
-                );
-                match (first, second) {
-                    (Ok(first), Ok(second)) => {
-                        parts.push(first);
-                        parts.push(second);
-                        Ok(())
+        while number <= count.min(2) {
+            pending.push(upload(number));
+            number += 1;
+        }
+
+        let mut parts = Vec::with_capacity(count as usize);
+        let mut failure = None;
+        let mut uncertain = false;
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(part) => parts.push(part),
+                Err(error) => {
+                    uncertain |= matches!(
+                        error,
+                        S3Error::Timeout | S3Error::Cancelled | S3Error::Unavailable
+                    );
+                    if failure.is_none() {
+                        failure = Some(error);
                     }
-                    (Err(error), _) | (_, Err(error)) => Err(error),
                 }
-            } else {
-                self.upload_part(
-                    object,
-                    UploadPart {
-                        key,
-                        upload_id: &id,
-                        number,
-                    },
-                    class,
-                    deadline,
-                    cancel,
-                )
-                .await
-                .map(|part| parts.push(part))
-            };
-            if let Err(error) = result {
-                if matches!(
+            }
+            if failure.is_none() && number <= count {
+                pending.push(upload(number));
+                number += 1;
+            }
+        }
+
+        if let Some(error) = failure {
+            // Drain started requests before aborting. Timeout/cancellation is
+            // not evidence that the provider stopped a part, so retain its
+            // durable upload ID and liability for later reconciliation.
+            if !uncertain
+                && matches!(
                     error,
                     S3Error::Forbidden
                         | S3Error::Corrupt
                         | S3Error::Unsupported
                         | S3Error::Boundary
-                ) && let Err(abort) = self.abort(key, &id, deadline, cancel).await
-                {
-                    tracing::error!(%abort,"multipart abort deferred to recorded-ID reconciliation");
-                }
-                return Err(error);
+                )
+                && let Err(abort) = self.abort(key, &id, deadline, cancel).await
+            {
+                tracing::error!(%abort, "multipart abort deferred to recorded-ID reconciliation");
             }
-            number += 2;
+            return Err(error);
         }
+        parts.sort_unstable_by_key(CompletedPart::part_number);
+
         let owned = key.to_owned();
         self.transport
             .ledger

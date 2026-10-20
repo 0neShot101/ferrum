@@ -124,6 +124,7 @@ pub fn routes() -> Router<Arc<HealthState>> {
             post(super::settings::post_config_save),
         )
         .route("/api/admin/sync", post(super::jobs::post_sync))
+        .route("/api/admin/prewarm", post(crate::prewarm::post_prewarm))
         .route("/api/admin/jobs", get(super::jobs::get_jobs))
         .route("/api/admin/jobs/{id}", get(super::jobs::get_job_detail))
         .route(
@@ -175,7 +176,10 @@ pub async fn security_boundary(
     } else if !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
-    ) && !(request.uri().path() == "/api/admin/sync"
+    ) && !((request.uri().path() == "/api/admin/sync"
+        || request.uri().path() == "/api/admin/prewarm"
+        || (request.uri().path().starts_with("/api/admin/jobs/")
+            && request.uri().path().ends_with("/cancel")))
         && bearer_token(request.headers()).is_some())
         && !state.admin_http.valid_origin(request.headers())
     {
@@ -206,7 +210,7 @@ fn security_headers(state: &HealthState, mut response: Response) -> Response {
     }
     response
 }
-pub(super) fn error_reply(
+pub(crate) fn error_reply(
     status: StatusCode,
     code: &'static str,
     message: &'static str,
@@ -223,7 +227,7 @@ pub(super) fn error_reply(
     }
     response
 }
-pub(super) fn store_error(error: StoreError) -> Response {
+pub(crate) fn store_error(error: StoreError) -> Response {
     match error {
         StoreError::Unauthorized => error_reply(
             StatusCode::UNAUTHORIZED,

@@ -134,6 +134,15 @@ impl From<S3Error> for FillError {
     }
 }
 
+impl From<ferrum_storage::s3::FetchError> for FillError {
+    fn from(error: ferrum_storage::s3::FetchError) -> Self {
+        match error {
+            ferrum_storage::s3::FetchError::S3(error) => error.into(),
+            ferrum_storage::s3::FetchError::Spool(error) => error.into(),
+        }
+    }
+}
+
 impl From<ferrum_storage::capture::CaptureError> for FillError {
     fn from(error: ferrum_storage::capture::CaptureError) -> Self {
         use ferrum_storage::capture::CaptureError;
@@ -200,16 +209,22 @@ pub(crate) async fn fill_authorized_package(
         mark_producer_source(0);
         return Ok(object);
     }
-    let reservation = spool.reserve(identity.size)?;
-    let mut writer = spool.begin_write(reservation, identity).await?;
-    let mut capture_reservation = None;
     let s3_outcome = if !capture.coverage_ready()? || capture.has_remote_candidate(identity)? {
-        attempt_s3(store, &mut writer, identity, deadline).await
+        store
+            .fetch_verified(spool, identity, deadline, cancel.clone())
+            .await
+            .map_err(FillError::from)
     } else {
         Err(FillError::NotFound)
     };
-    let from_s3 = match s3_outcome {
-        Ok(()) => true,
+    match s3_outcome {
+        Ok((object, fetched)) => {
+            capture
+                .capture_fetched_hit(proof, fetched, deadline, cancel)
+                .await?;
+            mark_producer_source(0);
+            Ok(object)
+        }
         Err(error) => {
             if matches!(error, FillError::Corrupt(_)) {
                 store.quarantine(identity)?;
@@ -221,14 +236,14 @@ pub(crate) async fn fill_authorized_package(
                     | FillError::Timeout
                     | FillError::BackendForbidden
             ) {
-                writer.abort().await;
                 return Err(error);
             }
             // The persistent capture gate also funds future verification and
             // receipt writes; no origin fallback can bypass it.
-            capture_reservation =
-                Some(capture.reserve(proof, ferrum_apt::release::UnixTime::now().as_secs())?);
-            writer.reset().await?;
+            let capture_reservation =
+                capture.reserve(proof, ferrum_apt::release::UnixTime::now().as_secs())?;
+            let reservation = spool.reserve(identity.size)?;
+            let mut writer = spool.begin_write(reservation, identity).await?;
             let mut attempt = 1;
             loop {
                 match attempt_once(client, &mut writer, identity, proof.path()).await {
@@ -244,31 +259,12 @@ pub(crate) async fn fill_authorized_package(
                     }
                 }
             }
-            false
+            let object = writer.commit().await?;
+            drop(capture_reservation);
+            mark_producer_source(1);
+            Ok(object)
         }
-    };
-    let object = match writer.commit().await {
-        Ok(object) => object,
-        Err(error) => {
-            if from_s3
-                && matches!(
-                    error,
-                    SpoolError::Mismatch { .. } | SpoolError::Overflow { .. }
-                )
-            {
-                store.quarantine(identity)?;
-            }
-            return Err(error.into());
-        }
-    };
-    if from_s3 {
-        capture
-            .capture_verified_hit(proof, deadline, cancel)
-            .await?;
     }
-    drop(capture_reservation);
-    mark_producer_source(if from_s3 { 0 } else { 1 });
-    Ok(object)
 }
 
 /// Pacman index records are transport-trusted candidates, not signed metadata.

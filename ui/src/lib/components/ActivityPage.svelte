@@ -138,6 +138,7 @@
 					<option value="">All</option>
 					<option value="sync">Sync</option>
 					<option value="cache_clear">Local cache</option>
+					<option value="prewarm">Package prewarm</option>
 				</select>
 			</label>
 
@@ -206,7 +207,7 @@
 	</div>
 
 	<div class="table-footer">
-		<span>Click any operation ID to inspect per-suite phase and artifact progress.</span>
+		<span>Click an operation ID to inspect targets, package results, and progress.</span>
 		<button
 			class="button"
 			type="button"

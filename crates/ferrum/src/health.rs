@@ -218,6 +218,7 @@ pub struct HealthState {
     pub fills: Option<crate::fetch::FillRegistry>,
     pub request_slots: Option<Arc<tokio::sync::Semaphore>>,
     pub active_bodies: Option<Arc<tokio::sync::Semaphore>>,
+    pub prewarm: Option<Arc<crate::prewarm::Prewarm>>,
 }
 
 #[derive(Serialize)]
@@ -270,80 +271,92 @@ fn classify_suite_alert(
     }
 }
 
-pub(crate) fn suite_health(catalog: &Catalog, clock_valid: bool) -> Vec<SuiteHealth> {
+pub(crate) async fn suite_health(catalog: &Catalog, clock_valid: bool) -> Vec<SuiteHealth> {
     let wall = UnixTime::now();
     let now = Instant::now();
-    catalog
-        .keys()
-        .into_iter()
-        .map(|key| {
-            let view = catalog.load_suite(&key);
-            let persisted = catalog
-                .publisher()
-                .and_then(|publisher| publisher.state(&key).ok());
-            let ready = clock_valid
-                && view.as_ref().is_some_and(|view| {
-                    catalog.current_view_available(view) && view.is_fresh(now, wall)
-                });
-            let checkpoint_status = match &persisted {
-                None => "unavailable",
-                Some(state) if state.blocked => "blocked",
-                Some(state) if state.pending.is_some() => "pending",
-                Some(state) if state.active.is_some() => "active",
-                Some(_) => "missing",
-            };
-            let age = |time: i64| wall.as_secs().saturating_sub(time).max(0);
-            let lease_deadline = view.as_ref().map(|view| {
-                let lease = i64::try_from(view.lease.as_secs()).unwrap_or(i64::MAX);
-                let deadline = view.confirmed_at_unix.as_secs().saturating_add(lease);
-                view.valid_until
-                    .map_or(deadline, |until| deadline.min(until.as_secs()))
+    let keys = catalog.keys();
+    let mut health = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        let view = catalog.load_suite(&key);
+        let persisted = match catalog.publisher() {
+            Some(publisher) => publisher.state_async(&key).await.ok(),
+            None => None,
+        };
+        let ready = clock_valid
+            && view.as_ref().is_some_and(|view| {
+                view.is_fresh(now, wall)
+                    && (catalog.publisher().is_none()
+                        || persisted.as_ref().is_some_and(|state| {
+                            !state.blocked
+                                && state.pending.is_none()
+                                && state.active.as_ref().is_some_and(|active| {
+                                    active.generation_id == view.generation_id.to_hex()
+                                })
+                        }))
             });
-            let lease_remaining_seconds =
-                lease_deadline.map(|deadline| deadline.saturating_sub(wall.as_secs()).max(0));
-            let observed_age_seconds = persisted
+        let checkpoint_status = match &persisted {
+            None => "unavailable",
+            Some(state) if state.blocked => "blocked",
+            Some(state) if state.pending.is_some() => "pending",
+            Some(state) if state.active.is_some() => "active",
+            Some(_) => "missing",
+        };
+
+        let age = |time: i64| wall.as_secs().saturating_sub(time).max(0);
+        let lease_deadline = view.as_ref().map(|view| {
+            let lease = i64::try_from(view.lease.as_secs()).unwrap_or(i64::MAX);
+            let deadline = view.confirmed_at_unix.as_secs().saturating_add(lease);
+            view.valid_until
+                .map_or(deadline, |until| deadline.min(until.as_secs()))
+        });
+        let lease_remaining_seconds =
+            lease_deadline.map(|deadline| deadline.saturating_sub(wall.as_secs()).max(0));
+        let observed_age_seconds = persisted
+            .as_ref()
+            .and_then(|state| state.observed_at)
+            .map(age);
+        let confirmed_age_seconds = persisted
+            .as_ref()
+            .and_then(|state| state.confirmed_at)
+            .map(age);
+        let publication_lag_seconds = persisted
+            .as_ref()
+            .and_then(|state| state.successor_seen_at)
+            .map(age);
+        let last_error: Option<String> = persisted
+            .as_ref()
+            .and_then(|state| state.last_error.as_ref())
+            .map(|error| error.chars().take(256).collect());
+        let alert_state = classify_suite_alert(
+            ready,
+            lease_remaining_seconds,
+            observed_age_seconds,
+            publication_lag_seconds,
+            last_error.as_deref(),
+        );
+
+        health.push(SuiteHealth {
+            repository: key.repository().to_owned(),
+            suite: key.suite().to_owned(),
+            ready,
+            generation_id: view.as_ref().map(|view| view.generation_id.to_hex()),
+            lease_deadline,
+            lease_remaining_seconds,
+            observed_age_seconds,
+            confirmed_age_seconds,
+            publication_lag_seconds,
+            checkpoint_sequence: persisted
                 .as_ref()
-                .and_then(|state| state.observed_at)
-                .map(age);
-            let confirmed_age_seconds = persisted
-                .as_ref()
-                .and_then(|state| state.confirmed_at)
-                .map(age);
-            let publication_lag_seconds = persisted
-                .as_ref()
-                .and_then(|state| state.successor_seen_at)
-                .map(age);
-            let last_error: Option<String> = persisted
-                .as_ref()
-                .and_then(|state| state.last_error.as_ref())
-                .map(|error| error.chars().take(256).collect());
-            let alert_state = classify_suite_alert(
-                ready,
-                lease_remaining_seconds,
-                observed_age_seconds,
-                publication_lag_seconds,
-                last_error.as_deref(),
-            );
-            SuiteHealth {
-                repository: key.repository().to_owned(),
-                suite: key.suite().to_owned(),
-                ready,
-                generation_id: view.as_ref().map(|view| view.generation_id.to_hex()),
-                lease_deadline,
-                lease_remaining_seconds,
-                observed_age_seconds,
-                confirmed_age_seconds,
-                publication_lag_seconds,
-                checkpoint_sequence: persisted
-                    .as_ref()
-                    .and_then(|state| state.floor.as_ref())
-                    .map(|floor| floor.sequence),
-                checkpoint_status,
-                alert_state,
-                last_error,
-            }
-        })
-        .collect()
+                .and_then(|state| state.floor.as_ref())
+                .map(|floor| floor.sequence),
+            checkpoint_status,
+            alert_state,
+            last_error,
+        });
+    }
+
+    health
 }
 
 /// Loopback administration listener. Probes are minimal; detailed routes require authentication.
@@ -369,12 +382,12 @@ async fn healthz() -> Response {
 async fn readyz(State(state): State<Arc<HealthState>>) -> Response {
     let view = state.catalog.load();
     let clock_valid = state.catalog.clock_valid();
-    let suites = suite_health(&state.catalog, clock_valid);
+    let suites = suite_health(&state.catalog, clock_valid).await;
     let ready = if state.catalog.is_fixture() {
         view.as_ref()
             .is_some_and(|view| clock_valid && view.is_fresh(Instant::now(), UnixTime::now()))
     } else {
-        !suites.is_empty() && suites.iter().all(|suite| suite.ready)
+        clock_valid && suites.iter().all(|suite| suite.ready)
     };
     // Metadata can publish before startup capture reconciliation completes.
     // Do not advertise aggregate readiness while cold package admission is closed.
@@ -401,6 +414,7 @@ async fn suite_readyz(State(state): State<Arc<HealthState>>, uri: Uri) -> Respon
     };
     let clock_valid = state.catalog.clock_valid();
     let Some(mut health) = suite_health(&state.catalog, clock_valid)
+        .await
         .into_iter()
         .find(|item| item.repository == repository && item.suite == suite)
     else {
@@ -429,7 +443,7 @@ async fn metrics(State(state): State<Arc<HealthState>>, headers: HeaderMap) -> R
     if let Err(response) = crate::admin::authorize_metrics(&state, &headers).await {
         return response;
     }
-    let text = render_metrics(&state);
+    let text = render_metrics(&state).await;
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -438,7 +452,7 @@ async fn metrics(State(state): State<Arc<HealthState>>, headers: HeaderMap) -> R
         .into_response()
 }
 
-fn render_metrics(state: &HealthState) -> String {
+async fn render_metrics(state: &HealthState) -> String {
     let metrics = &state.metrics;
     let mut text = String::with_capacity(2048);
     for (slot, source) in CACHE_SOURCES.iter().enumerate() {
@@ -608,7 +622,7 @@ fn render_metrics(state: &HealthState) -> String {
         .map_or(0, |view| view.confirmed_at.elapsed().as_secs());
     let _ = writeln!(text, "# TYPE ferrum_active_generation_age_seconds gauge");
     let _ = writeln!(text, "ferrum_active_generation_age_seconds {age}");
-    for suite in suite_health(&state.catalog, state.catalog.clock_valid()) {
+    for suite in suite_health(&state.catalog, state.catalog.clock_valid()).await {
         let repository = &suite.repository;
         let name = &suite.suite;
         let _ = writeln!(
@@ -674,8 +688,8 @@ mod tests {
     use ferrum_storage::checkpoint::SuiteKey;
     use std::time::Duration;
 
-    #[test]
-    fn aggregate_health_keeps_distinct_ubuntu_pockets_and_clock_gating() {
+    #[tokio::test]
+    async fn aggregate_health_keeps_distinct_ubuntu_pockets_and_clock_gating() {
         let pairs = [
             ("debian", "trixie"),
             ("debian", "trixie-updates"),
@@ -701,7 +715,7 @@ mod tests {
             })
             .collect();
         let catalog = Catalog::for_suite_tests(views);
-        let suites = suite_health(&catalog, catalog.clock_valid());
+        let suites = suite_health(&catalog, catalog.clock_valid()).await;
         assert_eq!(suites.len(), 6);
         assert_eq!(suites.iter().filter(|suite| suite.ready).count(), 5);
         for (repository, suite) in pairs {
@@ -715,6 +729,7 @@ mod tests {
         catalog.set_clock_synchronized(false);
         assert!(
             suite_health(&catalog, catalog.clock_valid())
+                .await
                 .iter()
                 .all(|suite| !suite.ready)
         );

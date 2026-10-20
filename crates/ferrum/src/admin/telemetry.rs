@@ -380,6 +380,7 @@ impl Process {
 }
 fn evaluate_alerts(
     state: &HealthState,
+    suites: Vec<crate::health::SuiteHealth>,
     installed: Option<u64>,
     ceiling: Option<u64>,
     admission_open: Option<bool>,
@@ -439,10 +440,7 @@ fn evaluate_alerts(
             "Captured package coverage is not ready.".into(),
         );
     }
-    for suite in crate::health::suite_health(&state.catalog, state.catalog.clock_valid())
-        .into_iter()
-        .take(128)
-    {
+    for suite in suites.into_iter().take(128) {
         if suite.alert_state != "ok" {
             add(
                 format!("mirror.{}.{}", suite.repository, suite.suite),
@@ -475,6 +473,8 @@ pub fn spawn_sampler(
         let mut alert_tracker = AlertTracker::default();
         loop {
             tokio::select! { () = cancel.cancelled() => break, _ = timer.tick() => {} }
+            let suites =
+                crate::health::suite_health(&state.catalog, state.catalog.clock_valid()).await;
             let state_for_read = state.clone();
             let mut next_process = std::mem::take(&mut process);
             let sampled = tokio::task::spawn_blocking(move || {
@@ -490,6 +490,7 @@ pub fn spawn_sampler(
                         .ok();
                 let alerts = evaluate_alerts(
                     &state_for_read,
+                    suites,
                     usage.as_ref().map(|u| u.managed_bytes),
                     usage.as_ref().map(|u| u.objects.ceiling),
                     usage.as_ref().map(|u| u.admission_open),

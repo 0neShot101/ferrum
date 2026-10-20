@@ -62,6 +62,8 @@ pub struct JobView {
     pub evicted_objects: Option<String>,
     pub freed_bytes: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm: Option<crate::prewarm::PrewarmProgress>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -175,6 +177,14 @@ impl JobRegistry {
                         target.error = Some(RESTART_REASON.into()); target.cancellable = false;
                     }
                 }
+                if let Some(progress) = &mut job.prewarm {
+                    for item in &mut progress.items {
+                        if nonterminal(&item.state) {
+                            item.state = "interrupted".into();
+                            item.error = Some(RESTART_REASON.into());
+                        }
+                    }
+                }
                 job.state = "interrupted".into(); job.updated_at = now(); job.error = Some(RESTART_REASON.into()); job.cancellable = false;
                 persist_job(tx, &job)?;
                 audit(tx, &job.actor, "operation.interrupted", &job.id, "interrupted", RESTART_REASON)?;
@@ -185,6 +195,103 @@ impl JobRegistry {
 
     pub async fn snapshot(&self) -> Vec<SuiteJobState> {
         self.inner.lock().await.suites.values().cloned().collect()
+    }
+
+    pub(crate) async fn replay_prewarm(
+        &self,
+        auth: AuthContext,
+        key: String,
+        hash: String,
+    ) -> Result<Option<JobView>, StoreError> {
+        let job = self
+            .admin
+            .read(move |connection| {
+                let user = actor(connection, &auth, Some(Permission::TriggerSync))?;
+                replay_id(connection, &user.id, &key, &hash)?
+                    .map(|id| load_job(connection, &id)?.ok_or(StoreError::Unavailable))
+                    .transpose()
+            })
+            .await?;
+        match job {
+            Some(job) => Ok(Some(self.overlay(job).await)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn admit_prewarm(
+        &self,
+        auth: AuthContext,
+        key: String,
+        hash: String,
+        reason: String,
+        progress: crate::prewarm::PrewarmProgress,
+    ) -> Result<(JobView, bool), StoreError> {
+        let mut inner = self.inner.lock().await;
+        let mut job = new_job("prewarm", &auth, reason, Vec::new());
+        job.prewarm = Some(progress);
+        job.cancellable = true;
+        let (job, replay) = self
+            .insert_intent(auth, Permission::TriggerSync, key, hash, job)
+            .await?;
+        if !replay {
+            inner.jobs.insert(job.id.clone(), job.clone());
+            inner.prune();
+        }
+        Ok((job, replay))
+    }
+
+    pub(crate) async fn record_prewarm(
+        &self,
+        id: &str,
+        progress: crate::prewarm::PrewarmProgress,
+        terminal: bool,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.lock().await;
+        let job = inner.jobs.get_mut(id).ok_or(StoreError::Unavailable)?;
+        let active = nonterminal(&job.state);
+        if active {
+            job.state = if !terminal {
+                "running"
+            } else if progress
+                .items
+                .iter()
+                .all(|item| matches!(item.state.as_str(), "filled" | "cache_hit"))
+            {
+                "succeeded"
+            } else if progress.filled + progress.cache_hits > 0 {
+                "partial"
+            } else if progress.items.iter().all(|item| item.state == "cancelled") {
+                "cancelled"
+            } else {
+                "failed"
+            }
+            .into();
+            job.cancellable = !terminal;
+        }
+        job.prewarm = Some(progress);
+        job.updated_at = now();
+        let recorded = job.clone();
+        let result = self
+            .admin
+            .write(move |tx| {
+                persist_job(tx, &recorded)?;
+                if terminal {
+                    audit(
+                        tx,
+                        &recorded.actor,
+                        "prewarm.outcome",
+                        &recorded.id,
+                        &recorded.state,
+                        &recorded.reason,
+                    )?;
+                }
+                Ok(())
+            })
+            .await;
+        if result.is_err() {
+            job.recording_incomplete = true;
+        }
+        result.map(|()| active)
     }
 
     async fn admit_sync(
@@ -265,7 +372,12 @@ impl JobRegistry {
             for target in &job.targets {
                 tx.execute("INSERT INTO operation_targets(request_id,repository,suite,pass_id,state,body) VALUES(?1,?2,?3,?4,?5,?6)", params![job.id, target.repository, target.suite, target.pass_id, target.state, encode(target)?])?;
             }
-            audit(tx, &user.id, if job.kind == "sync" { "sync.request" } else { "cache.clear" }, &job.id, "intent", &job.reason)?;
+            let action = match job.kind.as_str() {
+                "sync" => "sync.request",
+                "prewarm" => "prewarm.request",
+                _ => "cache.clear",
+            };
+            audit(tx, &user.id, action, &job.id, "intent", &job.reason)?;
             Ok((job, false))
         }).await
     }
@@ -409,8 +521,13 @@ impl JobRegistry {
                 let Some(mut job) = live.or(load_job(tx, &id)?) else {
                     return Ok(None);
                 };
-                if job.kind != "sync" {
+                if job.kind != "sync" && job.kind != "prewarm" {
                     return Err(StoreError::Forbidden);
+                }
+                if job.kind == "prewarm" && nonterminal(&job.state) {
+                    job.state = "cancelled".into();
+                    job.cancellable = false;
+                    job.updated_at = now();
                 }
                 for target in &mut job.targets {
                     if target.state == "queued" && target.cancellable {
@@ -424,10 +541,14 @@ impl JobRegistry {
                 audit(
                     tx,
                     &user.id,
-                    "sync.cancel",
+                    if job.kind == "prewarm" {
+                        "prewarm.cancel"
+                    } else {
+                        "sync.cancel"
+                    },
                     &job.id,
                     &job.state,
-                    "Queued references only; active publication is not cancelled",
+                    "Queued admission cancelled; shared foreground transfers are not cancelled",
                 )?;
                 Ok(Some(job))
             })
@@ -571,6 +692,7 @@ fn new_job(kind: &str, auth: &AuthContext, reason: String, targets: Vec<JobTarge
         evicted_objects: None,
         freed_bytes: None,
         error: None,
+        prewarm: None,
     }
 }
 fn encode<T: Serialize>(value: &T) -> Result<String, StoreError> {
@@ -666,14 +788,14 @@ pub struct SyncTarget {
     pub repository: String,
     pub suite: String,
 }
-fn reason(value: Option<String>, default: &str) -> Result<String, StoreError> {
+pub(crate) fn reason(value: Option<String>, default: &str) -> Result<String, StoreError> {
     let reason = value.unwrap_or_else(|| default.into());
     if reason.trim().is_empty() || reason.len() > 1024 || reason.chars().any(char::is_control) {
         return Err(StoreError::Invalid);
     }
     Ok(reason)
 }
-fn idempotency(headers: &HeaderMap, body: Option<String>) -> Result<String, StoreError> {
+pub(crate) fn idempotency(headers: &HeaderMap, body: Option<String>) -> Result<String, StoreError> {
     let mut values = headers.get_all("x-ferrum-idempotency").iter();
     let header = values
         .next()
@@ -998,7 +1120,7 @@ pub async fn get_jobs(
                 Ok(value) if (1..=100).contains(&value) => limit = value,
                 _ => return store_error(StoreError::Invalid),
             },
-            "kind" if matches!(value.as_ref(), "sync" | "cache_clear") => {
+            "kind" if matches!(value.as_ref(), "sync" | "cache_clear" | "prewarm") => {
                 kind = Some(value.into_owned())
             }
             "state"
@@ -1075,7 +1197,14 @@ pub async fn post_cancel_job(
     }
     tokio::spawn(async move {
         match state.jobs.cancel(auth, id).await {
-            Ok(Some(job)) => Json(serde_json::json!({"job":job})).into_response(),
+            Ok(Some(job)) => {
+                if job.kind == "prewarm"
+                    && let Some(prewarm) = &state.prewarm
+                {
+                    prewarm.cancel(&job.id);
+                }
+                Json(serde_json::json!({"job":job})).into_response()
+            }
             Ok(None) => error_reply(
                 StatusCode::NOT_FOUND,
                 "job_not_found",
@@ -1346,5 +1475,100 @@ mod tests {
         assert_eq!(live.state, "succeeded");
         assert!(live.recording_incomplete);
         assert!(broken.snapshot().await[0].recording_incomplete);
+    }
+
+    fn prewarm_progress() -> crate::prewarm::PrewarmProgress {
+        crate::prewarm::PrewarmProgress {
+            items: vec![crate::prewarm::PrewarmItem {
+                path: "debian/pool/package.deb".into(),
+                bytes: 100,
+                objects: 1,
+                state: "queued".into(),
+                error: None,
+            }],
+            byte_scope: "authenticated admission bytes".into(),
+            planned_bytes: 100,
+            charged_bytes: 0,
+            planned_objects: 1,
+            cache_hits: 0,
+            filled: 0,
+            failed: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn prewarm_replays_intent_and_cancellation_preserves_charges() {
+        let (_root, admin, registry, auth, _) = fixture().await;
+        let (job, replay) = registry
+            .admit_prewarm(
+                auth.clone(),
+                "warm".into(),
+                "a".repeat(64),
+                "Warm package".into(),
+                prewarm_progress(),
+            )
+            .await
+            .unwrap();
+        assert!(!replay);
+        let replay = registry
+            .replay_prewarm(auth.clone(), "warm".into(), "a".repeat(64))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.id, replay.id);
+        let mut progress = prewarm_progress();
+        progress.items[0].state = "running".into();
+        progress.charged_bytes = 100;
+        assert!(
+            registry
+                .record_prewarm(&job.id, progress.clone(), false)
+                .await
+                .unwrap()
+        );
+        let cancelled = registry
+            .cancel(auth, job.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        progress.items[0].state = "cancelled".into();
+        assert!(
+            !registry
+                .record_prewarm(&job.id, progress, true)
+                .await
+                .unwrap()
+        );
+        let stored = stored(&admin, &job.id).await;
+        assert_eq!(stored.state, "cancelled");
+        assert_eq!(stored.prewarm.unwrap().charged_bytes, 100);
+    }
+
+    #[tokio::test]
+    async fn prewarm_restart_interrupts_work_without_replaying_or_refunding_it() {
+        let (_root, admin, registry, auth, _) = fixture().await;
+        let mut progress = prewarm_progress();
+        progress.items[0].state = "running".into();
+        progress.charged_bytes = 100;
+        let (job, _) = registry
+            .admit_prewarm(
+                auth,
+                "restart-warm".into(),
+                "b".repeat(64),
+                "Warm package".into(),
+                progress.clone(),
+            )
+            .await
+            .unwrap();
+        registry
+            .record_prewarm(&job.id, progress, false)
+            .await
+            .unwrap();
+        JobRegistry::reconcile_startup(&admin).await.unwrap();
+        let stored = stored(&admin, &job.id).await;
+        assert_eq!(stored.state, "interrupted");
+        let progress = stored.prewarm.unwrap();
+        assert_eq!(progress.items[0].state, "interrupted");
+        assert_eq!(progress.charged_bytes, 100);
+        assert!(!stored.cancellable);
     }
 }

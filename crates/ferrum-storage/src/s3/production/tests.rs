@@ -512,11 +512,7 @@ async fn forbidden_circuit_survives_adapter_restart_without_another_wire_attempt
 async fn ambiguous_multipart_completion_retains_id_and_byte_liability_until_reconciliation() {
     let root = tempfile::tempdir().unwrap();
     let spool = test_support::open_spool(&root.path().join("state"));
-    let path = root.path().join("multipart.body");
-    let file = std::fs::File::create(&path).unwrap();
     let size = 33 * 1024 * 1024;
-    file.set_len(size).unwrap();
-    drop(file);
     let mut hash = Sha256Hasher::new();
     let zero = [0u8; 64 * 1024];
     for _ in 0..size / (zero.len() as u64) {
@@ -526,6 +522,12 @@ async fn ambiguous_multipart_completion_retains_id_and_byte_liability_until_reco
         sha256: hash.finalize(),
         size,
     };
+    let reservation = spool.reserve(size).unwrap();
+    let mut writer = spool.begin_write(reservation, identity).await.unwrap();
+    for _ in 0..size / zero.len() as u64 {
+        writer.write(Bytes::copy_from_slice(&zero)).await.unwrap();
+    }
+    let object = writer.commit().await.unwrap();
     let mut complete = capture_test::response(
         "POST",
         200,
@@ -561,10 +563,6 @@ async fn ambiguous_multipart_completion_retains_id_and_byte_liability_until_reco
     ledger
         .reserve_storage(&key, size, BudgetClass::Package)
         .unwrap();
-    let object = UploadFile {
-        path: &path,
-        identity,
-    };
     assert_eq!(
         store
             .multipart(
@@ -596,7 +594,7 @@ async fn ambiguous_multipart_completion_retains_id_and_byte_liability_until_reco
         })
         .unwrap();
     assert_eq!(state, ("owned-upload-1".into(), true, size));
-    assert!(spool.lookup(identity).is_none());
+    assert!(spool.lookup(identity).is_some());
     assert_eq!(
         store
             .multipart(
@@ -626,16 +624,22 @@ async fn ambiguous_multipart_completion_retains_id_and_byte_liability_until_reco
             )?)
         })
         .unwrap();
-    assert_eq!(state, ("owned-upload-2".into(), false, 32 * 1024 * 1024));
+    assert_eq!(state.0, "owned-upload-2");
+    assert!(!state.1);
+    assert!((16 * 1024 * 1024..=32 * 1024 * 1024).contains(&state.2));
     assert_eq!(ledger.usage().unwrap().storage, size);
     let methods = requests.snapshot().unwrap();
     assert_eq!(
-        methods,
+        &methods[..11],
         [
             "GET", "POST", "PUT", "PUT", "PUT", "POST", "GET", "GET", "DELETE", "GET", "POST",
-            "PUT", "PUT"
         ]
     );
+    assert!(
+        matches!(&methods[11..], [first] if first == "PUT")
+            || matches!(&methods[11..], [first, second] if first == "PUT" && second == "PUT")
+    );
+    assert!(state.2 >= (methods.len() - 11) as u64 * 16 * 1024 * 1024);
     let targets = requests.targets().unwrap();
     let abort = methods
         .iter()

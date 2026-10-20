@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use ferrum_apt::digest::{ObjectIdentity, Sha256Digest};
 use futures_util::stream::{Stream, StreamExt};
 use tokio::sync::Semaphore;
@@ -113,7 +113,7 @@ impl VerifiedObject {
     /// stream ends.
     ///
     /// Dropping the stream stops further reads; a chunk already handed to the
-    /// blocking pool completes (bounded by one chunk) and is discarded.
+    /// blocking pool completes (bounded by one configured chunk) and is discarded.
     pub fn stream_range(&self, start: u64, end_inclusive: u64) -> Result<ObjectStream, SpoolError> {
         if start > end_inclusive || end_inclusive >= self.size() {
             return Err(SpoolError::InvalidRange);
@@ -125,6 +125,7 @@ impl VerifiedObject {
             object: Arc::clone(&self.0),
             offset: start,
             end,
+            buffer: Bytes::new(),
         };
         let stream = futures_util::stream::unfold(cursor, |mut cursor| async move {
             if cursor.offset >= cursor.end {
@@ -162,6 +163,20 @@ impl VerifiedObject {
         if size == 0 {
             return Ok(Vec::new());
         }
+        if capacity <= self.0.read_chunk {
+            let mut cursor = RangeCursor {
+                object: Arc::clone(&self.0),
+                offset: 0,
+                end: size,
+                buffer: Bytes::new(),
+            };
+            let bytes = cursor.read_next().await?;
+
+            // Release the cursor's alias so conversion transfers the allocation.
+            drop(cursor);
+            return Ok(bytes.into());
+        }
+
         let mut buffer = Vec::with_capacity(capacity);
         let mut stream = self.stream_range(0, size.saturating_sub(1))?;
         while let Some(chunk) = stream.next().await {
@@ -175,36 +190,48 @@ struct RangeCursor {
     object: Arc<ObjectInner>,
     offset: u64,
     end: u64,
+    buffer: Bytes,
 }
 
 impl RangeCursor {
-    async fn read_next(&self) -> Result<Bytes, SpoolError> {
+    async fn read_next(&mut self) -> Result<Bytes, SpoolError> {
         let remaining = self.end.saturating_sub(self.offset);
-        let length = usize::try_from(remaining).map_or(self.object.read_chunk, |remaining| {
-            remaining.min(self.object.read_chunk)
-        });
+        let capacity = self.object.read_chunk;
+        let length =
+            usize::try_from(remaining).map_or(capacity, |remaining| remaining.min(capacity));
+        let previous = std::mem::take(&mut self.buffer);
         let permit = Arc::clone(&self.object.io_permits)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::other("spool I/O pool closed"))?;
         let object = Arc::clone(&self.object);
         let offset = self.offset;
-        self.object
+        self.buffer = self
+            .object
             .io
             .run(permit, move || {
                 let lease = object;
                 #[cfg(test)]
                 super::tests::pause(&lease.hook, "read");
-                read_chunk_at(&lease.file, offset, length)
+                read_chunk_at(&lease.file, offset, length, previous)
             })
-            .await?
+            .await??;
+        Ok(self.buffer.clone())
     }
 }
 
-fn read_chunk_at(file: &File, offset: u64, length: usize) -> Result<Bytes, SpoolError> {
-    let mut buffer = vec![0u8; length];
+fn read_chunk_at(
+    file: &File,
+    offset: u64,
+    length: usize,
+    previous: Bytes,
+) -> Result<Bytes, SpoolError> {
+    // Clones or slices held by a consumer must never be overwritten. Bytes
+    // returns mutable ownership only after the final other view is dropped.
+    let mut buffer = previous.try_into_mut().unwrap_or_else(|_| BytesMut::new());
+    buffer.resize(length, 0);
     file.read_exact_at(&mut buffer, offset)?;
-    Ok(Bytes::from(buffer))
+    Ok(buffer.freeze())
 }
 
 /// Bounded chunk stream over one byte range of a [`VerifiedObject`].

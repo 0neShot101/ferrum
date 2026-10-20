@@ -15,5 +15,6 @@ pub mod fixture_s3;
 pub mod health;
 pub mod http;
 pub mod maintenance;
+pub mod prewarm;
 pub mod server;
 pub mod sync;

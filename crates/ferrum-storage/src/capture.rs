@@ -613,7 +613,7 @@ impl CaptureManager {
         repository: &str,
         path: &RepositoryPath,
     ) -> Result<Option<ObjectIdentity>, CaptureError> {
-        if !self.usage()?.coverage {
+        if !self.coverage_ready()? {
             return Err(CaptureError::Admission);
         }
         let repository = repository.to_owned();
@@ -642,7 +642,7 @@ impl CaptureManager {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<(), CaptureError> {
-        if !self.usage()?.coverage {
+        if !self.coverage_ready()? {
             return Err(CaptureError::Admission);
         }
         let key = self

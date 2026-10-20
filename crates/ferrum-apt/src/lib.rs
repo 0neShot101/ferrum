@@ -7,6 +7,7 @@ pub mod digest;
 pub mod index;
 pub mod pacman;
 pub mod path;
+pub mod pdiff;
 pub mod release;
 pub mod rpm;
 pub mod selection;

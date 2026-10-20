@@ -276,15 +276,21 @@ impl ActiveView {
                 return Err(CheckpointError::Proof);
             }
             if is_pacman || is_rpm || !mutable {
-                let entry = release.entry(&path).ok_or(CheckpointError::Proof)?;
-                if entry.sha256 != Some(identity.sha256) || entry.size != identity.size {
+                if let Some(entry) = release.entry(&path) {
+                    if entry.sha256 != Some(identity.sha256) || entry.size != identity.size {
+                        return Err(CheckpointError::Proof);
+                    }
+                    if !is_pacman && !is_rpm {
+                        for key in alias_keys(artifact.path.as_str(), entry.sha256, entry.sha512) {
+                            descriptors.by_hash.insert(key, object.clone());
+                        }
+                    }
+                } else if is_pacman || is_rpm || !ferrum_apt::pdiff::is_patch_path(path.as_str()) {
                     return Err(CheckpointError::Proof);
                 }
-                if !is_pacman && !is_rpm {
-                    for key in alias_keys(artifact.path.as_str(), entry.sha256, entry.sha512) {
-                        descriptors.by_hash.insert(key, object.clone());
-                    }
-                }
+                // Historical proof verification already checked every patch
+                // against its same-generation authenticated Index. Patches
+                // absent from Release have canonical authority, never aliases.
             }
             let public = if is_rpm {
                 path

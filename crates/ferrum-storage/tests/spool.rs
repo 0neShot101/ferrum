@@ -113,6 +113,44 @@ async fn collect(object: &VerifiedObject, start: u64, end: u64) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn bounded_reads_preserve_size_limits_across_the_chunk_boundary() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+
+    for size in [4095, 4096, 4097] {
+        let expected = payload(size);
+        let object = install(&spool, &expected, 4096).await;
+
+        assert!(matches!(
+            object.read_bounded(size - 1).await,
+            Err(SpoolError::TooLarge)
+        ));
+        assert_eq!(
+            object.read_bounded(size).await.expect("exact bound"),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn bounded_single_chunk_read_rejects_a_truncated_object() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+    let object = install(&spool, &payload(4096), 4096).await;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(object.path())
+        .expect("fixture object")
+        .set_len(4095)
+        .expect("truncate fixture");
+
+    assert!(matches!(
+        object.read_bounded(4096).await,
+        Err(SpoolError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[tokio::test]
 async fn commit_installs_exact_bytes_at_digest_path_and_accounts_them() {
     let root = tempfile::tempdir().expect("tempdir");
     let spool = open(root.path());

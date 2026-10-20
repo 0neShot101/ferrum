@@ -1,7 +1,7 @@
 //! Sibling-prefix publication intents. The selected shared-key profile is NONISOLATED.
 //! CAS validators coordinate writers; only signed artifacts establish content trust.
 mod publication;
-pub use publication::PackageDescriptor;
+pub use publication::{PackageDescriptor, PackageScope};
 mod metadata;
 mod selection;
 use crate::catalog::CatalogError;
@@ -175,9 +175,8 @@ pub struct CheckpointPublisher {
     pub(crate) spool: Spool,
     pub(crate) store: Arc<S3Store>,
     profile: RecoveryProfile,
-    pub(crate) proofs: std::sync::Mutex<
-        std::collections::HashMap<String, Arc<crate::recovery::VerifiedHistoricalProof>>,
-    >,
+    pub(crate) proofs:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<publication::CachedProof>>>,
 }
 impl CheckpointPublisher {
     pub fn new(
@@ -403,6 +402,29 @@ impl CheckpointPublisher {
             .spool
             .durable_catalog()?
             .checkpoint_state(key.clone())?)
+    }
+
+    /// Reads durable suite state without blocking the async request executor.
+    /// A full reader queue fails immediately; cancellation does not cancel admitted SQL.
+    pub async fn state_async(&self, key: &SuiteKey) -> Result<SuiteState, CheckpointError> {
+        Ok(self
+            .spool
+            .durable_catalog()?
+            .checkpoint_state_async(key.clone())
+            .await?)
+    }
+
+    /// Reads the active generation only when durable publication permits serving.
+    /// Callers must separately enforce clock, view freshness, and retention checks.
+    pub async fn available_generation(
+        &self,
+        key: &SuiteKey,
+    ) -> Result<Option<String>, CheckpointError> {
+        Ok(self
+            .spool
+            .durable_catalog()?
+            .checkpoint_available_generation(key.clone())
+            .await?)
     }
 }
 

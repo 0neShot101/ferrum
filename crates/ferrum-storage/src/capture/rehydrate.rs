@@ -2,16 +2,19 @@ use super::{
     CaptureError, CaptureManager, CaptureReceipt, GRACE, VerifiedCaptureProof, put_readback,
 };
 use crate::budget::BudgetClass;
-use crate::s3::{OperationIdentity, S3Error};
+use crate::s3::{OperationIdentity, S3Error, VerifiedFetch};
 use crate::{SpoolError, VerifiedObject};
 use ferrum_apt::digest::ObjectIdentity;
 use futures_util::StreamExt;
 use rusqlite::params;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+#[cfg(test)]
+mod tests;
+
 impl CaptureManager {
     pub fn is_durable(&self, identity: ObjectIdentity) -> Result<bool, CaptureError> {
-        if !self.usage()?.coverage {
+        if !self.coverage_ready()? {
             return Err(CaptureError::Admission);
         }
         Ok(self.spool.capture_is_durable(identity)?)
@@ -40,7 +43,7 @@ impl CaptureManager {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<VerifiedObject, CaptureError> {
-        if !self.usage()?.coverage {
+        if !self.coverage_ready()? {
             return Err(CaptureError::Admission);
         }
         let known = self.spool.durable_catalog()?.read(move |connection| {
@@ -124,6 +127,34 @@ impl CaptureManager {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<CaptureReceipt, CaptureError> {
+        self.capture_hit(proof, None, deadline, cancel).await
+    }
+
+    /// Consumes evidence from a fresh GET through this exact store. The evidence
+    /// replaces only the package readback, never metadata or receipt authority.
+    pub async fn capture_fetched_hit(
+        &self,
+        proof: &VerifiedCaptureProof,
+        fetched: VerifiedFetch,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CaptureReceipt, CaptureError> {
+        self.capture_hit(proof, Some(fetched), deadline, cancel)
+            .await
+    }
+
+    async fn capture_hit(
+        &self,
+        proof: &VerifiedCaptureProof,
+        fetched: Option<VerifiedFetch>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<CaptureReceipt, CaptureError> {
+        let has_fetch = fetched.is_some();
+        if let Some(fetched) = fetched {
+            fetched.consume(&self.store, &self.spool, proof.identity())?;
+        }
+
         if !self.spool.same_owner(&proof.proof.owner) {
             return Err(CaptureError::Proof);
         }
@@ -132,7 +163,7 @@ impl CaptureManager {
             .store
             .capture_path_slot(proof.repository(), proof.path().as_str(), deadline, cancel)
             .await?;
-        if !self.usage()?.coverage {
+        if !self.coverage_ready()? {
             return Err(CaptureError::Admission);
         }
         let identity = proof.identity();
@@ -181,9 +212,11 @@ impl CaptureManager {
         })?;
         if let Some((generation, verified, first)) = previous {
             if verified {
-                self.store
-                    .verify_seed(identity, deadline, cancel.clone())
-                    .await?;
+                if !has_fetch {
+                    self.store
+                        .verify_seed(identity, deadline, cancel.clone())
+                        .await?;
+                }
                 self.spool.catalog_write(move |connection| {
                     connection.execute(
                         "UPDATE capture_blobs SET readback_verified=1 WHERE digest=?1",
@@ -216,9 +249,11 @@ impl CaptureManager {
             let _promoted = self.spool.promote_capture(identity)?;
             return Ok(actual);
         }
-        self.store
-            .verify_seed(identity, deadline, cancel.clone())
-            .await?;
+        if !has_fetch {
+            self.store
+                .verify_seed(identity, deadline, cancel.clone())
+                .await?;
+        }
         let manifest = proof.manifest();
         let _proof_slot = self
             .store

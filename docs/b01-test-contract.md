@@ -674,3 +674,540 @@ The disposable ledger remained certain across Arch/RPM restart: total download a
 Final release SHA-256: `ferrum` = `70d61a83eb57c2306b30163addaf3c3870a3b2b74c3dec92c57a0791d712b594`; `ferrum-verifier` = `a6e68bf5f5fa92acdcd3a1e29ff1163fa8e9bdcba1da9146ce744f5e080d04d4`; root `Cargo.lock` = `85144cf8affdc533d1949b081ee5c763d31fe9505b35d05ca415a8a3454b7304`.
 
 All owned smoke services exited cleanly. The disposable runtime container, signing keys, package fixtures, client scripts, external harness and its package-specific build artifacts were removed. Existing repository fixtures, builder container, shared dependency/release cache and pre-existing state were retained. No commit, push or deployment was performed.
+
+## Local performance and bounded operator features
+
+This qualification used disposable WSL2 Ubuntu state on an Intel Core Ultra 9
+185H (22 visible CPUs), Linux 6.6.87.2, rustc 1.99.1 and local Nginx 1.24.
+It did not access the deployed gateway, provider credentials, production
+allowances or a physical network link.
+
+The retained changes forward vectored writes through `TimedIo`, enable
+`TCP_NODELAY` on accepted public sockets, reuse uniquely owned object-read
+buffers, await bounded catalog-reader replies, shorten proof-cache lock holds,
+reuse exact verified S3-fetch evidence, and keep a rolling multipart window of
+two. Hash/signature verification, receipt checks, durable accounting, read
+leases, write deadlines and provider concurrency limits remain enforced.
+Payload-copy/allocation reductions are implementation findings, not an
+allocator or hardware-cycle profile.
+
+### Paired release measurements
+
+The unchanged source snapshot and final candidate were built into separate
+target directories. Seven alternating before/after pairs used fresh gateway
+processes, warmed object data and the same separate load-generator binary.
+Every HTTP response was checked for exact length and SHA-256. The TLS edge
+verified a private test certificate, disabled proxy buffering and used four
+workers; it was not the deployed Nginx configuration. No builds or other
+qualification jobs ran concurrently with these measurements.
+
+The table reports medians, not peak samples. Bulk means sixteen clients
+requesting 4 MiB objects, 1 GiB total. Single means one client transferring
+256 MiB in 16 MiB objects. Small means thirty-two clients transferring
+256 MiB in 64 KiB objects. Range means 1,024 single-byte requests across
+thirty-two clients; connections were not all pre-established before timing.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Direct HTTP bulk throughput | 46.642 Gbit/s | 47.836 Gbit/s |
+| Direct HTTP bulk gateway CPU | 0.67 s | 0.56 s |
+| Direct HTTP single-client throughput | 14.369 Gbit/s | 15.091 Gbit/s |
+| Direct HTTP small-object throughput | 23.336 Gbit/s | 24.766 Gbit/s |
+| Direct HTTP range p99 completion | 48.008 ms | 0.887 ms |
+| Local TLS bulk throughput | 8.859 Gbit/s | 11.263 Gbit/s |
+| Local TLS bulk gateway CPU, excluding Nginx | 0.77 s | 0.69 s |
+| Local TLS single-client throughput | 6.845 Gbit/s | 6.808 Gbit/s |
+| Local TLS small-object throughput | 8.698 Gbit/s | 9.595 Gbit/s |
+| Local TLS range p99 completion | 26.037 ms | 29.445 ms |
+| ObjectStream serial read, 1 GiB | 333.962 ms | 320.209 ms |
+| ObjectStream four-reader read, 2 GiB | 181.699 ms | 169.536 ms |
+| ObjectStream four readers retaining four chunks, 2 GiB | 192.323 ms | 190.078 ms |
+
+Direct bulk improved in six of seven pairs; single-client HTTP and range
+completion improved in all seven. TLS bulk also improved in six pairs, but
+its sample distribution was variable: the median within-pair throughput gain
+was 8.52%, substantially smaller than the ratio of the two distribution
+medians. TLS single-client and range latency do not establish an improvement.
+Retained-chunk reads were effectively neutral. CPU measurements include the
+initial warm verification request and have process-clock tick granularity.
+Loopback, warm page cache, client hashing and uncontrolled Windows host load
+limit generalization; none of these rates qualify NIC or production capacity.
+
+The directory-fsync cache was removed after shared/random-prefix installation
+measurements showed no reliable gain. The preliminary-eligibility-scan shortcut
+was also removed: all-pinned CLOCK maintenance became 12-24 times slower.
+The final large all-pinned case returned to approximately 5 ms for 10,000
+passes. Final install timings were bimodal in both variants; no install
+speedup is claimed and the original directory durability path is retained.
+
+Raw samples, binary SHA-256 values and archived disposable probe/driver sources
+are local generated artifacts under `fixture/run/performance/`:
+`http-final/report.json`, `tls-final/report.json`, `storage-final.json`,
+`storage-v1.json` and `probe-sources.json`. The permanent
+`crates/ferrum/examples/throughput.rs` harness remains available through
+`cargo run --release -p ferrum --features test-harness --example throughput --`
+with `serve` and `load` subcommands. It is loopback-only and bounded.
+
+### Feature and transfer evidence
+
+The authenticated prewarm smoke invokes the actual CLI and private HTTP API.
+It verifies whole-batch byte-budget refusal, unknown/retired-path refusal
+without origin or remote traffic, one cold fill, a repeat cache hit, and a
+foreground request sharing the fill through operator cancellation. The final
+foreground body matches the signed fixture exactly. Admission-byte charges
+are not wire-byte budgets; the existing provider ledger remains authoritative.
+
+The retirement smoke verifies route and synchronization exclusion while
+retaining capture trust and checkpoint floors, then reactivates the suite.
+Separate spool-reopen tests preserve retained selections and reservations.
+The stock APT 2.7.14 smoke applies a Release-authenticated PDiff to obtain exact
+Packages content, reconstructs authority in a fresh owner, and exercises
+malformed, corrupt, missing and rotated-history full-index fallbacks. An
+optional patch timeout still publishes the mandatory full index.
+
+| Byte-level scenario | Without reuse/diff | With reuse/diff |
+| --- | ---: | ---: |
+| Two S3 capture-adoption cases: full package GETs | 4 | 2 |
+| Same capture cases: package response-body bytes | 132 | 66 |
+| APT fixture: compressed full index versus selected patch | 116,177 bytes | 423 bytes |
+
+The S3 result removes one complete package GET per affected adoption, not half
+of all provider traffic. Corrupt remote content is still rejected even when a
+local object exists. Exact store/spool/object/operation capability boundaries,
+filesystem deadlines, SDK cancellation leases and uncertain multipart sibling
+completion were exercised. The multipart scenario observes at most two active
+parts and dispatches a later part before a deliberately held earlier part
+finishes; no real-provider throughput claim follows from that ordering proof.
+
+### Catalog scheduling
+
+The isolated scheduling benchmark uses one Tokio executor thread, 8,192
+catalog rows, 24 indexed reads per client and three competing workers making
+256 full SQL scans each. Both modes execute identical SQL. Read latency starts
+when a task becomes ready, before spawning or yielding, so it includes
+executor scheduling as well as the SQL queue and execution. Seven alternating
+pairs were measured at each concurrency.
+
+| Median measurement | Blocking replies | Awaitable replies |
+| --- | ---: | ---: |
+| One client, ready-to-result p99 | 1.259 ms | 0.824 ms |
+| Sixteen clients, ready-to-result p99 | 10.370 ms | 5.827 ms |
+| Forty-eight clients, ready-to-result p99 | 24.529 ms | 5.748 ms |
+| Forty-eight clients, scheduler p99 lateness | 13.763 ms | 1.448 ms |
+| Forty-eight clients, complete workload elapsed | 176 ms | 140 ms |
+| One client, complete workload elapsed | 137 ms | 140 ms |
+
+This establishes a concurrency/responsiveness benefit, not a universal
+single-query speedup. `catalog-ready-final.json` contains these measurements;
+the earlier `catalog-final.json` diagnostic timed only the call and omitted
+time ready on the executor, so its call latencies are not end-to-end results.
+Reproduce the corrected benchmark with:
+
+```sh
+FERRUM_CATALOG_MODE=blocking FERRUM_CATALOG_CLIENTS=48 \
+  cargo test --release --locked -p ferrum-storage --features test-harness \
+  catalog_scheduling_benchmark -- --ignored --nocapture
+FERRUM_CATALOG_MODE=awaitable FERRUM_CATALOG_CLIENTS=48 \
+  cargo test --release --locked -p ferrum-storage --features test-harness \
+  catalog_scheduling_benchmark -- --ignored --nocapture
+```
+
+The mixed production-like workload of durable HTTP requests, real metadata
+synchronization and cold capture installs remains separate qualification in
+`ferrum-9d9945032ece35b0`. Neither the isolated SQL workload nor the unsigned
+throughput fixture claims to cover that combination.
+
+### Executed checks
+
+The integrated release run passed **550 tests**, including the explicitly
+enabled catalog benchmark, all 24 signed publication scenarios and all five
+signed HTTP fixture scenarios; none failed or remained ignored. After final
+lint cleanup, the real prewarm CLI/shared-cancellation scenario and the
+retired-catalog/shared-authority scenario passed again. That cleanup grouped
+existing private termination arguments, used a borrowed test key and applied
+the repository's test-only assertion lint convention; it did not change the
+measured HTTP or ObjectStream logic.
+
+With generated signed fixtures, `FERRUM_FIXTURE_PUBLIC`,
+`FERRUM_FIXTURE_PRIVATE`, `FERRUM_VERIFIER` and the verifier's `PATH` configured,
+the completed commands were:
+
+```sh
+cargo test --release --locked --workspace --features test-harness \
+  --no-fail-fast -j 4 -- --include-ignored --test-threads=2
+cargo clippy --release --locked --workspace --all-targets \
+  --features test-harness -j 4 -- -D warnings
+cargo clippy --release --locked --workspace --all-targets -j 4 -- -D warnings
+cargo fmt --all -- --check
+cargo build --release --locked --workspace -j 4
+```
+
+The UI passed `bun run check` without errors or warnings and `bun run build`.
+A real browser session exercised the Activity page's Package prewarm filter
+and completed `GET /api/admin/jobs?kind=prewarm`; populated prewarm Job Detail
+was not separately visually qualified. The final non-test-harness release
+build was restored after the feature test, and its top-level help, prewarm
+run help and verifier version command executed successfully.
+
+Final production binary SHA-256 values:
+
+- `ferrum`: `08c055802289972d120a1f75413cd58546e1ce24985af8df876bab8447cbdafb`
+- `ferrum-verifier`: `27b70898f429cb1c6fd59ef866afbc8517a3f8956cf362b2b82fbeff784f61fd`
+
+Owned smoke services and browser tabs were closed. Disposable probe sources
+and generated TLS private keys were removed after archiving non-secret
+measurement evidence. No commit, push, deployment or production/provider
+state change was performed.
+
+## Follow-up: bounded metadata reads and proxy connection reuse
+
+`VerifiedObject::read_bounded` now transfers the existing buffer into its
+returned `Vec` when the complete object fits in one configured read chunk.
+It uses the same `RangeCursor`, filesystem pool, permit and detached-read
+lease as streaming reads. Dropping the cursor releases its buffer alias before
+the ownership conversion. This avoids the second payload allocation/copy and
+the boxed stream for this case. Empty-object behavior, caller size limits and
+the multi-chunk path remain unchanged. No new dependency or unsafe code was
+introduced.
+
+### Bounded-read measurements
+
+Seven alternating release pairs used four filesystem workers, a 256 KiB read
+chunk, warm local files and exact byte comparison on every returned buffer.
+Timing excludes fixture installation. These are component batch times, not
+network latency or a whole-gateway speedup.
+
+| Object size / readers / total reads | Before median | After median | Elapsed change |
+| --- | ---: | ---: | ---: |
+| 4 KiB / 1 / 8,192 | 423.839 ms | 422.323 ms | -0.36% |
+| 64 KiB / 1 / 4,096 | 221.334 ms | 220.666 ms | -0.30% |
+| 64 KiB / 4 / 8,192 | 125.889 ms | 121.422 ms | -3.55% |
+| 256 KiB / 1 / 2,048 | 156.686 ms | 145.778 ms | -6.96% |
+| 256 KiB / 4 / 4,096 | 91.987 ms | 83.153 ms | -9.60% |
+| 256 KiB + 1 byte / 4 / 4,096 | 144.564 ms | 146.284 ms | +1.19% |
+| 1 MiB / 4 / 512 | 52.180 ms | 53.454 ms | +2.44% |
+
+Both 256 KiB workloads and the concurrent 64 KiB workload improved in all
+seven pairs. Small serial reads were effectively neutral. The multi-chunk
+controls did not improve, so no gain is claimed for them. Raw samples,
+commands and executable hashes are in
+`fixture/run/performance/bounded-reads.json`; the original implementation is
+preserved in `bounded-before.json`, and disposable sources in
+`followup-sources.json`.
+
+### Proxy pooling experiment: not adopted
+
+The existing HTTP/1.1 and cleared Connection header do not themselves enable
+an upstream pool on the measured Nginx 1.24. The
+[Nginx upstream documentation](https://nginx.org/en/docs/http/ngx_http_upstream_module.html#keepalive)
+distinguishes the explicit pool from newer defaults introduced in 1.29.7.
+A candidate pool of sixteen idle connections per worker with a fifteen-second
+idle timeout was tested against the exact same Ferrum executable, using four
+Nginx workers and seven alternating TLS pairs.
+
+| Proxy measurement | Unpooled | Pooled |
+| --- | ---: | ---: |
+| 64 KiB objects, 32 clients, 512 MiB total | 9.880 Gbit/s | 12.113 Gbit/s |
+| Same small-object workload, gateway CPU | 1.36 s | 0.92 s |
+| 4 MiB objects, 16 clients, 2 GiB total | 12.520 Gbit/s | 11.103 Gbit/s |
+| Sequential boundary smoke, backend connections for 100 requests | 100 | 1 |
+
+The small-response and CPU improvements do not justify the measured bulk
+regression for a package gateway. Deployment configuration was not changed.
+The separate real TLS smoke checked escaped request targets, Host and
+per-client IP forwarding, Range, HEAD, 304, private-path exclusion, no cache or
+retry, backend-close reconnection and idle expiry. Its origin was an
+instrumented local HTTP server, not a claim of application authentication.
+The performance runs used the real Ferrum fixture gateway and checked every
+response body. An initial warmup rejected an incorrect harness Host header;
+it was corrected equally for both variants and that failed attempt is not
+counted as a result.
+
+Proxy evidence is in `proxy-pool-final/report.json` and `proxy-smoke.json`
+under `fixture/run/performance/`. Disposable scripts and generated TLS private
+keys were removed after archiving the non-secret evidence.
+
+The bounded-read change passed 216 storage unit tests and 20 spool integration
+tests, including new exact/below/above-chunk size-limit coverage, truncated-file
+rejection and the detached-read cancellation ownership scenario through both
+streaming and bounded-read APIs.
+
+After the change, both signed publication PDiff scenarios passed against the
+real gateway and stock APT: optional-diff timeout still published the full
+index, and successful diff application, recovered authority and full-index
+fallback remained functional. Release Clippy passed for the entire workspace
+and all targets with and without `test-harness`, with warnings denied.
+Workspace formatting passed. A production release workspace build without
+test features succeeded after the smoke runs, and its executable reported
+`ferrum 0.1.0`. No production service or provider state was accessed.
+
+## Follow-up: multi-package upgrades and capture recovery checks
+
+Two fresh Docker containers on the Debian 12 client each upgraded the same
+130 packages from its existing `node:20-bookworm` image. The container-only
+sources used Ferrum over verified HTTPS and retained Debian archive signature
+verification. Each run downloaded 82,940,032 bytes before separately timing
+installation, observed 130 version changes, passed `apt-get check` and an empty
+`dpkg --audit`, and found no pending upgrades afterward.
+
+| Phase | First container | Second fresh container |
+| --- | ---: | ---: |
+| `apt-get update` | 1.081 s | 1.039 s |
+| Download upgrade archives | 6.515 s | 1.077 s |
+| Install already-downloaded archives | 20.638 s | 20.474 s |
+
+This is **not a code A/B**. The initial shared-cache state was mixed/unknown;
+the first run fetched the archives before the second run. Both installation
+phases downloaded zero bytes. The client-side installation dominated, even
+with the faster second download. The second installation interval consumed
+11.203 CPU seconds, read about 507 MB and wrote about 778 MB according to its
+cgroup counters, with no additional CPU quota throttling. These counters do
+not isolate filesystem wait from scheduling or maintainer-script delays.
+
+The image already included Docker's `force-unsafe-io` dpkg configuration.
+The experiment did not add it, and these installation timings must not be
+treated as measurements of a host using all default durability barriers.
+No unsafe-I/O, signature-check, hash-check or trigger-skipping optimization was
+introduced. APT already batches triggers through its
+[dpkg installation implementation](https://github.com/Debian/apt/blob/2.6.1/apt-pkg/deb/dpkgpm.cc#L1730-L1847).
+Faster client storage is a profiling candidate, not a measured recommendation.
+
+### Retained server change
+
+Six coverage-only callers now use the existing `coverage_ready()` singleton
+query rather than `usage()`, which also aggregates the entire pending outbox
+and admission queues. These are capture lookup, completion, durability lookup,
+rehydration, captured hits and upload-worker drain. Admission paths still
+perform their full byte/count accounting. Recovery remains fail-closed.
+
+A disposable release probe called the actual `CaptureManager::lookup` against
+its SQLite catalog and checked the exact returned object identity on every
+iteration. The fixture seeded an already-authenticated mapping and synthetic
+pending outbox rows; it did not claim to measure authentication or uploads.
+Seven alternating before/after pairs, 1,000 lookups per sample, ran without
+concurrent builds or tests. Median time per lookup:
+
+| Pending outbox entries | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| 0 | 103.218 µs | 85.001 µs | 17.65% |
+| 100 | 116.395 µs | 84.691 µs | 27.24% |
+| 5,000 | 743.195 µs | 86.328 µs | 88.38% |
+
+Every case improved in all seven pairs. This removes queue-size-dependent
+overhead from those recovery checks; it is not an equivalent percentage
+improvement in HTTP transfers or complete package upgrades. No end-to-end
+upgrade speedup is claimed for this patch, and it was not deployed.
+
+Raw upgrade logs and version changes are in
+`fixture/run/performance/upgrade-profile-{first,second}.json`; both disposable
+runner sources and resource deltas are in `upgrade-profile-method.json`.
+`capture-lookup.json` contains the lookup probe source and every sample.
+Both Docker containers and their remote temporary reports were removed.
+Disposable source files were removed after archiving.
+
+The existing incomplete-reconciliation regression now also checks lookup,
+durability lookup and rehydration rejection before any remote request or
+download credit. Storage verification passed 216 unit tests and 20 spool
+integration tests; the unrelated ignored catalog benchmark was not rerun.
+
+The signed Arch/Chaotic-AUR publication scenario also passed with the real
+verifier and local origin/provider harness, exercising capture completion,
+eviction, origin-off recovery and forged-receipt rejection. Its first launch
+failed because `ferrum-verifier` was absent from the test process's `PATH`;
+adding the existing release directory to `PATH` resolved that setup failure.
+Workspace formatting and release all-target Clippy with `test-harness` and
+warnings denied passed. The production release workspace build without test
+features succeeded and the resulting executable reported `ferrum 0.1.0`.
+
+## Follow-up: measured complete-command upgrade improvement
+
+The retained changes improve the complete cold-package upgrade command in the
+controlled workload below. They do **not** establish a faster complete
+`apt-get update`. These are code A/B results, not a cold-versus-warm comparison,
+and the changes have not been deployed to the production server.
+
+### Retained changes and safety boundaries
+
+- Storage reservations still perform every qualification, certainty and capacity
+  check, but do not issue an UPSERT when the existing charge and class would not
+  change. New zero-byte reservations, growth and promotion to package storage
+  still write. Shrinking or reclassifying a request cannot reduce its charge.
+- Request-side checkpoint availability uses a cached checkpoint statement
+  without loading unrelated publication scheduling fields. Full intent decoding,
+  blocked/pending checks, current-generation matching and the separate clock,
+  freshness and retention checks remain.
+- Package-index lookup uses one cached LEFT JOIN rather than separately checking
+  readiness and looking up the entry. An unverified index remains an error;
+  a verified index without the requested package remains a normal miss.
+
+The regression checks cover reused reservations at and above the package cap,
+zero-byte class promotion, retained size/class on smaller requests, and rejection
+of a package lookup after its index becomes unverified.
+
+### Final complete-command comparison
+
+The final experiment used 31 predetermined alternating before/after pairs in
+the same disposable Debian 13 CT. Both variants and their clients ran on CPU 10.
+Each variant started with a fresh gateway catalog/spool, APT lists and archives,
+and isolated dpkg root. The same 64 real data-only packages were installed at
+version 1.0 and upgraded to 2.0: 64 MiB of payload and 1,360 files per version.
+The signed package index also contained 4,096 real optional packages.
+
+The timer covered each complete `apt-get update` or `apt-get --yes upgrade`
+process, including download and installation, not selected internal phases.
+Source files and executable pages received equal pre-reading; filesystem sync
+before each timed command was excluded. Command completion used blocking pipe
+collection with a signal deadline, not timeout polling that quantizes exit time.
+There were no concurrent remote benchmarks.
+
+| Complete command | Before median | After median | Reduction of medians | Faster pairs |
+| --- | ---: | ---: | ---: | ---: |
+| `apt-get update` | 24.699 ms | 24.751 ms | -0.21% — not an improvement | 18/31 |
+| `apt-get --yes upgrade` | 2.493854 s | 2.319533 s | 6.99% | 25/31 |
+
+For upgrade, the paired median reduction was 5.80%; its 95% paired bootstrap
+interval was [4.16%, 10.59%], with two-sided sign-test p=0.000878.
+The update interval was [-0.45%, 0.92%], which includes no improvement.
+Bootstrap analysis used 20,000 paired resamples and fixed seed 2119.
+An earlier independent 31-pair comparison of the same retained changes also
+improved upgrades: 2.709956 s to 2.529846 s, with 27/31 faster pairs.
+
+Every final run verified all package versions and every installed payload hash,
+passed `apt-get check` and an empty `dpkg --audit`, and completed exactly 64
+upgrades. The evidence validation checked 168,640 before/after payload-hash
+records and 682 command/service log hashes. Every gateway drained with exit 0,
+capture coverage intact, certain accounting and 64 captured outbox entries.
+Fixture origins were intentionally stopped with SIGTERM after the commands.
+`--no-force-unsafe-io` remained enabled; no triggers, signatures or hashes were
+skipped.
+
+This used the real durable catalog, capture, publication and HTTP paths, but a
+local origin and local stateful S3 test transport. It does not measure WAN
+throughput or prove actual remote S3 durability. The CT's unsynchronized-clock
+status used the explicit test-only operator assertion; real wall-time,
+expiration and rollback checks remained. No host clock or production settings
+were changed.
+
+### Update investigation and rejected work
+
+A bounded first-chunk prefetch experiment reduced header/body writes in an
+actual `writev` trace, but did not measurably accelerate complete updates.
+It was removed, including its temporary test. Its larger validation retained
+all 682 complete cold-list update executions, analyzed as 31 paired blocks
+rather than pretending repeated calls were independent samples.
+
+An untraced CPU profile of the retained build measured median full-update wall
+time of 22.861 ms, APT child-process CPU of 22.219 ms, and gateway CPU of 0.403 ms
+across 11 cold-list calls. Gateway CPU summed all live server threads'
+`/proc/.../schedstat` runtime. This workload leaves little server-side update
+headroom; it is not evidence that arbitrary real-world updates take this long.
+The unproven directory-sync, client compression and PTY experiments were also
+not retained.
+
+### Evidence and verification
+
+All paths below are under `fixture/run/performance/`:
+
+- `command-retained-evidence.tar.gz`: every final result, command log,
+  configuration, workload manifest and CPU-profile record.
+- `command-retained-summary.json`: every paired sample, statistics, binary
+  hashes, analysis source and complete evidence-validation source.
+- `command-durable-{before,after}-source.tar.gz` and
+  `command-method-source.tar.gz`: archived adapter, implementation, generator,
+  runner and profiling sources. The archived legacy runner is provenance only;
+  it is not the isolated final runner and must not be used.
+- `command-durable-evidence.tar.gz` and `command-durable-first-summary.json`:
+  the earlier independent retained-code comparison.
+- `command-blocked-{evidence.tar.gz,summary.json}` and
+  `command-prefetch-first-summary.json`: unsuccessful update experiments,
+  retained rather than discarded from the record.
+
+Final benchmark adapter SHA-256:
+
+```text
+before 726142fe842edf47351f213829bc5616d9a268df6aa833ca4fb9d006fcd12b9f
+after  84c6c84a5cb8905fedfb65107c8a2f633404b60ba0126e75d508bf0c78d546ba
+```
+
+After removing prefetch, workspace release verification passed 527 tests
+(26 opt-in tests ignored), followed by five explicitly selected real-verifier
+publication tests covering retirement, stale metadata, incomplete successors,
+confirmation timing and exact signed bytes. Formatting and release all-target
+Clippy with warnings denied passed. The production workspace built without
+test features, and its executable reported `ferrum 0.1.0`.
+
+The disposable CT 110, remote staging files, local temporary harness/runner,
+staging archives and generated private signing material were removed.
+The measurement/source archives remain. No production deployment or restart
+was performed.
+
+## Follow-up: combined command improvement and client-cache tradeoff
+
+Decision: the user chose to keep APT defaults after reviewing the measured
+tradeoff. The client-cache tuning was not adopted. The retained improvement
+is the SQL-only upgrade result above; no additional server-only update
+improvement is claimed. The combined measurements below document the
+rejected alternative, not the shipped/default configuration.
+
+The retained SQL changes were compared with the original pre-SQL implementation
+in another disposable Debian 13 CT. This comparison also disabled only APT's
+`Dir::Cache::pkgcache` for the after variant; `srcpkgcache` remained enabled.
+It is a combined server-and-client comparison, not attribution of an update
+speedup to Ferrum alone.
+
+The same signed workload upgraded 64 real data-only packages from 1.0 to 2.0,
+with 64 MiB and 1,360 payload files per version, plus 4,096 additional real
+packages in the index. Each of 31 alternating pairs used fresh package,
+APT-list and gateway state, pinned to CPU 9. Timings include complete command
+startup and exit. Signatures, hashes, freshness, limits, triggers and dpkg
+durable I/O remained enabled.
+
+| Complete command | Before median | After median | Median time reduction | Faster pairs |
+| --- | ---: | ---: | ---: | ---: |
+| `apt-get update` | 24.755 ms | 24.140 ms | 2.48% | 24/31 |
+| `apt-get upgrade` | 2.574568 s | 2.346961 s | 8.84% | 26/31 |
+
+Paired median reductions were 2.00% for update and 9.72% for upgrade.
+Their 20,000-resample bootstrap 95% intervals were [0.33%, 3.43%] and
+[6.51%, 13.01%], respectively; two-sided sign-test p-values were 0.00333
+and 0.000192. The earlier SQL-only result remains the server-only evidence.
+These are local-origin/local-S3-test-transport results, not WAN measurements
+or a guarantee for a full distribution upgrade.
+
+A separate seven-pair check retained lists for a second update. All seven
+second updates were faster with the combined configuration; median time
+was 15.779 ms before and 15.192 ms after. Its first-update result was
+inconclusive, and it is not pooled into the 31-pair result.
+
+The client-cache setting has a real cost. On the existing Debian 12 client,
+nine read-only `apt-cache policy bash` queries per variant had identical
+output but median startup times of 11.765 ms with defaults, 26.054 ms with
+only `pkgcache` disabled, and 217.612 ms with both binary caches disabled.
+[APT documents this startup tradeoff](https://manpages.debian.org/bookworm/apt/apt.conf.5.en.html#DIRECTORIES).
+No persistent client setting was changed. This is not an unconditional
+recommendation to disable caches.
+
+The alternative server-side metadata-admission optimization was rejected:
+12,524 complete updates across two reversed-assignment experiments did not
+show a reproducible gain. Its production change and temporary test were
+removed, preserving the existing availability checks.
+
+Evidence under `fixture/run/performance/`:
+
+- `combined-cache-evidence.tar.gz`: all final runs, exploratory cache runs,
+  warm-list check, exact configurations, signed-workload manifests and logs.
+- `combined-cache-summary.json`: paired samples, statistics, binary hashes
+  and validation method. All 62 final updates and 62 upgrades passed, with
+  168,640 payload-hash records and 682 log hashes checked.
+- `combined-cache-source.tar.gz`: retained implementation and exact command
+  runners; `command-durable-before-source.tar.gz` supplies original SQL code.
+- `client-cache-query-{summary,method}.json`: real-client tradeoff and method.
+- `update-admission-{evidence.tar.gz,source.tar.gz,summary.json}`: rejected
+  server experiment, including both assignment orders.
+
+The current production workspace was rebuilt without test features;
+`ferrum --version` reported `ferrum 0.1.0`, and formatting passed.
+The newly created CT 110, owned remote staging files, temporary harnesses,
+isolated baseline source and generated private signing material were removed.
+Existing CTs 114 and 125 were left running. Both SSH sessions were closed.
+No production deployment or restart was performed.

@@ -436,11 +436,45 @@ export interface JobTarget extends SyncTarget {
 	supersededGenerationIds: string[];
 }
 
-/** Durable synchronization or cache maintenance job. */
+/** One explicitly requested authenticated package in a prewarm job. */
+export interface PrewarmItem {
+	/** Repository-qualified package path. */
+	path: string;
+	/** Conservative authenticated package/signature byte charge (at most 8 GiB). */
+	bytes: number;
+	/** Package plus any required detached signature. */
+	objects: number;
+	/** Package lifecycle or outcome, including `cache_hit` and `filled`. */
+	state: string;
+	/** Bounded failure or cancellation explanation. */
+	error: string | null;
+}
+
+/** Bounded package prewarming progress, persisted with the operation job. */
+export interface PrewarmProgress {
+	/** Explicit package paths and individual results. */
+	items: PrewarmItem[];
+	/** Explains admission byte accounting versus provider transfer accounting. */
+	byteScope: string;
+	/** Total authenticated admission byte reservation (at most 8 GiB). */
+	plannedBytes: number;
+	/** Dispatched byte charges, never refunded on cancellation or failure. */
+	chargedBytes: number;
+	/** Planned package/signature object count (at most 128). */
+	plannedObjects: number;
+	/** Successfully verified already-resident packages. */
+	cacheHits: number;
+	/** Successfully filled packages. */
+	filled: number;
+	/** Failed package requests, excluding operator cancellation. */
+	failed: number;
+}
+
+/** Durable synchronization, package prewarm, or cache maintenance job. */
 export interface OperationJob {
 	/** Unique operation job identifier. */
 	id: string;
-	/** Operation kind (`sync` or `cache_clear`). */
+	/** Operation kind (`sync`, `prewarm`, or `cache_clear`). */
 	kind: string;
 	/** Aggregate state (`queued`, `running`, `succeeded`, `partial`, `failed`, `cancelled`, `interrupted`). */
 	state: string;
@@ -464,6 +498,8 @@ export interface OperationJob {
 	cancellable?: boolean;
 	/** Top-level error summary, if any. */
 	error?: string | null;
+	/** Explicit package results and bounded admission accounting for prewarm jobs. */
+	prewarm?: PrewarmProgress | null;
 }
 
 /** Live per-suite state reported by the synchronizer actor. */

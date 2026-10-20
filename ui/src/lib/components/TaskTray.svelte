@@ -79,6 +79,13 @@
 
 	const jobProgressPercent = (job: OperationJob): number => {
 		if (job.state === 'succeeded') return 100;
+		if (job.prewarm !== undefined && job.prewarm !== null) {
+			const finished = job.prewarm.items.reduce(
+				(count, item) => count + Number(item.state !== 'queued' && item.state !== 'running'),
+				0
+			);
+			return Math.min(100, Math.max(10, Math.round((finished / job.prewarm.items.length) * 100)));
+		}
 		if (job.targets.length === 0) return job.state === 'running' ? 50 : 15;
 		const finished = job.targets.filter(
 			(target) =>
@@ -221,10 +228,14 @@
 										closeTray();
 									}}
 								>
-									{job.kind === 'cache_clear' ? 'Local cache clear' : 'Mirror sync'} ·
-									{job.targets.length > 0
-										? `${job.targets.length} ${job.targets.length === 1 ? 'suite' : 'suites'}`
-										: job.id.slice(0, 10)}
+									{job.kind === 'prewarm'
+										? 'Package prewarm'
+										: job.kind === 'cache_clear' ? 'Local cache clear' : 'Mirror sync'} ·
+									{job.prewarm !== undefined && job.prewarm !== null
+										? `${job.prewarm.items.length} packages`
+										: job.targets.length > 0
+											? `${job.targets.length} ${job.targets.length === 1 ? 'suite' : 'suites'}`
+											: job.id.slice(0, 10)}
 								</button>
 								<StatusBadge tone={badgeTone(job.state)} label={job.state} />
 							</div>
@@ -239,6 +250,11 @@
 
 							{#if job.kind === 'cache_clear' && job.freedBytes !== undefined && job.freedBytes !== null}
 								<p class="muted">Reclaimed {formatBytes(job.freedBytes)}</p>
+							{:else if job.prewarm !== undefined && job.prewarm !== null}
+								<p class="muted">
+									{job.prewarm.filled} filled · {job.prewarm.cacheHits} cache hits ·
+									{job.prewarm.failed} failed
+								</p>
 							{:else if job.targets.length > 0}
 								<p class="muted break-word">
 									{job.targets
@@ -254,14 +270,14 @@
 							<div class="row-between task-item-footer">
 								<small class="muted">{formatTimestamp(job.updatedAt)}</small>
 								<div class="toolbar">
-									{#if canCancel && job.targets.some((target) => target.state === 'queued')}
+									{#if canCancel && job.cancellable === true}
 										<button
 											type="button"
 											class="button is-danger"
 											disabled={busyId === job.id}
 											onclick={() => handleCancel(job.id)}
 										>
-											Cancel queued
+											{job.kind === 'prewarm' ? 'Cancel prewarm' : 'Cancel queued'}
 										</button>
 									{/if}
 									<button

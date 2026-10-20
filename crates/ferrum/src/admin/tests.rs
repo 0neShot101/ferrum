@@ -58,6 +58,7 @@ impl Fixture {
             fills: None,
             request_slots: Some(Arc::new(tokio::sync::Semaphore::new(1024))),
             active_bodies: Some(Arc::new(tokio::sync::Semaphore::new(256))),
+            prewarm: None,
             verifier_version: "route-test".into(),
         });
         Self { root, state }
@@ -129,6 +130,63 @@ async fn body(response: Response) -> Value {
             .expect("bounded body"),
     )
     .expect("JSON")
+}
+
+#[tokio::test]
+async fn prewarm_and_cancel_require_private_control_authority_without_browser_origin() {
+    let _serial = super::password::TEST_LOCK.lock().await;
+    let fixture = Fixture::new();
+    let payload = json!({
+        "paths": ["debian/pool/main/f/fixture/fixture_1_all.deb"],
+        "maxBytes": 1024,
+        "maxObjects": 1,
+        "timeoutSeconds": 30,
+        "concurrency": 1
+    });
+    let token = fixture.secret("control.token");
+    let invalid = fixture
+        .request(
+            "POST",
+            "/api/admin/prewarm",
+            payload.clone(),
+            None,
+            None,
+            None,
+            HOST,
+            Some(&"0".repeat(64)),
+        )
+        .await;
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+
+    // A valid token reaches the unavailable durable controller rather than a
+    // browser-origin rejection or an unsigned local fill fallback.
+    let unavailable = fixture
+        .request(
+            "POST",
+            "/api/admin/prewarm",
+            payload,
+            None,
+            None,
+            None,
+            HOST,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let unknown = fixture
+        .request(
+            "POST",
+            &format!("/api/admin/jobs/{}/cancel", "1".repeat(64)),
+            json!({}),
+            None,
+            None,
+            None,
+            HOST,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 }
 #[tokio::test]
 async fn exact_origin_host_and_csrf_protect_logout_and_revocation() {

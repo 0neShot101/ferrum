@@ -24,7 +24,7 @@ impl UploadWorker {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> Result<UploadReport, CaptureError> {
-        if !self.manager.usage()?.coverage {
+        if !self.manager.coverage_ready()? {
             return Err(CaptureError::ReconciliationPending);
         }
         let now = crate::s3::production_now()?;

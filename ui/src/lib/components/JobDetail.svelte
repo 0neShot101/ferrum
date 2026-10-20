@@ -45,7 +45,10 @@
 	};
 
 	const badgeTone = (state: string): 'ok' | 'warn' | 'danger' | 'neutral' => {
-		if (state === 'succeeded' || state === 'published' || state === 'renewed') return 'ok';
+		if (
+			state === 'succeeded' || state === 'published' || state === 'renewed' ||
+			state === 'filled' || state === 'cache_hit'
+		) return 'ok';
 		if (state === 'running' || state === 'queued' || state === 'partial') return 'warn';
 		if (state === 'failed' || state === 'rejected' || state === 'interrupted') return 'danger';
 		return 'neutral';
@@ -104,6 +107,42 @@
 			</p>
 		{/if}
 
+		{#if job.prewarm !== undefined && job.prewarm !== null}
+			<p class="notice">
+				{job.prewarm.filled} filled, {job.prewarm.cacheHits} cache hits,
+				{job.prewarm.failed} failed.
+				Charged {formatBytes(job.prewarm.chargedBytes)} of
+				{formatBytes(job.prewarm.plannedBytes)} planned admission bytes across
+				{job.prewarm.plannedObjects} package/signature objects.
+			</p>
+			<p class="muted">
+				{job.prewarm.byteScope}. Cancellation stops background admission and unshared
+				transfers; a fill joined by a foreground client may finish.
+			</p>
+			<div class="table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>Package path</th>
+							<th>State</th>
+							<th>Admission bytes</th>
+							<th>Details</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each job.prewarm.items as item (item.path)}
+							<tr>
+								<td class="mono break-word">{item.path}</td>
+								<td><StatusBadge tone={badgeTone(item.state)} label={item.state} /></td>
+								<td>{formatBytes(item.bytes)}</td>
+								<td class="break-word">{item.error ?? ''}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/if}
+
 		{#if job.targets.length > 0}
 			<div class="table-wrap">
 				<table>
@@ -153,7 +192,7 @@
 			</div>
 		{/if}
 
-		{#if canCancel && job.targets.some((target) => target.state === 'queued')}
+		{#if canCancel && job.cancellable === true}
 			<div class="toolbar">
 				<button
 					class="button is-danger"
@@ -161,7 +200,7 @@
 					disabled={busy}
 					onclick={handleCancel}
 				>
-					Cancel queued targets
+					{job.kind === 'prewarm' ? 'Cancel prewarm' : 'Cancel queued targets'}
 				</button>
 			</div>
 		{/if}

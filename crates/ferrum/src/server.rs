@@ -43,6 +43,13 @@ use crate::http::{BodyPermits, BodyStream};
 use crate::sync::view::{ActiveView, DerivedDescriptor};
 use crate::sync::{CacheClass, Catalog, Resolution};
 
+mod prewarm;
+
+pub(crate) use prewarm::{PreparedWarm, prepare_warm, warm_package};
+
+#[cfg(test)]
+mod socket_tests;
+
 tokio::task_local! {
     pub(crate) static REQUEST_SOURCE: std::cell::Cell<usize>;
     static REQUEST_REPOSITORY: usize;
@@ -163,6 +170,13 @@ pub async fn serve(
             drop(stream);
             continue;
         };
+
+        // Separate headers and a small body must not wait for a delayed ACK.
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%error, "cannot configure accepted socket");
+            continue;
+        }
+
         let service = TowerToHyperService::new(
             router
                 .clone()
@@ -245,6 +259,24 @@ impl AsyncWrite for TimedIo {
         buffer: &[u8],
     ) -> Poll<io::Result<usize>> {
         match Pin::new(&mut self.inner).poll_write(context, buffer) {
+            Poll::Pending => self.pending_or_timeout(context),
+            ready => {
+                self.write_timer = None;
+                ready
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write_vectored(context, buffers) {
             Poll::Pending => self.pending_or_timeout(context),
             ready => {
                 self.write_timer = None;
@@ -465,7 +497,7 @@ async fn pipeline(
     let (class, reply) = match authorized.resolution {
         Resolution::Unknown => (RequestClass::Other, response::error(StatusCode::NOT_FOUND)),
         Resolution::Metadata { object, class } => {
-            if class.requires_freshness() && !fresh_view(state, view.as_deref()) {
+            if class.requires_freshness() && !fresh_view(state, view.as_deref()).await {
                 return (
                     RequestClass::Metadata,
                     validated_path,
@@ -473,7 +505,7 @@ async fn pipeline(
                 );
             }
             let reply = serve_verified(state, &valid, headers, slot, &object, class).await;
-            if class.requires_freshness() && !fresh_view(state, view.as_deref()) {
+            if class.requires_freshness() && !fresh_view(state, view.as_deref()).await {
                 return (
                     RequestClass::Metadata,
                     validated_path,
@@ -488,7 +520,7 @@ async fn pipeline(
             (RequestClass::ByHash, reply)
         }
         Resolution::Derived { descriptor, class } => {
-            if class.requires_freshness() && !fresh_view(state, view.as_deref()) {
+            if class.requires_freshness() && !fresh_view(state, view.as_deref()).await {
                 return (
                     RequestClass::Metadata,
                     validated_path,
@@ -497,7 +529,7 @@ async fn pipeline(
             }
             let reply =
                 serve_derived(state, client_ip, &valid, headers, slot, &descriptor, class).await;
-            if class.requires_freshness() && !fresh_view(state, view.as_deref()) {
+            if class.requires_freshness() && !fresh_view(state, view.as_deref()).await {
                 return (
                     RequestClass::Metadata,
                     validated_path,
@@ -530,11 +562,12 @@ async fn pipeline(
                 };
                 Arc::clone(client)
             };
-            let proof = match package
-                .as_ref()
-                .map(PackageDescriptor::authorize)
-                .transpose()
-            {
+            let authorized = match package.as_ref() {
+                Some(package) => package.authorize().await.map(Some),
+                None => Ok(None),
+            };
+
+            let proof = match authorized {
                 Ok(proof) => proof.map(Arc::new),
                 Err(error) => {
                     return (
@@ -618,7 +651,7 @@ async fn resolve_package_signature(
         .find(|(name, _)| name == repository)
         .map(|(_, client)| Arc::clone(client))
         .ok_or(FillError::Admission)?;
-    let proof = Arc::new(package.authorize()?);
+    let proof = Arc::new(package.authorize().await?);
     let capture = state.capture.as_ref().ok_or(FillError::Admission)?;
     match state
         .registry
@@ -643,11 +676,16 @@ async fn resolve_package_signature(
     Ok(resolved.and_then(|resolved| resolved.package))
 }
 
-fn fresh_view(state: &AppState, view: Option<&ActiveView>) -> bool {
-    state.catalog.clock_valid()
-        && view.is_some_and(|view| {
-            state.catalog.suite_available(view) && view.is_fresh(Instant::now(), UnixTime::now())
-        })
+async fn fresh_view(state: &AppState, view: Option<&ActiveView>) -> bool {
+    if !state.catalog.clock_valid() {
+        return false;
+    }
+
+    let Some(view) = view else {
+        return false;
+    };
+
+    state.catalog.suite_available(view).await && view.is_fresh(Instant::now(), UnixTime::now())
 }
 
 struct PackageRequest {

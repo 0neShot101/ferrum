@@ -386,43 +386,52 @@ async fn verified_handle_keeps_exclusive_ownership_after_spool_drop() {
 
 #[tokio::test]
 async fn detached_read_keeps_lock_and_accounting_until_its_handle_closes() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let spool = open(root.path());
-    let object = writer(&spool, b"verified")
-        .await
-        .commit()
-        .await
-        .expect("commit");
-    let lifetime = Arc::downgrade(&spool.0.lifetime);
-    let permits = Arc::clone(spool.0.io_permits());
-    let mut gate = Gate::arm(&spool, "read");
-    let mut stream = object.stream_range(0, 7).expect("range");
-    let task = tokio::spawn(async move { stream.next().await });
-    gate.entered().await;
-    task.abort();
-    assert!(task.await.expect_err("cancelled read").is_cancelled());
-    drop(object);
-    drop(spool);
-    assert!(matches!(
-        Spool::open_exclusive_fixture(config(root.path())),
-        Err(SpoolError::NotExclusive(_))
-    ));
-    assert_eq!(
-        lock_unpoisoned(&lifetime.upgrade().expect("detached lease").ledger)
-            .snapshot()
-            .installed,
-        8
-    );
-    gate.release();
-    drop(
-        permits
-            .acquire_many_owned(2)
+    for bounded in [false, true] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let spool = open(root.path());
+        let object = writer(&spool, b"verified")
             .await
-            .expect("detached read finished"),
-    );
-    assert!(lifetime.upgrade().is_none());
-    let reopened = open(root.path());
-    assert_eq!(reopened.accounting().installed, 0);
+            .commit()
+            .await
+            .expect("commit");
+        let lifetime = Arc::downgrade(&spool.0.lifetime);
+        let permits = Arc::clone(spool.0.io_permits());
+        let mut gate = Gate::arm(&spool, "read");
+        let reader = object.clone();
+        let task = tokio::spawn(async move {
+            if bounded {
+                reader.read_bounded(8).await.map(|_| ())
+            } else {
+                let mut stream = reader.stream_range(0, 7).expect("range");
+                stream.next().await.transpose().map(|_| ())
+            }
+        });
+        gate.entered().await;
+        task.abort();
+        assert!(task.await.expect_err("cancelled read").is_cancelled());
+        drop(object);
+        drop(spool);
+        assert!(matches!(
+            Spool::open_exclusive_fixture(config(root.path())),
+            Err(SpoolError::NotExclusive(_))
+        ));
+        assert_eq!(
+            lock_unpoisoned(&lifetime.upgrade().expect("detached lease").ledger)
+                .snapshot()
+                .installed,
+            8
+        );
+        gate.release();
+        drop(
+            permits
+                .acquire_many_owned(2)
+                .await
+                .expect("detached read finished"),
+        );
+        assert!(lifetime.upgrade().is_none());
+        let reopened = open(root.path());
+        assert_eq!(reopened.accounting().installed, 0);
+    }
 }
 
 #[tokio::test]
@@ -505,4 +514,198 @@ fn physical_capacity_query_failure_does_not_admit_or_charge_bytes() {
     assert!(matches!(spool.reserve(8), Err(SpoolError::Io(_))));
     assert_eq!(spool.accounting().reserved, 0);
     assert_eq!(spool.accounting().installed, 0);
+}
+
+#[tokio::test]
+async fn retained_chunk_views_and_concurrent_ranges_are_never_overwritten() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+    let object = writer(&spool, b"01234567abcdefghABCDEFGH")
+        .await
+        .commit()
+        .await
+        .expect("commit");
+    let mut first = object.stream_range(0, 23).expect("first range");
+    let mut second = object.stream_range(4, 19).expect("second range");
+    let retained = first.next().await.expect("first").expect("read");
+    let view = retained.slice(2..6);
+    let clone = retained.clone();
+    drop(retained);
+
+    let (next, other) = tokio::join!(first.next(), second.next());
+    let next = next.expect("next").expect("read");
+    let other = other.expect("other").expect("read");
+    assert_eq!(&next[..], b"abcdefgh");
+    assert_eq!(&other[..], b"4567abcd");
+    assert_eq!(&view[..], b"2345");
+    assert_eq!(&clone[..], b"01234567");
+    drop(next);
+    drop(other);
+
+    assert_eq!(
+        &first.next().await.expect("last").expect("read")[..],
+        b"ABCDEFGH"
+    );
+    assert_eq!(
+        &second.next().await.expect("last").expect("read")[..],
+        b"efghABCD"
+    );
+    assert_eq!(&view[..], b"2345");
+    assert_eq!(&clone[..], b"01234567");
+    assert!(first.next().await.is_none());
+    assert!(second.next().await.is_none());
+}
+
+#[tokio::test]
+async fn short_read_emits_one_error_without_exposing_reused_bytes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+    let object = writer(&spool, b"01234567abcdefghABCDEFGH")
+        .await
+        .commit()
+        .await
+        .expect("commit");
+    let mut stream = object.stream_range(0, 23).expect("range");
+    let first = stream.next().await.expect("first").expect("read");
+    assert_eq!(&first[..], b"01234567");
+    drop(first);
+
+    fs::OpenOptions::new()
+        .write(true)
+        .open(object.path())
+        .expect("fault injection descriptor")
+        .set_len(12)
+        .expect("inject short read");
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(SpoolError::Io(error))) if error.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+    assert!(stream.next().await.is_none());
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn cancelled_sdk_body_keeps_lease_until_the_detached_read_finishes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+    let object = writer(&spool, b"verified")
+        .await
+        .commit()
+        .await
+        .expect("commit");
+    let lifetime = Arc::downgrade(&spool.0.lifetime);
+    let permits = Arc::clone(spool.0.io_permits());
+    let mut body = crate::s3::object_body_for_test(&object, 0, 8).expect("valid upload range");
+    let mut gate = Gate::arm(&spool, "read");
+    let task = tokio::spawn(async move { body.next().await });
+    gate.entered().await;
+    task.abort();
+    assert!(task.await.expect_err("cancelled SDK body").is_cancelled());
+    drop(object);
+    drop(spool);
+
+    assert!(matches!(
+        Spool::open_exclusive_fixture(config(root.path())),
+        Err(SpoolError::NotExclusive(_))
+    ));
+    assert_eq!(
+        lock_unpoisoned(&lifetime.upgrade().expect("detached lease").ledger)
+            .snapshot()
+            .installed,
+        8
+    );
+
+    gate.release();
+    drop(
+        permits
+            .acquire_many_owned(2)
+            .await
+            .expect("detached SDK read finished"),
+    );
+    assert!(lifetime.upgrade().is_none());
+    assert!(open(root.path()).lookup(identity(b"verified")).is_none());
+}
+
+#[tokio::test]
+async fn verified_fetch_bounds_filesystem_waits_without_granting_capture() {
+    use crate::s3::{FetchError, S3Error};
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
+
+    for operation in ["create", "write", "commit"] {
+        for cancelled in [false, true] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let spool = crate::recovery::test_support::open_spool(&root.path().join("state"));
+            let expected = identity(b"verified");
+            let (manager, _, requests) = crate::capture::tests::setup(
+                spool.clone(),
+                vec![crate::capture::tests::response("GET", 200, b"verified")],
+            );
+            let store = Arc::clone(manager.store());
+            let owner = spool.clone();
+            let permits = Arc::clone(&spool.0.io_permits);
+            let workers = permits.available_permits() as u32;
+            let mut gate = Gate::arm(&spool, operation);
+            let cancel = CancellationToken::new();
+            let task_cancel = cancel.clone();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut task = tokio::spawn(async move {
+                store
+                    .fetch_verified(&owner, expected, deadline, task_cancel)
+                    .await
+            });
+            gate.entered().await;
+
+            // Freeze only after the real filesystem worker has entered its
+            // gate, so virtual time cannot expire before the operation starts.
+            tokio::time::pause();
+            if cancelled {
+                cancel.cancel();
+            } else {
+                tokio::time::advance(Duration::from_secs(31)).await;
+            }
+            let joined = tokio::time::timeout(Duration::from_secs(1), &mut task).await;
+            let charged = spool.accounting().reserved;
+            gate.release();
+            tokio::time::resume();
+            if joined.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+            let outcome = joined
+                .expect("deadline/cancellation must interrupt the filesystem wait")
+                .expect("fetch task");
+            let expected_error = if cancelled {
+                S3Error::Cancelled
+            } else {
+                S3Error::Timeout
+            };
+            assert!(
+                matches!(outcome, Err(FetchError::S3(error)) if error == expected_error),
+                "{operation}: no late fetch capability may escape"
+            );
+            assert_eq!(
+                charged, expected.size,
+                "{operation}: detached I/O retains charge"
+            );
+            drop(
+                permits
+                    .acquire_many_owned(workers)
+                    .await
+                    .expect("detached filesystem work finished"),
+            );
+            assert_eq!(requests.snapshot().expect("requests"), ["GET"]);
+            assert!(!spool.capture_is_durable(expected).expect("capture state"));
+            if operation == "commit" {
+                let object = spool.lookup(expected).expect("admitted commit may finish");
+                assert_eq!(
+                    object.read_bounded(8).await.expect("local bytes"),
+                    b"verified"
+                );
+            } else {
+                assert!(spool.lookup(expected).is_none());
+            }
+        }
+    }
 }

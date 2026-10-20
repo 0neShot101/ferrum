@@ -43,14 +43,17 @@ impl MetadataDescriptor {
     }
 }
 impl CheckpointPublisher {
-    pub fn lookup_metadata(
+    /// Uses bounded short-read admission; cancellation drops only the reply.
+    pub async fn lookup_metadata(
         &self,
         key: &SuiteKey,
         path: &RepositoryPath,
     ) -> Result<Option<MetadataDescriptor>, CheckpointError> {
         self.metadata_lookup(key, Some(path.as_str()), "", None)
+            .await
     }
-    pub fn lookup_by_hash(
+    /// Uses bounded short-read admission; cancellation drops only the reply.
+    pub async fn lookup_by_hash(
         &self,
         key: &SuiteKey,
         directory: &str,
@@ -59,9 +62,9 @@ impl CheckpointPublisher {
         if !directory.is_empty() {
             RepositoryPath::parse_decoded(directory).map_err(|_| CheckpointError::Invalid)?;
         }
-        self.metadata_lookup(key, None, directory, Some(hash))
+        self.metadata_lookup(key, None, directory, Some(hash)).await
     }
-    fn metadata_lookup(
+    async fn metadata_lookup(
         &self,
         key: &SuiteKey,
         path: Option<&str>,
@@ -71,7 +74,7 @@ impl CheckpointPublisher {
         let key = key.clone();
         let path = path.map(str::to_owned);
         let directory = directory.to_owned();
-        let row = self.spool.durable_catalog()?.read(move |connection| {
+        let row = self.spool.durable_catalog()?.read_async(move |connection| {
             let read = |row: &rusqlite::Row<'_>| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -83,11 +86,10 @@ impl CheckpointPublisher {
             };
             if let Some(path) = path {
                 Ok(connection
-                    .query_row(
+                    .prepare_cached(
                         "SELECT m.generation,m.path,m.digest,m.size,m.source_path FROM public_generations g JOIN publication_metadata m ON m.generation=g.generation AND m.path=?3 WHERE g.repository=?1 AND g.suite=?2 AND g.retired_at IS NULL LIMIT 1",
-                        params![key.repository(), key.suite(), path],
-                        read,
-                    )
+                    )?
+                    .query_row(params![key.repository(), key.suite(), path], read)
                     .optional()?)
             } else {
                 let (sql, digest) = match hash {
@@ -102,14 +104,11 @@ impl CheckpointPublisher {
                     None => return Err(CatalogError::InvalidState),
                 };
                 Ok(connection
-                    .query_row(
-                        sql,
-                        params![key.repository(), key.suite(), directory, digest],
-                        read,
-                    )
+                    .prepare_cached(sql)?
+                    .query_row(params![key.repository(), key.suite(), directory, digest], read)
                     .optional()?)
             }
-        })?;
+        }).await?;
         let Some((scope, path, digest, size, source_path)) = row else {
             return Ok(None);
         };
@@ -118,7 +117,7 @@ impl CheckpointPublisher {
             .lock()
             .map_err(|_| CheckpointError::Proof)?
             .get(&scope)
-            .cloned()
+            .map(|entry| entry.proof.clone())
             .ok_or(CheckpointError::Proof)?;
         let identity = ObjectIdentity {
             sha256: Sha256Digest::from_hex(&digest).map_err(|_| CatalogError::InvalidState)?,

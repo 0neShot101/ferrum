@@ -43,16 +43,19 @@ both without a view and after a valid view is active. Run those external-tool te
 with `cargo test -p ferrum --locked --features test-harness --test signed_fixture -- --ignored`;
 the smoke harness runs them automatically after generation.
 
-To include the signed publication scenarios and their 100-transition race,
-generate the extended fixture in an isolated directory on the Linux build host
-with the image's tools installed:
+To include the signed publication scenarios, their 100-transition race and stock
+APT PDiff qualification, generate the extended fixture in an isolated directory
+on the Linux build host. Install the image's tools plus `apt-get` and `apt-helper`.
 
 ```sh
 cargo build --workspace --locked
 export FIXTURE_DIR="$(mktemp -d)"
 B09=1 bash fixture/generate.sh
 export FERRUM_FIXTURE_PUBLIC="$FIXTURE_DIR/public"
+export FERRUM_FIXTURE_PRIVATE="$FIXTURE_DIR/private"
+python3 fixture/pdiff.py --public "$FERRUM_FIXTURE_PUBLIC" --private "$FERRUM_FIXTURE_PRIVATE"
 export FERRUM_VERIFIER="$PWD/target/debug/ferrum-verifier"
+export PATH="$PWD/target/debug:$PATH"
 cargo test --workspace --locked --features ferrum/test-harness -- --include-ignored
 ```
 
@@ -60,6 +63,15 @@ Use the matching binary path if `CARGO_TARGET_DIR` is customized. Keep the
 generated private keys out of gateway/client mounts and remove this owned
 temporary fixture after verification. The default test invocation skips these
 external-fixture scenarios; a passing default run is not full publication proof.
+
+`fixture/pdiff-smoke.sh` regenerates only the PDiff extension and runs the focused
+stock-client and optional-timeout scenarios. It verifies exact resulting Packages
+bytes, measures full-index versus patch transfers, recreates publication owners,
+and exercises malformed, corrupt, missing and rotated-history fallback. APT uses
+isolated source, lists, status and cache paths; the host's sources are not changed.
+The fixture generator uses private keys, but Ferrum receives only signed public
+inputs. Prewarming and retirement lifecycle tests use the same signed B09 fixture
+and the local SDK transport; they do not contact a bucket.
 
 Measured private acceptance and artifact locations are recorded in
 [`docs/b01-test-contract.md`](../docs/b01-test-contract.md#executed-private-acceptance-2026-10-17).

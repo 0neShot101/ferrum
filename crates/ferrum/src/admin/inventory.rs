@@ -512,6 +512,7 @@ struct MirrorView {
     ecosystem: &'static str,
     architectures: &'static [&'static str],
     configured: bool,
+    retired: bool,
     retained_locked: Option<bool>,
     bootstrap_authorized: Option<bool>,
     keyring_configured: bool,
@@ -560,9 +561,9 @@ fn candidate_keyring(config: &Config, profile: Option<Repository>) -> Option<&st
         }),
     }
 }
-fn mirrors(state: &HealthState) -> Result<Vec<MirrorView>, ()> {
+fn mirrors(state: &HealthState, health: Vec<SuiteHealth>) -> Result<Vec<MirrorView>, ()> {
     let configured = state.config.suites().map_err(|_| ())?;
-    let health = suite_health(&state.catalog, state.catalog.clock_valid());
+    let retired = state.config.durable().map(|config| &config.retired_suites);
     let retained = match &state.publisher {
         Some(publisher) => Some(publisher.retained_suites().map_err(|_| ())?),
         None => None,
@@ -585,6 +586,11 @@ fn mirrors(state: &HealthState) -> Result<Vec<MirrorView>, ()> {
         let selection = configured
             .iter()
             .find(|s| s.key.repository() == repository && s.key.suite() == suite);
+        let is_retired = retired.is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.split_once('/') == Some((repository, suite)))
+        });
         let live = health
             .iter()
             .find(|h| h.repository == repository && h.suite == suite);
@@ -625,6 +631,7 @@ fn mirrors(state: &HealthState) -> Result<Vec<MirrorView>, ()> {
             ecosystem: profile.map_or("apt", Repository::ecosystem),
             architectures: profile.map_or(&["amd64"] as &[&str], Repository::architectures),
             configured: selection.is_some(),
+            retired: is_retired,
             retained_locked: retained.as_ref().map(|keys| {
                 keys.iter()
                     .any(|k| k.repository() == repository && k.suite() == suite)
@@ -632,7 +639,9 @@ fn mirrors(state: &HealthState) -> Result<Vec<MirrorView>, ()> {
             bootstrap_authorized: bootstrap,
             keyring_configured: keyring.is_some_and(|p| !p.as_os_str().is_empty()),
             keyring_exists: keyring.is_some_and(std::path::Path::is_file),
-            status: if selection.is_none() {
+            status: if is_retired {
+                "retired"
+            } else if selection.is_none() {
                 "candidate_unconfigured"
             } else if ready {
                 "ready"
@@ -658,9 +667,10 @@ pub async fn get_mirrors(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let health = suite_health(&state.catalog, state.catalog.clock_valid()).await;
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        mirrors(&state)
+        mirrors(&state, health)
     })
     .await
     {
@@ -689,9 +699,10 @@ pub async fn get_mirror_detail(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let health = suite_health(&state.catalog, state.catalog.clock_valid()).await;
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        mirrors(&state).map(|items| {
+        mirrors(&state, health).map(|items| {
             items
                 .into_iter()
                 .find(|v| v.repository == repository && v.suite == suite)
@@ -799,6 +810,7 @@ pub(crate) fn config_projection(config: &Config) -> Value {
             .map(|s| format!("{}/{}", s.key.repository(), s.key.suite()))
             .collect::<Vec<_>>()
     });
+    let retired = config.durable().map(|config| &config.retired_suites);
     // Project validated running values without touching credential paths.
     let remote = config.durable().map(|d| json!({"endpoint":d.provider.endpoint,"bucket":d.provider.bucket,
         "region":d.provider.region,"packagePrefix":d.provider.package_prefix,"checkpointPrefix":d.provider.checkpoint_prefix,
@@ -808,7 +820,7 @@ pub(crate) fn config_projection(config: &Config) -> Value {
     json!({"mode":if config.is_fixture(){"private-fixture"}else if config.is_durable_fixture(){"private-durable-fixture"}else if config.is_public(){"public-durable"}else{"private-durable"},
         "listen":{"public":config.listen.public.to_string(),"admin":config.listen.admin.to_string(),"publicHost":config.listen.public_host},
         "admin":{"origin":config.admin.origin,"managedConfigEnabled":config.admin.managed_config},
-        "suites":suites,"provider":remote,"budget":budget,"credentials":"redacted","keyrings":"paths_and_contents_redacted","statePaths":"redacted",
+        "suites":suites,"retiredSuites":retired,"provider":remote,"budget":budget,"credentials":"redacted","keyrings":"paths_and_contents_redacted","statePaths":"redacted",
         "limits":{"managedCeilingBytes":limits.managed_ceiling_bytes.to_string(),"maxObjectBytes":limits.max_object_bytes.to_string(),
             "concurrentFills":limits.concurrent_fills,"waitersPerObject":limits.waiters_per_object,"activeBodies":limits.active_bodies,"requestSlots":limits.request_slots,
             "readerBufferBytes":limits.reader_buffer_bytes.to_string(),"sourceAttempts":limits.source_attempts,"failureMapEntries":limits.failure_map_entries,
@@ -1047,6 +1059,7 @@ mode = "existing"
             fills: None,
             request_slots: None,
             active_bodies: None,
+            prewarm: None,
         });
         // No provider transport exists; real catalog-backed handlers still work.
         assert!(state.s3.is_none());

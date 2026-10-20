@@ -42,13 +42,16 @@ fn decode(value: Option<String>) -> Result<Option<PublicationIntent>, CatalogErr
 fn encode(intent: &PublicationIntent) -> Result<String, CatalogError> {
     intent.encode().map_err(|_| CatalogError::InvalidState)
 }
-pub(super) fn load(
+
+fn load_checkpoint(
     connection: &rusqlite::Connection,
     key: &SuiteKey,
 ) -> Result<SuiteState, CatalogError> {
     let row = connection
-        .query_row(
+        .prepare_cached(
             "SELECT observed_date,observed_content,floor,active,pending,blocked,bootstrap_authorized,recovery_ready FROM suite_checkpoints WHERE repository=?1 AND suite=?2",
+        )?
+        .query_row(
             params![key.repository(), key.suite()],
             |row| {
                 Ok((
@@ -64,7 +67,7 @@ pub(super) fn load(
             },
         )
         .optional()?;
-    let mut state = match row {
+    let state = match row {
         None => SuiteState::default(),
         Some((date, content, floor, active, pending, blocked, bootstrap, recovery_ready)) => {
             SuiteState {
@@ -80,6 +83,16 @@ pub(super) fn load(
             }
         }
     };
+
+    Ok(state)
+}
+
+pub(super) fn load(
+    connection: &rusqlite::Connection,
+    key: &SuiteKey,
+) -> Result<SuiteState, CatalogError> {
+    let mut state = load_checkpoint(connection, key)?;
+
     let publication = connection
         .query_row(
             "SELECT candidate_generation,observed_at,confirmed_at,successor_seen_at,last_error,next_check_at FROM suite_publication WHERE repository=?1 AND suite=?2",
@@ -129,6 +142,31 @@ impl Catalog {
     pub(crate) fn checkpoint_state(&self, key: SuiteKey) -> Result<SuiteState, CatalogError> {
         self.reader().call(move |connection| load(connection, &key))
     }
+
+    pub(crate) async fn checkpoint_state_async(
+        &self,
+        key: SuiteKey,
+    ) -> Result<SuiteState, CatalogError> {
+        self.read_async(move |connection| load(connection, &key))
+            .await
+    }
+
+    pub(crate) async fn checkpoint_available_generation(
+        &self,
+        key: SuiteKey,
+    ) -> Result<Option<String>, CatalogError> {
+        self.read_async(move |connection| {
+            let state = load_checkpoint(connection, &key)?;
+
+            if state.blocked || state.pending.is_some() {
+                return Ok(None);
+            }
+
+            Ok(state.active.map(|active| active.generation_id))
+        })
+        .await
+    }
+
     pub(crate) fn checkpoint_prepare(&self, intent: PublicationIntent) -> Result<(), CatalogError> {
         self.writer.call(move |connection| {
             let key = intent.key().map_err(|_| CatalogError::InvalidState)?;

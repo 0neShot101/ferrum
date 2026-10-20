@@ -178,7 +178,7 @@ pub(super) async fn get_overview(
     }
     let view = state.catalog.load();
     let clock_valid = state.catalog.clock_valid();
-    let raw_suites = suite_health(&state.catalog, clock_valid);
+    let raw_suites = suite_health(&state.catalog, clock_valid).await;
     let capture_ready = state
         .capture
         .as_ref()
@@ -187,7 +187,7 @@ pub(super) async fn get_overview(
         view.as_ref()
             .is_some_and(|v| clock_valid && v.is_fresh(Instant::now(), UnixTime::now()))
     } else {
-        !raw_suites.is_empty() && raw_suites.iter().all(|s| s.ready)
+        clock_valid && raw_suites.iter().all(|suite| suite.ready)
     } && capture_ready;
     let suites: Vec<SuiteOverview> = if state.catalog.is_fixture() && raw_suites.is_empty() {
         let lease_deadline = view.as_ref().map(|v| {

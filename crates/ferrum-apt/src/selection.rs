@@ -51,7 +51,7 @@ fn category<'a>(
     architectures: &[&str],
 ) -> Result<Result<Selected<'a>, &'static str>, SelectionError> {
     if path.split('/').any(|part| part.ends_with(".diff")) {
-        return Ok(Err("PDiff excluded; full indexes selected"));
+        return Ok(Err("PDiff acquired through optional authenticated closure"));
     }
     if path
         .split('/')
@@ -299,6 +299,33 @@ pub fn packages<'a>(
                 .ok_or_else(|| SelectionError::MissingTarget(target.path.clone()))
         })
         .collect()
+}
+
+/// Optional PDiff roots for selected full indexes. Patch names are never
+/// selected from Release or guessed from suffixes: only the authenticated
+/// Index may authorize their exact closure. Unsupported roots use full indexes.
+pub fn pdiffs<'a>(release: &'a Release, targets: &[Target]) -> Vec<&'a ReleaseEntry> {
+    let roots: Vec<_> = release
+        .entries()
+        .iter()
+        .filter(|entry| {
+            let Some(base) = entry.path.as_str().strip_suffix(".diff/Index") else {
+                return false;
+            };
+            entry.sha256.is_some()
+                && entry.size <= crate::pdiff::MAX_INDEX_BYTES as u64
+                && targets.iter().any(|target| target.logical == base)
+                && release
+                    .entries()
+                    .iter()
+                    .any(|full| full.path.as_str() == base && full.sha256.is_some())
+        })
+        .collect();
+    if roots.len() > crate::pdiff::MAX_INDEXES {
+        Vec::new()
+    } else {
+        roots
+    }
 }
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]

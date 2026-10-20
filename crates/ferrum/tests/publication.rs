@@ -7,6 +7,7 @@
 //! From the repository root:
 //! Build `cargo build --locked -p ferrum-verifier` and add `target/debug` to PATH.
 //! `B09=1 bash fixture/generate.sh` only if fixture/public/b09 has not been generated.
+//! Generate the PDiff extension as described in fixture/README.md before the full ignored suite.
 //! `cargo test --locked -p ferrum --features test-harness --test publication -- --ignored --test-threads=1`
 //! No live provider credentials or network access to a distribution is used. The
 //! scripted transport implements HTTP storage only: signatures, spool commits,
@@ -42,6 +43,16 @@ use ferrum_storage::s3::testing::StatefulRemote;
 use ferrum_storage::s3::{ControlCondition, OperationIdentity, S3Store};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+
+#[path = "publication/prewarming.rs"]
+mod prewarming;
+
+#[path = "publication/retirement.rs"]
+mod retirement;
+
+#[cfg(unix)]
+#[path = "publication/pdiff.rs"]
+mod pdiff;
 
 #[tokio::test]
 async fn all_configured_distribution_profiles_reach_the_bounded_catalog() {
@@ -573,6 +584,7 @@ async fn one_hundred_actual_transitions_with_ten_thousand_held_release_sequences
                         "main/binary-amd64",
                         ferrum_storage::checkpoint::MetadataHash::Sha256(held_hash),
                     )
+                    .await
                     .expect("production indexed retained authority")
                     .expect("held signed by-hash remains authorized after transition");
                 assert!(
@@ -1246,10 +1258,10 @@ fn http_state(harness: &Harness, waiter_timeout: Duration) -> Arc<AppState> {
     Arc::new(AppState {
         catalog: harness.catalog.clone(),
         spool: harness.spool.clone(),
-        client,
+        client: client.clone(),
         s3: None,
         capture: None,
-        clients: Vec::new(),
+        clients: vec![("debian".into(), client)],
         registry,
         metrics,
         limits,
@@ -1272,7 +1284,7 @@ async fn request(
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
-        .header("host", "fixture.test");
+        .header("host", &state.authority);
     if let Some((name, value)) = condition {
         builder = builder.header(name, value);
     }
@@ -1712,6 +1724,7 @@ async fn stale_canonical_derived_metadata_does_not_disable_retained_immutable_al
     let proof = harness
         .publisher
         .lookup_metadata(&key, &index)
+        .await
         .expect("activated metadata")
         .expect("durable metadata row")
         .proof();
@@ -2576,9 +2589,11 @@ async fn pacman_arch_and_chaotic_aur_bootstrap_serve_packages_and_verify_detache
     .expect("candidate package path");
     let candidate = publisher
         .lookup_package("chaotic-aur", &candidate_path)
+        .await
         .expect("candidate lookup")
         .expect("indexed unsigned candidate")
         .authorize()
+        .await
         .expect("descriptor is not yet package authenticity");
     assert!(matches!(
         capture.reserve(&candidate, UnixTime::now().as_secs()),
@@ -3095,4 +3110,73 @@ async fn rpm_almalinux_bootstrap_serves_repomd_primary_and_packages() {
 
     state.registry.shutdown().await;
     origin.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "Linux, ferrum-verifier 0.2.0 on PATH, prlimit, and generated fixture/public/b09"]
+async fn retired_catalog_closes_routes_but_preserves_shared_package_authority() {
+    let harness = Harness::new().await;
+    let key = keys().remove(0);
+    let active_key = keys().remove(1);
+    let before = harness.publisher.state(&key).expect("retained checkpoint");
+    let view = harness.view(&key);
+    let package_path = ferrum_apt::path::RepositoryPath::parse_decoded(
+        "pool/main/f/ferrum-fixture/ferrum-fixture_1.0_all.deb",
+    )
+    .expect("package path");
+    let scope = ferrum_storage::checkpoint::PackageScope::new(std::slice::from_ref(&active_key))
+        .expect("active-only package scope");
+    let package = harness
+        .publisher
+        .lookup_package_in("debian", &package_path, &scope)
+        .await
+        .expect("scoped shared package lookup")
+        .expect("active suite retains the shared package");
+    assert_eq!(package.generation().suite, active_key.suite());
+
+    let index = representation(&view, INDEX).await;
+    let alias = format!(
+        "/debian/dists/trixie/main/binary-amd64/by-hash/SHA256/{}",
+        Sha256Digest::of(&index)
+    );
+    let retired = Catalog::configured(Vec::new(), harness.publisher.clone())
+        .expect("all suites explicitly retired");
+    assert!(
+        !retired.is_fixture(),
+        "empty durable selection is not fixture authority"
+    );
+    assert!(!retired.suite_available(&view).await);
+    assert!(!retired.current_view_available(&view).await);
+
+    let mut state = http_state(&harness, Duration::from_secs(5));
+    Arc::get_mut(&mut state)
+        .expect("unshared HTTP state")
+        .catalog = Arc::new(retired);
+    for path in [
+        "/debian/dists/trixie/InRelease",
+        "/debian/dists/trixie/main/binary-amd64/Packages.gz",
+        alias.as_str(),
+        "/debian/pool/main/f/ferrum-fixture/ferrum-fixture_1.0_all.deb",
+    ] {
+        assert_eq!(
+            request(&state, Method::GET, path, None).await.status(),
+            StatusCode::NOT_FOUND,
+            "retired route {path}"
+        );
+    }
+    let after = harness.publisher.state(&key).expect("unchanged checkpoint");
+    assert_eq!(after.active, before.active);
+    assert_eq!(after.floor, before.floor);
+    assert!(
+        harness
+            .publisher
+            .lookup_package("debian", &package_path)
+            .await
+            .expect("retained lookup")
+            .is_some(),
+        "serving selection must not destroy recovery authority"
+    );
+
+    state.registry.shutdown().await;
+    harness.shutdown().await;
 }

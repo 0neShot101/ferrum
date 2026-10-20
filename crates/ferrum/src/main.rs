@@ -38,6 +38,13 @@ enum Command {
         #[arg(long)]
         offline: bool,
     },
+    /// Warm explicit authenticated package paths through a running private admin listener.
+    Prewarm {
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        operation: PrewarmOperation,
+    },
     /// Explicit owned-prefix private fixture operations (never production durability).
     PrivateS3 {
         #[arg(long)]
@@ -57,6 +64,37 @@ enum Command {
         #[command(subcommand)]
         operation: AdminOperation,
     },
+}
+
+#[derive(Subcommand)]
+enum PrewarmOperation {
+    /// Submit bounded background fills; never downloads package bodies to the CLI.
+    Run {
+        /// Explicit repository package paths (not URLs, metadata, or globs).
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Cap admitted authenticated package/signature bytes, not retry or wire bytes.
+        /// Existing durable transfer allowances independently bound provider traffic.
+        #[arg(long)]
+        max_bytes: u64,
+        /// Cap package plus possible detached-signature objects.
+        #[arg(long, default_value_t = 128)]
+        max_objects: usize,
+        /// Stop admission and background-only work after this deadline.
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+        /// Background producers; must leave at least one configured fill slot free.
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Read durable job results, cache hits, failures, and conservative byte charges.
+    Status { id: String },
+    /// Cancel admission and background-only work; shared foreground fills may finish.
+    Cancel { id: String },
 }
 
 #[derive(Subcommand)]
@@ -155,6 +193,38 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Serve { config } => serve(&config).await,
+        Command::Prewarm { config, operation } => {
+            async {
+                use ferrum::prewarm::{PrewarmCommand, PrewarmRequest};
+
+                let config = ferrum::config::Config::load(&config)?;
+                let command = match operation {
+                    PrewarmOperation::Run {
+                        paths,
+                        max_bytes,
+                        max_objects,
+                        timeout_seconds,
+                        concurrency,
+                        reason,
+                        idempotency_key,
+                    } => PrewarmCommand::Run(PrewarmRequest {
+                        paths,
+                        max_bytes,
+                        max_objects,
+                        timeout_seconds,
+                        concurrency,
+                        reason,
+                        idempotency_key,
+                    }),
+                    PrewarmOperation::Status { id } => PrewarmCommand::Status(id),
+                    PrewarmOperation::Cancel { id } => PrewarmCommand::Cancel(id),
+                };
+                let result = ferrum::prewarm::execute(&config, command).await?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(())
+            }
+            .await
+        }
         Command::Admin { operation } => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 match operation {

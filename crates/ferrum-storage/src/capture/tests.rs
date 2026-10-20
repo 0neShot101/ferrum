@@ -254,6 +254,20 @@ async fn actual_signed_compressed_packages_bind_exact_filename_size_and_digest()
         .await
         .is_err()
     );
+
+    let id = index.id.clone();
+    fixture
+        .spool
+        .catalog_write(move |connection| {
+            connection.execute("UPDATE capture_indexes SET verified=0 WHERE id=?1", [id])?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(matches!(
+        index.lookup(capture.path()),
+        Err(CaptureError::Catalog(CatalogError::InvalidState))
+    ));
 }
 #[tokio::test]
 async fn cancelled_capture_refunds_unwritten_controls_and_releases_only_capture_pins() {
@@ -636,6 +650,28 @@ async fn incomplete_reconciliation_blocks_upload_replay_before_any_wire_or_credi
         .unwrap();
     manager.begin_reconciliation(now).unwrap();
     let before = ledger.usage().unwrap().download;
+
+    let path = RepositoryPath::parse_decoded("pool/main/p/package_1_all.deb").unwrap();
+
+    assert!(matches!(
+        manager.lookup("origin-a", &path),
+        Err(CaptureError::Admission)
+    ));
+    assert!(matches!(
+        manager.is_durable(identity),
+        Err(CaptureError::Admission)
+    ));
+    assert!(matches!(
+        manager
+            .rehydrate(
+                identity,
+                Instant::now() + Duration::from_secs(10),
+                &CancellationToken::new()
+            )
+            .await,
+        Err(CaptureError::Admission)
+    ));
+
     assert!(matches!(
         manager
             .complete(

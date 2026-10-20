@@ -118,36 +118,77 @@ impl AuthenticatedPackageIndex {
                 request_authentication: std::sync::OnceLock::new(),
             }))
     }
+    pub(crate) async fn authorize_async(
+        &self,
+        proof: Arc<VerifiedHistoricalProof>,
+        path: RepositoryPath,
+    ) -> Result<Option<super::VerifiedCaptureProof>, CaptureError> {
+        if proof.manifest().scope_id() != self.proof.manifest().scope_id()
+            || !self.spool.same_owner(&proof.owner)
+            || proof.packages_source(&self.logical_path).is_none()
+            || !super::is_package_path(path.as_str())
+        {
+            return Err(CaptureError::Proof);
+        }
+
+        let id = self.id.clone();
+        let name = path.as_str().to_owned();
+        let identity = self
+            .spool
+            .durable_catalog()?
+            .read_async(move |connection| lookup(connection, &id, &name))
+            .await?;
+
+        Ok(identity.map(|identity| super::VerifiedCaptureProof {
+            proof,
+            path,
+            identity,
+            package_signature: None,
+            package_objects: None,
+            request_authentication: std::sync::OnceLock::new(),
+        }))
+    }
+
     pub fn lookup(&self, path: &RepositoryPath) -> Result<Option<ObjectIdentity>, CaptureError> {
         let id = self.id.clone();
         let path = path.as_str().to_owned();
-        Ok(self.spool.durable_catalog()?.read(move |connection| {
-            let ready: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM capture_indexes WHERE id=?1 AND verified=1)",
-                [&id],
-                |row| row.get(0),
-            )?;
-            if !ready {
-                return Err(CatalogError::InvalidState);
-            }
-            let row: Option<(String, u64)> = connection
-                .query_row(
-                    "SELECT digest,size FROM capture_index_entries WHERE index_id=?1 AND path=?2",
-                    params![id, path],
-                    |row| Ok((row.get(0)?, crate::catalog::read_unsigned(row, 1)?)),
-                )
-                .optional()?;
-            row.map(|(digest, size)| {
-                Ok(ObjectIdentity {
-                    sha256: Sha256Digest::from_hex(&digest)
-                        .map_err(|_| CatalogError::InvalidState)?,
-                    size,
-                })
-            })
-            .transpose()
-        })?)
+        Ok(self
+            .spool
+            .durable_catalog()?
+            .read(move |connection| lookup(connection, &id, &path))?)
     }
 }
+
+fn lookup(
+    connection: &rusqlite::Connection,
+    id: &str,
+    path: &str,
+) -> Result<Option<ObjectIdentity>, CatalogError> {
+    let row: Option<(String, u64)> = connection
+        .prepare_cached(
+            "SELECT entry.digest,entry.size FROM capture_indexes AS package_index \
+             LEFT JOIN capture_index_entries AS entry ON entry.index_id=package_index.id AND entry.path=?2 \
+             WHERE package_index.id=?1 AND package_index.verified=1",
+        )?
+        .query_row(params![id, path], |row| {
+            let digest: Option<String> = row.get(0)?;
+
+            digest
+                .map(|digest| Ok((digest, crate::catalog::read_unsigned(row, 1)?)))
+                .transpose()
+        })
+        .optional()?
+        .ok_or(CatalogError::InvalidState)?;
+
+    row.map(|(digest, size)| {
+        Ok(ObjectIdentity {
+            sha256: Sha256Digest::from_hex(&digest).map_err(|_| CatalogError::InvalidState)?,
+            size,
+        })
+    })
+    .transpose()
+}
+
 pub async fn stage_package_index(
     spool: &Spool,
     proof: Arc<VerifiedHistoricalProof>,

@@ -843,7 +843,12 @@ impl BudgetLedger {
                 && data
                     .checked_add(data_increment)
                     .is_some_and(|n| n <= limits.storage - limits.storage_control);
-            if allowed {
+            // Reused reservations still require admission, but not another WAL write.
+            if allowed
+                && old.is_none_or(|(old_size, old_class)| {
+                    size > old_size || final_class != old_class
+                })
+            {
                 transaction.execute(
                     "INSERT INTO remote_storage(key,size,class) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET size=MAX(size,excluded.size),class=MIN(class,excluded.class)",
                     params![key, number(size)?, final_class],
@@ -1270,11 +1275,67 @@ mod tests {
                 .reserve_storage("new", 1, BudgetClass::Control)
                 .is_err()
         );
+        assert!(matches!(
+            ledger.reserve_storage("owned-existing", 1200, BudgetClass::Package),
+            Err(BudgetError::Refused)
+        ));
+        assert!(matches!(
+            ledger.reserve_storage("owned-existing", 0, BudgetClass::Control),
+            Err(BudgetError::Refused)
+        ));
         ledger
             .record_existing_storage("owned-existing", 1200, BudgetClass::Control)
             .expect("idempotent no double charge");
         assert_eq!(ledger.usage().expect("usage").storage, 1200);
     }
+
+    #[test]
+    fn reused_storage_reservations_preserve_size_and_package_class() {
+        let root = tempfile::tempdir().expect("root");
+        let ledger = BudgetLedger::initialize_with_clock(
+            spool(&root.path().join("state")),
+            BudgetLimits {
+                storage: 1000,
+                storage_control: 100,
+                monthly_download: 1000,
+                download_control: 100,
+            },
+            LedgerClock::at(1_735_689_600),
+        )
+        .expect("initialize");
+
+        ledger
+            .reserve_storage("object", 0, BudgetClass::Control)
+            .expect("reserve empty control");
+        ledger
+            .reserve_storage("object", 0, BudgetClass::Package)
+            .expect("promote empty object to package");
+        assert!(matches!(
+            ledger.reserve_storage("object", 901, BudgetClass::Control),
+            Err(BudgetError::Refused)
+        ));
+
+        ledger
+            .reserve_storage("object", 900, BudgetClass::Control)
+            .expect("grow within package allowance");
+        ledger
+            .reserve_storage("object", 900, BudgetClass::Package)
+            .expect("reuse the full reservation");
+        ledger
+            .reserve_storage("object", 1, BudgetClass::Control)
+            .expect("smaller request retains size and package class");
+
+        assert_eq!(ledger.usage().expect("usage").storage, 900);
+        assert!(matches!(
+            ledger.reserve_storage("object", 901, BudgetClass::Control),
+            Err(BudgetError::Refused)
+        ));
+        ledger
+            .reserve_storage("control", 100, BudgetClass::Control)
+            .expect("package reservations preserve control headroom");
+        assert_eq!(ledger.usage().expect("usage").storage, 1000);
+    }
+
     #[test]
     fn qualification_namespace_is_enforced_for_ordinary_and_escrow_admission() {
         let root = tempfile::tempdir().expect("root");

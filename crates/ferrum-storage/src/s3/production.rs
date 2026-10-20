@@ -3,9 +3,8 @@ use super::{
     SINGLE_PUT_LIMIT, TransferStatus, bounded, classify_sdk, config,
 };
 use crate::budget::{BudgetClass, BudgetLedger};
-use crate::{Spool, VerifiedObject};
+use crate::{Spool, SpoolError, VerifiedObject};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_smithy_types::byte_stream::Length;
 use bytes::Bytes;
 use ferrum_apt::digest::{ObjectIdentity, Sha256Digest, Sha256Hasher};
 use futures_util::StreamExt;
@@ -15,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+pub(super) mod body;
 mod circuit;
 pub(super) mod dns;
 mod maintenance;
@@ -23,6 +23,8 @@ mod multipart;
 mod qualification;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transfer_tests;
 mod uploads;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +43,44 @@ pub struct ControlObject {
     pub bytes: Vec<u8>,
     pub etag: String,
 }
+/// A failure before a remote transfer has both reached EOF and committed.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    #[error(transparent)]
+    S3(#[from] S3Error),
+    #[error(transparent)]
+    Spool(#[from] SpoolError),
+}
+
+/// Single-use evidence from this store's exact object GET and verified commit.
+/// Local residency, HEAD and upload acknowledgments cannot construct it.
+pub struct VerifiedFetch {
+    identity: ObjectIdentity,
+    operation: OperationIdentity,
+    store: Arc<Semaphore>,
+    owner: Spool,
+}
+
+impl VerifiedFetch {
+    pub(crate) fn consume(
+        self,
+        store: &S3Store,
+        spool: &Spool,
+        identity: ObjectIdentity,
+    ) -> Result<(), S3Error> {
+        let production = store.production()?;
+        if self.identity != identity
+            || self.operation != OperationIdentity::Object
+            || !Arc::ptr_eq(&self.store, &production.operations)
+            || !spool.same_owner(&self.owner)
+        {
+            return Err(S3Error::Boundary);
+        }
+
+        production.check(&production.object_key(identity))
+    }
+}
+
 /// Full object bytes were read back and hashed by this adapter. Construction is
 /// private; neither a PUT ACK, HEAD nor metadata can manufacture this result.
 pub struct VerifiedUpload {
@@ -238,18 +278,6 @@ pub(super) fn now() -> Result<i64, S3Error> {
 }
 fn database(error: impl std::fmt::Display) -> S3Error {
     S3Error::Journal(error.to_string())
-}
-struct UploadFile<'a> {
-    path: &'a Path,
-    identity: ObjectIdentity,
-}
-impl UploadFile<'_> {
-    fn path(&self) -> &Path {
-        self.path
-    }
-    fn identity(&self) -> ObjectIdentity {
-        self.identity
-    }
 }
 impl S3Store {
     pub fn open(config: S3Config, ledger: BudgetLedger) -> Result<Self, S3Error> {
@@ -457,6 +485,83 @@ impl S3Store {
             }
         }
     }
+    /// Downloads and commits one exact object, retaining non-replayable remote
+    /// verification evidence for immediate capture. Dropping the future removes
+    /// its temporary; queued filesystem work retains its reservation and lease.
+    /// The deadline and token bound filesystem waits as well as HTTP. A commit
+    /// already dispatched may finish locally, but timeout grants no capability.
+    pub async fn fetch_verified(
+        &self,
+        spool: &Spool,
+        identity: ObjectIdentity,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> Result<(VerifiedObject, VerifiedFetch), FetchError> {
+        let store = self.production()?;
+        if !spool.same_owner(store.transport.ledger.spool()) {
+            return Err(S3Error::Boundary.into());
+        }
+
+        if cancel.is_cancelled() {
+            return Err(S3Error::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(S3Error::Timeout.into());
+        }
+
+        let transfer = async {
+            let reservation = spool.reserve(identity.size)?;
+            let response = self.get(identity, deadline, cancel.clone()).await?;
+            let mut writer = spool.begin_write(reservation, identity).await?;
+            let mut body = response.into_stream();
+            while let Some(bytes) = body.next().await {
+                if let Err(error) = writer.write(bytes?).await {
+                    if matches!(
+                        error,
+                        SpoolError::Mismatch { .. } | SpoolError::Overflow { .. }
+                    ) {
+                        self.quarantine(identity)?;
+                        return Err(S3Error::Corrupt.into());
+                    }
+                    return Err(error.into());
+                }
+            }
+
+            match writer.commit().await {
+                Ok(object) => Ok::<_, FetchError>(object),
+                Err(error) => {
+                    if matches!(
+                        error,
+                        SpoolError::Mismatch { .. } | SpoolError::Overflow { .. }
+                    ) {
+                        self.quarantine(identity)?;
+                        return Err(S3Error::Corrupt.into());
+                    }
+                    Err(error.into())
+                }
+            }
+        };
+        // Keep typed spool failures inside the S3 deadline boundary. Dropping
+        // the transfer retains reservations in any detached filesystem work.
+        let object = bounded(deadline, &cancel, async { Ok(transfer.await) }).await??;
+        if cancel.is_cancelled() {
+            return Err(S3Error::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(S3Error::Timeout.into());
+        }
+
+        Ok((
+            object,
+            VerifiedFetch {
+                identity,
+                operation: OperationIdentity::Object,
+                store: Arc::clone(&store.operations),
+                owner: spool.clone(),
+            },
+        ))
+    }
+
     pub async fn head(
         &self,
         identity: ObjectIdentity,
@@ -724,6 +829,8 @@ impl S3Store {
         }
         result.map(|_| ())
     }
+    /// Uploads a resident object from this store's spool. The exact path and
+    /// identity must still name a verified object; SDK reads own its lease.
     pub async fn control_put_file(
         &self,
         suffix: &str,
@@ -733,6 +840,13 @@ impl S3Store {
         cancel: &CancellationToken,
     ) -> Result<(), S3Error> {
         let store = self.production()?;
+        let object = store
+            .transport
+            .ledger
+            .spool()
+            .lookup(identity)
+            .filter(|object| object.path() == path)
+            .ok_or(S3Error::Boundary)?;
         let key = store.key(OperationIdentity::Object, suffix)?;
         let _key = store.key_slot(&key, deadline, cancel).await?;
         store.check(&key)?;
@@ -752,13 +866,7 @@ impl S3Store {
             })
             .await?;
             store
-                .multipart(
-                    &UploadFile { path, identity },
-                    &key,
-                    BudgetClass::Control,
-                    deadline,
-                    cancel,
-                )
+                .multipart(&object, &key, BudgetClass::Control, deadline, cancel)
                 .await?;
             return Ok(());
         }
@@ -771,13 +879,7 @@ impl S3Store {
                 CONTROL,
                 BudgetClass::Control,
             )?;
-            let body = ByteStream::read_from()
-                .path(path)
-                .length(Length::Exact(identity.size))
-                .buffer_size(CHUNK)
-                .build()
-                .await
-                .map_err(|_| S3Error::Unavailable)?;
+            let body = body::object_body(&object, 0, identity.size)?;
             bounded(deadline, cancel, async {
                 client
                     .put_object()
@@ -1254,16 +1356,7 @@ impl Production {
         .await?;
         if identity.size > SINGLE_PUT_LIMIT {
             return self
-                .multipart(
-                    &UploadFile {
-                        path: object.path(),
-                        identity,
-                    },
-                    &key,
-                    BudgetClass::Package,
-                    deadline,
-                    cancel,
-                )
+                .multipart(object, &key, BudgetClass::Package, deadline, cancel)
                 .await
                 .map(|etag| {
                     UploadOutcome::ReadBack(VerifiedUpload {
@@ -1281,13 +1374,7 @@ impl Production {
             CONTROL,
             BudgetClass::Package,
         )?;
-        let body = ByteStream::read_from()
-            .path(object.path())
-            .length(Length::Exact(identity.size))
-            .buffer_size(CHUNK)
-            .build()
-            .await
-            .map_err(|_| S3Error::Unavailable)?;
+        let body = body::object_body(object, 0, identity.size)?;
         let marker = self.mutation_marker(&key, true)?;
         let result = bounded(deadline, cancel, async {
             client

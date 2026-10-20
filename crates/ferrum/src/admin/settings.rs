@@ -762,7 +762,11 @@ fn field_capabilities(config: &Config) -> Vec<Value> {
         ),
         (
             "durable.suites",
-            "Offline trust selection; retained identities cannot be removed and adding a candidate does not authorize bootstrap.",
+            "Offline serving selection; move retained identities to retired_suites to retire them, or back here to reactivate. Adding a candidate does not authorize bootstrap.",
+        ),
+        (
+            "durable.retiredSuites",
+            "Offline retained trust selection. Retirement stops routes and synchronization after restart but preserves keyrings, checkpoints, capture authority and reservations.",
         ),
         (
             "limits.managedCeilingBytes",

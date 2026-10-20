@@ -108,4 +108,76 @@ mod tests {
         assert!(publisher.retained_suites().is_err());
         assert!(capture.coverage_ready().unwrap());
     }
+
+    #[test]
+    fn retained_selection_survives_spool_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        {
+            let spool = test_support::open_spool(&state);
+            let (capture, ledger, _) = capture_test::setup(spool.clone(), vec![]);
+            let reserved = capture
+                .store()
+                .package_key(&format!(
+                    "v1/objects/sha256/{}",
+                    ferrum_apt::digest::Sha256Digest::of(b"retained reservation")
+                ))
+                .unwrap();
+            ledger
+                .reserve_storage(&reserved, 4096, crate::budget::BudgetClass::Package)
+                .unwrap();
+            let publisher = CheckpointPublisher::new(
+                spool.clone(),
+                Arc::clone(capture.store()),
+                super::super::RecoveryProfile::SharedNonisolated,
+            )
+            .unwrap();
+            spool
+                .catalog_write(|connection| {
+                    connection.execute(
+                        "INSERT INTO suite_checkpoints(repository,suite,floor,active) \
+                         VALUES('debian','trixie','retained-floor','retained-active')",
+                        [],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(publisher.retained_suites().unwrap().len(), 1);
+            spool.checkpoint().unwrap();
+        }
+
+        let spool = test_support::open_spool(&state);
+        let ledger =
+            crate::budget::BudgetLedger::open(spool.clone(), capture_test::limits()).unwrap();
+        assert_eq!(ledger.usage().unwrap().storage, 4096);
+        let (store, _) =
+            crate::s3::S3Store::scripted_production(capture_test::config(&spool), ledger, vec![])
+                .unwrap();
+        let publisher = CheckpointPublisher::new(
+            spool.clone(),
+            Arc::new(store),
+            super::super::RecoveryProfile::SharedNonisolated,
+        )
+        .unwrap();
+        assert_eq!(
+            publisher.retained_suites().unwrap(),
+            vec![SuiteKey::new("debian", "trixie").unwrap()]
+        );
+        let preserved = spool
+            .durable_catalog()
+            .unwrap()
+            .read(|connection| {
+                Ok(connection.query_row(
+                    "SELECT floor,active FROM suite_checkpoints \
+                     WHERE repository='debian' AND suite='trixie'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("retained-floor".into(), "retained-active".into())
+        );
+    }
 }

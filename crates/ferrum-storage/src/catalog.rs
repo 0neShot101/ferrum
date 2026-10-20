@@ -145,6 +145,28 @@ impl Worker {
             })?;
         result.recv().map_err(|_| CatalogError::Closed)?
     }
+
+    async fn call_async<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, CatalogError> + Send + 'static,
+    ) -> Result<T, CatalogError> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let job: Job = Box::new(move |connection| {
+            // Accepted work belongs to this worker, even if its caller disconnects.
+            let _ = reply.send(operation(connection));
+        });
+
+        self.sender
+            .as_ref()
+            .ok_or(CatalogError::Closed)?
+            .try_send(job)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => CatalogError::Busy,
+                TrySendError::Disconnected(_) => CatalogError::Closed,
+            })?;
+
+        result.await.map_err(|_| CatalogError::Closed)?
+    }
 }
 
 impl Drop for Worker {
@@ -464,24 +486,20 @@ impl Catalog {
         self.reader().call(operation)
     }
 
+    /// Short reads share the three bounded reader queues with synchronous callers.
+    /// Cancellation drops only the reply; admitted work finishes on its owner.
+    pub(crate) async fn read_async<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, CatalogError> + Send + 'static,
+    ) -> Result<T, CatalogError> {
+        self.reader().call_async(operation).await
+    }
+
     pub(crate) async fn work_async<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T, CatalogError> + Send + 'static,
     ) -> Result<T, CatalogError> {
-        let (reply, result) = tokio::sync::oneshot::channel();
-        let job: Job = Box::new(move |connection| {
-            let _ = reply.send(operation(connection));
-        });
-        self.readers[3]
-            .sender
-            .as_ref()
-            .ok_or(CatalogError::Closed)?
-            .try_send(job)
-            .map_err(|error| match error {
-                TrySendError::Full(_) => CatalogError::Busy,
-                TrySendError::Disconnected(_) => CatalogError::Closed,
-            })?;
-        result.await.map_err(|_| CatalogError::Closed)?
+        self.readers[3].call_async(operation).await
     }
 
     fn reader(&self) -> &Worker {
@@ -781,6 +799,9 @@ impl Catalog {
         })
     }
 }
+
+#[cfg(test)]
+mod scheduling;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
