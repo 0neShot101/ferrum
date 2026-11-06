@@ -197,6 +197,19 @@ Use package paths from the active authenticated catalog, not arbitrary URLs. One
 
 Retired suites have no public routes or new synchronization work. Retirement preserves rollback floors, historical capture authority and accounting; it is not deletion or garbage collection. Current keyrings remain required for retained proofs. Reactivation moves the identity back to the active list and requires normal verified recovery/synchronization before serving.
 
+**Catalog capacity.** SQLite has its own limit, separate from free filesystem space and the package cache. Retained package-index history can fill it even when the disk has room. Ordinary growth leaves 8 MiB available for bounded recovery cleanup; cleanup still respects the catalog, total managed-storage and physical free-space limits.
+
+| Configuration | Setting | Default | Maximum |
+| --- | --- | --- | --- |
+| Gateway, `[limits]` | `catalog_ceiling_bytes` | 8 GiB, scaled down for smaller managed ceilings | 32 GiB (`34359738368` bytes) |
+| Maintenance, top level | `catalog_ceiling_bytes` | 8 GiB | 32 GiB (`34359738368` bytes) |
+
+Set both ceilings to the same byte value while Ferrum is stopped, then restart. Increasing the ceiling budgets additional metadata-only snapshot staging within the existing managed ceiling; it does not increase the 8 GiB package limit or reset provider allowances. Snapshot staging can overlap two catalog-sized reservations plus 256 KiB. Larger explicit ceilings therefore require at least three times that ceiling in managed capacity, with actual admission also accounting for resident data and filesystem headroom.
+
+Snapshots above the package limit use catalog-specific admission, retain full size/hash and SQLite integrity checks, and hold one consistent read transaction during the copy so live writes cannot continually restart it. Scheduled backup deadlines allow four minutes per configured GiB, with a ten-minute minimum; slow full-index validation can delay completion beyond the next hourly boundary. Shutdown cancels copying and validation without releasing their storage ownership early.
+
+When a generation leaves the public retention set and has no captured package paths or active references, Ferrum automatically unlinks and reclaims its local package-index rows online and on startup while preserving S3 generation manifests and captured-package proof links. Capacity expansion preserves retained generations and captured packages; remote object deletion still uses explicit, reference-checked offline maintenance (`ferrum storage gc --execute`). For an already exhausted catalog, stop the gateway and preserve a consistent offline backup before compaction or changing limits. Do not delete the catalog, clear rollback history, or run `storage init` to recover capacity. An older binary limited to 8 GiB cannot safely reopen a catalog that has grown beyond that size.
+
 For the HTTPS edge, merge `deploy/nginx/ferrum-http.conf` into Nginx's `http` settings, replacing duplicate directives such as `keepalive_timeout` rather than including them twice. Install `ferrum-site.conf` as the virtual host and `ferrum-proxy.conf` as `/etc/nginx/snippets/ferrum-boundary.conf`. Replace every example hostname and both certificate paths with your own. Integrate the default reject listeners with existing virtual hosts; do not duplicate `default_server` declarations. Validate with `sudo nginx -t` before reloading. Never expose port 9090.
 
 Test normal APT update/download/install from a disposable client using your domain before changing real clients. `/healthz` checks only the edge, not repository readiness. Repeat after a process restart. Provider compatibility, retention, recovery and capacity need independent qualification for your deployment; successful startup is not that qualification.
