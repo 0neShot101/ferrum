@@ -17,6 +17,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 const PAGE: i64 = 128;
 const APPLICATION_ID: u32 = 0x4645_5252;
 const SCHEMA_VERSION: u32 = 5;
+// Fresh catalogs use 4 KiB pages and validation rejects any other size.
+const MAX_PAGE_COUNT: i64 = (crate::disk::MAX_CATALOG_BYTES / 4096) as i64;
 const SCHEMA: [(&str, &str); 3] = [
     (
         "objects",
@@ -279,7 +281,17 @@ fn open_connection(path: &Path, writer: bool, fresh: bool) -> Result<Connection,
             transaction.commit()?;
             validate_catalog(&connection, SCHEMA_VERSION)?;
         }
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=65536; PRAGMA max_page_count=2097152;")?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=16; PRAGMA journal_size_limit=65536;")?;
+        // SQLite clamps the limit up to the current page count; equality proves
+        // an existing file is within the hard cap. The configured catalog
+        // ceiling remains enforced by the spool owner.
+        let pages: i64 =
+            connection.pragma_update_and_check(None, "max_page_count", MAX_PAGE_COUNT, |row| {
+                row.get(0)
+            })?;
+        if pages != MAX_PAGE_COUNT {
+            return Err(CatalogError::InvalidState);
+        }
     } else {
         connection.execute_batch("PRAGMA query_only=ON;")?;
     }

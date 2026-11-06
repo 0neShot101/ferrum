@@ -32,7 +32,7 @@ pub(super) fn config(root: &Path) -> DurableSpoolConfig {
     config.temporary_ceiling = 4 * MIB;
     config.metadata_temporary_reserve = MIB;
     config.metadata_ceiling = 8 * MIB;
-    config.catalog_ceiling = 16 * MIB;
+    config.catalog_ceiling = 24 * MIB;
     config.catalog_memory_budget = 32 * MIB;
     config.max_entries = 128;
     config.database_queue = 8;
@@ -387,12 +387,12 @@ async fn pending_packages_never_gain_eviction_authority_from_upload_readback_alo
 async fn all_pinned_admission_refuses_then_same_owner_reclaims_after_release() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut limits = config(root.path());
-    limits.spool.managed_ceiling = 8 * MIB;
+    limits.spool.managed_ceiling = 16 * MIB;
     limits.temporary_ceiling = 4 * MIB;
     limits.metadata_ceiling = 8 * MIB;
-    limits.catalog_ceiling = 8 * MIB;
-    limits.eviction_high_watermark = 6 * MIB;
-    limits.eviction_low_watermark = 4 * MIB;
+    limits.catalog_ceiling = 16 * MIB;
+    limits.eviction_high_watermark = 14 * MIB;
+    limits.eviction_low_watermark = 12 * MIB;
     let spool = Spool::open_durable(limits).expect("bounded store");
     let object = install(
         &spool,
@@ -408,7 +408,7 @@ async fn all_pinned_admission_refuses_then_same_owner_reclaims_after_release() {
     ));
     assert!(path.exists());
     assert_eq!(spool.accounting().installed, 3 * MIB);
-    assert!(spool.usage().expect("bounds").managed_bytes <= 8 * MIB);
+    assert!(spool.usage().expect("bounds").managed_bytes <= 16 * MIB);
     drop(object);
     let reservation = spool
         .reserve_class(3 * MIB, ReservationClass::Metadata)
@@ -747,7 +747,7 @@ fn failed_reservation_sql_retains_the_uncertain_charge_and_closes_admission() {
 async fn generation_reference_transaction_preserves_other_sql_reservations_and_physical_floor() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut limits = config(root.path());
-    limits.catalog_ceiling = 6 * MIB;
+    limits.catalog_ceiling = 14 * MIB;
     let mut spool = Spool::open_durable(limits).expect("store");
     let object = install(
         &spool,
@@ -793,11 +793,11 @@ async fn generation_reference_transaction_preserves_other_sql_reservations_and_p
 async fn zero_byte_admission_cannot_overpromise_managed_sql_headroom() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut limits = config(root.path());
-    limits.spool.managed_ceiling = 5 * MIB;
+    limits.spool.managed_ceiling = 13 * MIB;
     limits.metadata_ceiling = 5 * MIB;
-    limits.catalog_ceiling = 5 * MIB;
-    limits.eviction_high_watermark = 4 * MIB;
-    limits.eviction_low_watermark = 3 * MIB;
+    limits.catalog_ceiling = 13 * MIB;
+    limits.eviction_high_watermark = 12 * MIB;
+    limits.eviction_low_watermark = 11 * MIB;
     let spool = Spool::open_durable(limits).expect("small store");
     let package = install(
         &spool,
@@ -813,7 +813,7 @@ async fn zero_byte_admission_cannot_overpromise_managed_sql_headroom() {
     ));
     let usage = spool.usage().expect("usage");
     assert_eq!(usage.reservations, 1);
-    assert!(usage.managed_bytes <= 5 * MIB);
+    assert!(usage.managed_bytes <= 13 * MIB);
     assert_eq!(
         database(root.path())
             .query_row(
@@ -832,7 +832,7 @@ async fn zero_byte_admission_cannot_overpromise_managed_sql_headroom() {
 async fn ordinary_retirement_capacity_refusal_does_not_poison_future_admission() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut limits = config(root.path());
-    limits.catalog_ceiling = 6 * MIB;
+    limits.catalog_ceiling = 14 * MIB;
     let spool = Spool::open_durable(limits).expect("store");
     let object = install(
         &spool,
@@ -1130,4 +1130,194 @@ async fn candidate_dedup_does_not_downgrade_existing_package_ownership() {
         0
     );
     assert!(spool.lookup(expected).is_some());
+}
+
+#[tokio::test]
+async fn catalog_growth_preserves_restart_cleanup_and_retained_objects() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut limits = config(root.path());
+    limits.spool.managed_ceiling = 64 * MIB;
+    limits.catalog_ceiling = 32 * MIB;
+    let spool = Spool::open_durable(limits.clone()).expect("store");
+    let object = install(
+        &spool,
+        Bytes::from_static(b"retained authenticated package"),
+        ReservationClass::Package,
+    )
+    .await;
+    let expected = object.identity();
+    spool
+        .retain_generation(Sha256Digest::of(b"retained generation"), &[expected])
+        .expect("retention pin");
+    spool
+        .catalog_write(|connection| {
+            connection.execute_batch(
+                "INSERT INTO capture_indexes VALUES('retained',1),('orphan',0);
+                 INSERT INTO capture_proof_indexes VALUES('generation','Packages','retained');
+                 INSERT INTO capture_index_entries VALUES('retained','pool/kept.deb','digest',1);",
+            )?;
+            Ok(())
+        })
+        .expect("retained and interrupted indexes");
+    let mut batches = 0u64;
+    loop {
+        let first = batches * 32;
+        let result = spool.catalog_write(move |connection| {
+            let transaction = connection.transaction()?;
+            for number in first..first + 32 {
+                transaction.execute(
+                    "INSERT INTO capture_index_entries VALUES('orphan',?1,?2,1)",
+                    params![
+                        format!("pool/{number:020}-{}.deb", "x".repeat(128)),
+                        Sha256Digest::of(&number.to_le_bytes()).to_hex(),
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                batches += 1;
+                assert!(batches < 10_000, "catalog growth must be bounded");
+            }
+            Err(SpoolError::CapacityExhausted { .. }) => break,
+            Err(error) => panic!("unexpected growth failure: {error}"),
+        }
+    }
+    assert!(matches!(
+        spool.reserve(0),
+        Err(SpoolError::CapacityExhausted { .. })
+    ));
+    assert!(spool.usage().expect("usage").admission_open);
+    drop((object, spool));
+
+    let reopened = Spool::open_durable(limits.clone())
+        .expect("growth must not consume the workspace needed by restart cleanup");
+    let object = reopened
+        .lookup(expected)
+        .expect("retained package survives");
+    assert_eq!(
+        object.read_bounded(64).await.expect("verified bytes"),
+        b"retained authenticated package"
+    );
+    assert_eq!(reopened.reclaim(u64::MAX).expect("retained pin"), 0);
+    let connection = database(root.path());
+    let indexes: Vec<String> = connection
+        .prepare("SELECT id FROM capture_indexes ORDER BY id")
+        .expect("indexes")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(indexes, ["retained"]);
+    assert_eq!(
+        connection
+            .query_row("SELECT path FROM capture_index_entries", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("retained index entry"),
+        "pool/kept.deb"
+    );
+    let usage = reopened.usage().expect("recovered usage");
+    assert!(usage.catalog_bytes <= limits.catalog_ceiling);
+    assert!(usage.managed_bytes <= limits.spool.managed_ceiling);
+}
+
+#[test]
+fn catalog_ceiling_accepts_hard_maximum_and_keeps_default() {
+    let mut limits = DurableSpoolConfig::new("/var/lib/ferrum".into());
+    assert_eq!(limits.catalog_ceiling, 8 * 1024 * MIB);
+    assert_eq!(limits.spool.max_object_size, 8 * 1024 * MIB);
+    limits.catalog_ceiling = super::MAX_CATALOG_BYTES;
+    assert!(super::validate_durable_config(&limits).is_ok());
+    limits.catalog_ceiling = super::MAX_CATALOG_BYTES + 1;
+    assert!(super::validate_durable_config(&limits).is_err());
+    limits.catalog_ceiling = super::MAX_CATALOG_BYTES;
+    limits.spool.managed_ceiling = super::MAX_CATALOG_BYTES;
+    limits.eviction_high_watermark = super::MAX_CATALOG_BYTES;
+    limits.eviction_low_watermark = super::MAX_CATALOG_BYTES / 2;
+    assert!(super::validate_durable_config(&limits).is_ok());
+    limits.spool.managed_ceiling -= 1;
+    limits.eviction_high_watermark -= 1;
+    assert!(super::validate_durable_config(&limits).is_err());
+}
+
+#[test]
+fn retired_unreferenced_and_discarded_proof_indexes_are_reclaimed() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let spool = open(root.path());
+    let captured_digest = Sha256Digest::of(b"captured package").to_hex();
+    spool
+        .catalog_write(move |connection| {
+            connection.execute_batch(
+                "INSERT INTO capture_proofs(generation,manifest,durable,was_public) VALUES('abandoned','{}',0,0);
+                 INSERT INTO capture_indexes VALUES('idx-abandoned',1),('idx-retired-empty',1),('idx-retired-captured',1);
+                 INSERT INTO capture_proof_indexes VALUES
+                     ('abandoned','Packages','idx-abandoned'),
+                     ('retired-empty','Packages','idx-retired-empty'),
+                     ('retired-captured','Packages','idx-retired-captured');
+                 INSERT INTO capture_index_generations VALUES
+                     ('abandoned','set',1),
+                     ('retired-empty','set',1),
+                     ('retired-captured','set',1);
+                 INSERT INTO capture_index_entries VALUES
+                     ('idx-abandoned','pool/abandoned.deb','a',1),
+                     ('idx-retired-empty','pool/empty.deb','b',1),
+                     ('idx-retired-captured','pool/captured.deb','c',1);
+                 INSERT INTO capture_proofs(generation,manifest,durable,reconciled,was_public,public_retired_at,recovery_retention) VALUES
+                     ('retired-empty','{}',1,1,1,100,9223372036854775807),
+                     ('retired-captured','{}',1,1,1,100,200);",
+            )?;
+            connection.execute(
+                "INSERT INTO capture_blobs(digest,size,first_capture,retain_until,readback_verified) VALUES(?1,1,50,200,1)",
+                [&captured_digest],
+            )?;
+            connection.execute(
+                "INSERT INTO capture_paths(repository,path,path_hash,digest,generation,receipt_verified,referenced,retain_until) VALUES('debian','pool/captured.deb',?1,?2,'retired-captured',1,0,200)",
+                params![Sha256Digest::of(b"pool/captured.deb").to_hex(), captured_digest],
+            )?;
+            Ok(())
+        })
+        .expect("seed index states");
+    spool
+        .discard_unused_capture_proof("abandoned")
+        .expect("discard unused nondurable proof and its index");
+    let after_discard: Vec<String> = database(root.path())
+        .prepare("SELECT id FROM capture_indexes ORDER BY id")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(after_discard, ["idx-retired-captured", "idx-retired-empty"]);
+    drop(spool);
+
+    let reopened = open(root.path());
+    let connection = database(root.path());
+    let surviving_indexes: Vec<String> = connection
+        .prepare("SELECT id FROM capture_indexes ORDER BY id")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(surviving_indexes, ["idx-retired-captured"]);
+    let surviving_entries: Vec<String> = connection
+        .prepare("SELECT path FROM capture_index_entries ORDER BY path")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(surviving_entries, ["pool/captured.deb"]);
+    let retention: i64 = connection
+        .query_row(
+            "SELECT recovery_retention FROM capture_proofs WHERE generation='retired-empty'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("normalized retention");
+    assert_eq!(retention, 100 + crate::capture::GRACE);
+    drop(reopened);
 }

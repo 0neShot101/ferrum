@@ -447,6 +447,7 @@ fn public_retention_respects_grace_valid_until_two_distinct_predecessors_and_cap
             Ok(())
         })
         .unwrap();
+    let mut second_scope = String::new();
     for (sequence, now) in [
         (2, 1),
         (3, 2),
@@ -463,7 +464,26 @@ fn public_retention_respects_grace_valid_until_two_distinct_predecessors_and_cap
             &path,
             Sha256Digest::of(path.as_bytes()),
         );
-        install(&catalog, next);
+        if sequence == 2 {
+            second_scope = next.manifest.scope_id().to_hex();
+        }
+        if sequence == 5 {
+            let sentinel_scope = second_scope.clone();
+            catalog
+                .write(move |connection| {
+                    connection.execute(
+                        "UPDATE capture_proofs SET recovery_retention=9223372036854775807 WHERE generation=?1",
+                        [sentinel_scope],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            prepare(&catalog, &next);
+            let (_, retired_indexes) = catalog.publication_activate(next).unwrap();
+            assert_eq!(retired_indexes, vec![format!("index-{second_scope}")]);
+        } else {
+            install(&catalog, next);
+        }
     }
     assert!(
         catalog
@@ -489,7 +509,7 @@ fn public_retention_respects_grace_valid_until_two_distinct_predecessors_and_cap
             .any(|manifest| manifest.scope_id().to_hex() == scope)
     );
     assert!(manifests.len() >= 3);
-    let (referenced, retain, proof_only) = catalog
+    let (referenced, retain, proof_only, first_linked, second_linked, second_retention) = catalog
         .read(move |connection| {
             Ok((
                 connection.query_row(
@@ -499,17 +519,43 @@ fn public_retention_respects_grace_valid_until_two_distinct_predecessors_and_cap
                 )?,
                 connection.query_row(
                     "SELECT was_public=1 AND public_retired_at IS NOT NULL FROM capture_proofs WHERE generation=?1",
-                    [scope],
+                    [&scope],
                     |row| row.get::<_, bool>(0),
+                )?,
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM capture_proof_indexes WHERE generation=?1)",
+                    [&scope],
+                    |row| row.get::<_, bool>(0),
+                )?,
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM capture_proof_indexes WHERE generation=?1 OR EXISTS(SELECT 1 FROM capture_index_generations WHERE generation=?1))",
+                    [&second_scope],
+                    |row| row.get::<_, bool>(0),
+                )?,
+                connection.query_row(
+                    "SELECT recovery_retention FROM capture_proofs WHERE generation=?1",
+                    [&second_scope],
+                    |row| row.get::<_, i64>(0),
                 )?,
             ))
         })
-        .map(|((referenced, retain), proof)| (referenced, retain, proof))
+        .map(|((referenced, retain), proof, first_linked, second_linked, second_retention)| {
+            (referenced, retain, proof, first_linked, second_linked, second_retention)
+        })
         .unwrap();
     assert!(!referenced);
     assert!(retain >= initial);
     assert!(retain >= 2 * METADATA_GRACE + CAPTURE_GRACE);
     assert!(proof_only);
+    assert!(
+        first_linked,
+        "captured path retains its retired proof index link"
+    );
+    assert!(
+        !second_linked,
+        "retired generation without captures unlinks its index"
+    );
+    assert_eq!(second_retention, 2 * METADATA_GRACE - 1 + CAPTURE_GRACE);
 }
 #[test]
 fn fewer_than_two_previous_generations_never_expire_and_unconfirmed_recovery_stays_closed() {

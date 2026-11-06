@@ -126,7 +126,7 @@ impl CaptureManager {
 /// Runs after filesystem reconciliation and before the gateway accepts requests.
 pub(crate) fn reconcile_startup(spool: &Spool) -> Result<(), crate::SpoolError> {
     loop {
-        let removed = spool.catalog_write(|connection| {
+        let removed = spool.catalog_cleanup(2 * 1024 * 1024, |connection| {
             Ok(connection.execute(
                 "DELETE FROM capture_admission_owners WHERE rowid IN (SELECT rowid FROM capture_admission_owners LIMIT 128)",
                 [],
@@ -169,7 +169,7 @@ pub(crate) fn reconcile_startup(spool: &Spool) -> Result<(), crate::SpoolError> 
         if rows.is_empty() {
             break;
         }
-        spool.catalog_write(move |connection| {
+        spool.catalog_cleanup(2 * 1024 * 1024, move |connection| {
             let transaction = connection.transaction()?;
             for digest in rows {
                 abandon_transaction(&transaction, &digest)?;

@@ -123,6 +123,7 @@ pub(crate) struct Activation {
     pub confirmed_at: Option<i64>,
     pub metadata: Vec<MetadataRecord>,
 }
+pub(crate) type ActivationOutcome = (Vec<(ObjectIdentity, u64)>, Vec<String>);
 impl Catalog {
     pub(crate) fn publication_headroom(
         &self,
@@ -227,7 +228,7 @@ impl Catalog {
     pub(crate) fn publication_activate(
         &self,
         activation: Activation,
-    ) -> Result<Vec<(ObjectIdentity, u64)>, CatalogError> {
+    ) -> Result<ActivationOutcome, CatalogError> {
         self.write(move |connection| activate(connection, activation))
     }
     pub(crate) fn publication_manifests(
@@ -254,7 +255,7 @@ impl Catalog {
 fn activate(
     connection: &mut rusqlite::Connection,
     activation: Activation,
-) -> Result<Vec<(ObjectIdentity, u64)>, CatalogError> {
+) -> Result<ActivationOutcome, CatalogError> {
     let Activation {
         intent,
         manifest,
@@ -411,6 +412,7 @@ fn activate(
     let grace = now
         .checked_add(CAPTURE_GRACE)
         .ok_or(CatalogError::InvalidState)?;
+    let mut retired_indexes = std::collections::BTreeSet::new();
     for retired in expired.into_iter().skip(2) {
         let eligible: bool = transaction.query_row(
             "SELECT retired_at<=?2 AND (valid_until IS NULL OR valid_until<=?3) FROM public_generations WHERE generation=?1",
@@ -441,7 +443,7 @@ fn activate(
             params![retired, grace],
         )?;
         transaction.execute(
-            "UPDATE capture_proofs SET public_retired_at=COALESCE(public_retired_at,?2),recovery_retention=MAX(recovery_retention,?3) WHERE generation=?1",
+            "UPDATE capture_proofs SET public_retired_at=COALESCE(public_retired_at,?2),recovery_retention=CASE WHEN recovery_retention=9223372036854775807 THEN ?3 ELSE MAX(recovery_retention,?3) END WHERE generation=?1",
             params![retired, now, grace],
         )?;
         transaction.execute(
@@ -452,6 +454,28 @@ fn activate(
             "DELETE FROM public_generations WHERE generation=?1",
             [&retired],
         )?;
+        let has_paths: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_paths WHERE generation=?1)",
+            [&retired],
+            |row| row.get(0),
+        )?;
+        if !has_paths {
+            {
+                let mut statement = transaction
+                    .prepare("SELECT index_id FROM capture_proof_indexes WHERE generation=?1")?;
+                for row in statement.query_map([&retired], |row| row.get::<_, String>(0))? {
+                    retired_indexes.insert(row?);
+                }
+            }
+            transaction.execute(
+                "DELETE FROM capture_proof_indexes WHERE generation=?1",
+                [&retired],
+            )?;
+            transaction.execute(
+                "DELETE FROM capture_index_generations WHERE generation=?1",
+                [&retired],
+            )?;
+        }
     }
     transaction.execute(
         "UPDATE capture_paths SET referenced=0,retain_until=MAX(retain_until,?2) WHERE repository=?1 AND referenced=1 AND NOT EXISTS(SELECT 1 FROM capture_generation_refs r WHERE r.digest=capture_paths.digest AND r.retain_until=9223372036854775807)",
@@ -502,7 +526,7 @@ fn activate(
         )?;
     }
     transaction.commit()?;
-    Ok(counts)
+    Ok((counts, retired_indexes.into_iter().collect()))
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ pub(crate) fn unused(spool: &Spool) -> Result<(), SpoolError> {
             break;
         }
         after = keys.last().ok_or(CatalogError::InvalidState)?.clone();
-        spool.catalog_write_reserved(8 * 1024 * 1024, move |connection| {
+        spool.catalog_cleanup(8 * 1024 * 1024, move |connection| {
             let transaction = connection.transaction()?;
             for key in keys {
                 let Some((_, suffix)) = key.split_once("/v1/") else {

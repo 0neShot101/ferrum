@@ -138,7 +138,7 @@ pub(crate) const AUX_SCHEMA: &[(&str, &str)] = &[
         "CREATE INDEX capture_artifacts_digest ON capture_artifacts(digest)",
     ),
 ];
-const GRACE: i64 = 30 * 24 * 60 * 60;
+pub(crate) const GRACE: i64 = 30 * 24 * 60 * 60;
 // Two independently validated 8 KiB paths, JSON escaping, digests and scalar
 // fields fit this fixed ceiling; signature payloads remain separate bounded objects.
 pub(crate) const RECEIPT_LIMIT: u64 = 64 * 1024;
@@ -803,7 +803,7 @@ impl CaptureManager {
     }
 
     fn reset_reconciliation(&self, now: i64) -> Result<(), CaptureError> {
-        self.spool.catalog_write(move |connection| {
+        self.spool.catalog_cleanup(2 * 1024 * 1024, move |connection| {
             connection.execute(
                 "INSERT INTO capture_state(id,coverage,recovery_time) VALUES(1,0,?1) ON CONFLICT(id) DO UPDATE SET coverage=0,gc_resume=0,recovery_time=MAX(recovery_time,excluded.recovery_time)",
                 [now],
@@ -812,7 +812,7 @@ impl CaptureManager {
         })?;
         self.spool.reset_capture_verification()?;
         loop {
-            let changed = self.spool.catalog_write(|connection| {
+            let changed = self.spool.catalog_cleanup(2 * 1024 * 1024, |connection| {
                 Ok(connection.execute(
                     "UPDATE capture_index_generations SET verified=0 WHERE rowid IN (SELECT rowid FROM capture_index_generations WHERE verified=1 LIMIT 128)",
                     [],
@@ -825,7 +825,7 @@ impl CaptureManager {
         #[cfg(test)]
         index::test_support::at(&self.spool, index::test_support::Point::Reset);
         loop {
-            let changed = self.spool.catalog_write(|connection| {
+            let changed = self.spool.catalog_cleanup(2 * 1024 * 1024, |connection| {
                 Ok(connection.execute(
                     "DELETE FROM capture_proof_indexes WHERE rowid IN (SELECT rowid FROM capture_proof_indexes LIMIT 128)",
                     [],
@@ -836,7 +836,7 @@ impl CaptureManager {
             }
         }
         loop {
-            let changed = self.spool.catalog_write(|connection| {
+            let changed = self.spool.catalog_cleanup(2 * 1024 * 1024, |connection| {
                 Ok(connection.execute(
                     "UPDATE capture_indexes SET verified=0 WHERE id IN (SELECT id FROM capture_indexes WHERE verified=1 LIMIT 128)",
                     [],
@@ -847,7 +847,7 @@ impl CaptureManager {
             }
         }
         loop {
-            let changed = self.spool.catalog_write(|connection| {
+            let changed = self.spool.catalog_cleanup(2 * 1024 * 1024, |connection| {
                 Ok(connection.execute(
                     "DELETE FROM capture_index_sources WHERE rowid IN (SELECT rowid FROM capture_index_sources LIMIT 128)",
                     [],
@@ -858,7 +858,7 @@ impl CaptureManager {
             }
         }
         loop {
-            let changed = self.spool.catalog_write(|connection| {
+            let changed = self.spool.catalog_cleanup(2 * 1024 * 1024, |connection| {
                 Ok(connection.execute(
                     "UPDATE capture_proofs SET reconciled=0 WHERE generation IN (SELECT generation FROM capture_proofs WHERE reconciled=1 LIMIT 128)",
                     [],

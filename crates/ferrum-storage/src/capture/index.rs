@@ -63,6 +63,23 @@ pub(super) async fn index_owner(
     };
     Ok(Arc::new(owner))
 }
+
+pub(crate) fn try_lock_index(spool: &Spool, id: &str) -> Option<OwnedSemaphorePermit> {
+    let mut gates = INDEX_GATES.lock().ok()?;
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let key = (spool.root().to_owned(), id.to_owned());
+    let gate = if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        gate
+    } else {
+        if gates.len() >= 32 {
+            return None;
+        }
+        let gate = Arc::new(Semaphore::new(1));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    };
+    gate.try_acquire_owned().ok()
+}
 #[derive(Clone)]
 pub struct AuthenticatedPackageIndex {
     spool: Spool,

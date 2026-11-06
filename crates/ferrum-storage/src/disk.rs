@@ -31,10 +31,16 @@ use crate::eviction::Policy;
 
 pub const MAX_READ_CHUNK: usize = 262_144;
 const GIB: u64 = 1024 * 1024 * 1024;
+/// Hard ceiling for an operator-selected `DurableSpoolConfig::catalog_ceiling`.
+/// SQLite's page limit matches it; the configured ceiling is enforced by the
+/// spool owner and the default stays 8 GiB.
+pub const MAX_CATALOG_BYTES: u64 = 32 * GIB;
 // Per admitted writer, including its bind/install/release transactions. Eight
-// reference updates per transaction, 4 KiB pages and the 1 GiB catalog cap keep
+// reference updates per transaction, 4 KiB pages and the 32 GiB catalog cap keep
 // B-tree splits plus WAL/checkpoint growth inside this conservative allowance.
 const SQL_OPERATION_RESERVE: u64 = 2 * 1024 * 1024;
+// Normal growth must leave room for bounded startup cleanup transactions.
+const CATALOG_RECOVERY_RESERVE: u64 = 8 * 1024 * 1024;
 const CATALOG_FIXED_MEMORY: u64 = 16 * 1024 * 1024;
 const ENTRY_MEMORY_BOUND: u64 = 4096;
 
@@ -57,7 +63,9 @@ pub struct DurableSpoolConfig {
     /// Temporary bytes unavailable to package admissions.
     pub metadata_temporary_reserve: u64,
     pub metadata_ceiling: u64,
-    /// SQLite database, WAL and SHM combined; at most 8 GiB. Growth stops admission.
+    /// SQLite database, WAL and SHM combined; at most [`MAX_CATALOG_BYTES`].
+    /// Growth stops admission. Catalog snapshots may reach this size even when
+    /// it exceeds `spool.max_object_size`; ordinary admissions may not.
     pub catalog_ceiling: u64,
     pub catalog_memory_budget: u64,
     /// Resident entries plus concurrent reservations, including zero-byte ones.
@@ -280,6 +288,13 @@ impl SpoolInner {
         recovery::catalog_bytes(&self.root)
     }
     fn check_catalog_operation(&self, additional: u64) -> Result<(), SpoolError> {
+        self.check_catalog_cleanup(
+            additional
+                .checked_add(CATALOG_RECOVERY_RESERVE)
+                .ok_or(SpoolError::AdmissionClosed)?,
+        )
+    }
+    fn check_catalog_cleanup(&self, additional: u64) -> Result<(), SpoolError> {
         let config = self.durable.as_ref().ok_or(SpoolError::AdmissionClosed)?;
         let ledger = lock_unpoisoned(&self.lifetime.ledger);
         ledger.ensure_open()?;
@@ -459,11 +474,31 @@ impl Spool {
         size: u64,
         class: ReservationClass,
     ) -> Result<Reservation, SpoolError> {
-        if size > self.0.max_object_size {
-            return Err(SpoolError::ObjectTooLarge {
-                size,
-                max: self.0.max_object_size,
+        self.reserve_bounded(size, class, self.0.max_object_size)
+    }
+
+    /// Catalog snapshot staging and restored backup bytes. The per-object bound
+    /// is the larger of the object cap and the configured catalog ceiling; the
+    /// managed, temporary, metadata, entry and physical limits are unchanged.
+    pub(crate) fn reserve_snapshot(&self, size: u64) -> Result<Reservation, SpoolError> {
+        let maximum = self
+            .0
+            .durable
+            .as_ref()
+            .map_or(self.0.max_object_size, |config| {
+                config.catalog_ceiling.max(self.0.max_object_size)
             });
+        self.reserve_bounded(size, ReservationClass::Metadata, maximum)
+    }
+
+    fn reserve_bounded(
+        &self,
+        size: u64,
+        class: ReservationClass,
+        maximum: u64,
+    ) -> Result<Reservation, SpoolError> {
+        if size > maximum {
+            return Err(SpoolError::ObjectTooLarge { size, max: maximum });
         }
         let mut registry = lock_unpoisoned(&self.0.installed);
         self.0.ensure_admission()?;
@@ -473,7 +508,8 @@ impl Spool {
             let used = snapshot
                 .installed
                 .saturating_add(snapshot.reserved)
-                .saturating_add(metadata);
+                .saturating_add(metadata)
+                .saturating_add(CATALOG_RECOVERY_RESERVE);
             if used
                 .saturating_add(size)
                 .saturating_add(SQL_OPERATION_RESERVE)
@@ -513,6 +549,7 @@ impl Spool {
             let sql_headroom = (ledger.reservation_count() as u64)
                 .checked_add(1)
                 .and_then(|count| count.checked_mul(SQL_OPERATION_RESERVE))
+                .and_then(|bytes| bytes.checked_add(CATALOG_RECOVERY_RESERVE))
                 .ok_or(SpoolError::AdmissionClosed)?;
             let required = snapshot
                 .installed
@@ -674,6 +711,19 @@ impl Spool {
     ) -> Result<T, SpoolError> {
         let _owner = lock_unpoisoned(&self.0.installed);
         self.0.check_catalog_operation(bytes)?;
+        Ok(self.durable_catalog()?.write(operation)?)
+    }
+    /// Bounded recovery/cleanup may use the headroom withheld from new growth.
+    /// The hard catalog, managed, physical and outstanding-writer limits still apply.
+    pub(crate) fn catalog_cleanup<T: Send + 'static>(
+        &self,
+        bytes: u64,
+        operation: impl FnOnce(&mut rusqlite::Connection) -> Result<T, crate::catalog::CatalogError>
+        + Send
+        + 'static,
+    ) -> Result<T, SpoolError> {
+        let _owner = lock_unpoisoned(&self.0.installed);
+        self.0.check_catalog_cleanup(bytes)?;
         Ok(self.durable_catalog()?.write(operation)?)
     }
     pub(crate) fn catalog_admission(&self, bytes: u64) -> Result<impl Drop + '_, SpoolError> {
@@ -1026,7 +1076,7 @@ impl Spool {
     pub(crate) fn reset_capture_verification(&self) -> Result<(), SpoolError> {
         loop {
             let mut registry = lock_unpoisoned(&self.0.installed);
-            self.0.check_catalog_operation(8 * 1024 * 1024)?;
+            self.0.check_catalog_cleanup(8 * 1024 * 1024)?;
             let result = self.durable_catalog()?.write(|connection| {
                 let transaction = connection.transaction()?;
                 let identities = {
@@ -1079,7 +1129,7 @@ impl Spool {
     }
     pub(crate) fn discard_unused_capture_proof(&self, generation: &str) -> Result<(), SpoolError> {
         let mut registry = lock_unpoisoned(&self.0.installed);
-        self.0.check_catalog_operation(8 * 1024 * 1024)?;
+        self.0.check_catalog_cleanup(8 * 1024 * 1024)?;
         let bound = generation.to_owned();
         let unused = self.durable_catalog()?.read(move |connection| {
             Ok(connection.query_row(
@@ -1093,7 +1143,7 @@ impl Spool {
         }
         let pin = crate::capture::lifecycle::proof_pin(generation);
         loop {
-            self.0.check_catalog_operation(SQL_OPERATION_RESERVE)?;
+            self.0.check_catalog_cleanup(SQL_OPERATION_RESERVE)?;
             let identities = match self.durable_catalog()?.release_generation_batch(pin) {
                 Ok(values) => values,
                 Err(error) => {
@@ -1115,19 +1165,46 @@ impl Spool {
             }
         }
         let generation = generation.to_owned();
-        self.durable_catalog()?.write(move |connection| {
+        let unlinked = self.durable_catalog()?.write(move |connection| {
             let transaction = connection.transaction()?;
             transaction.execute(
                 "DELETE FROM capture_artifacts WHERE generation=?1 AND EXISTS(SELECT 1 FROM capture_proofs WHERE generation=?1 AND durable=0 AND was_public=0)",
                 [&generation],
             )?;
-            transaction.execute(
+            let deleted = transaction.execute(
                 "DELETE FROM capture_proofs WHERE generation=?1 AND durable=0 AND was_public=0",
-                [generation],
+                [&generation],
             )?;
+            let mut indexes = Vec::new();
+            if deleted > 0 {
+                {
+                    let mut statement = transaction.prepare(
+                        "SELECT index_id FROM capture_proof_indexes WHERE generation=?1",
+                    )?;
+                    for row in statement.query_map([&generation], |row| row.get::<_, String>(0))? {
+                        indexes.push(row?);
+                    }
+                }
+                transaction.execute(
+                    "DELETE FROM capture_proof_indexes WHERE generation=?1",
+                    [&generation],
+                )?;
+                transaction.execute(
+                    "DELETE FROM capture_index_generations WHERE generation=?1",
+                    [&generation],
+                )?;
+            }
             transaction.commit()?;
-            Ok(())
+            Ok(indexes)
         })?;
+        drop(registry);
+        for index_id in unlinked {
+            if let Err(error) = crate::gc::reclaim_unreferenced_index(self, &index_id)
+                && !matches!(error, SpoolError::CapacityExhausted { .. })
+            {
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -1219,10 +1296,18 @@ impl Spool {
         }
         // The writer returns absolute counts from the committed transaction, so
         // no fallible SQL/readback remains between commit and owner visibility.
-        let counts = self.durable_catalog()?.publication_activate(activation)?;
+        let (counts, retired_indexes) = self.durable_catalog()?.publication_activate(activation)?;
         for (identity, references) in counts {
             if let Some(entry) = registry.entries.get_mut(&identity) {
                 entry.generation_references = references;
+            }
+        }
+        drop(registry);
+        for index_id in retired_indexes {
+            if let Err(error) = crate::gc::reclaim_unreferenced_index(self, &index_id)
+                && !matches!(error, SpoolError::CapacityExhausted { .. })
+            {
+                return Err(error);
             }
         }
         Ok(())
@@ -1487,7 +1572,7 @@ fn evict_identity_locked(
         return Ok(false);
     }
     let catalog = spool.catalog().ok_or(SpoolError::AdmissionClosed)?;
-    spool.check_catalog_operation(256 * 1024)?;
+    spool.check_catalog_cleanup(256 * 1024)?;
     entry.evicting = true;
     #[cfg(test)]
     spool.pause("evicting");
@@ -1609,9 +1694,9 @@ fn validate_durable_config(config: &DurableSpoolConfig) -> Result<(), SpoolError
         || config.metadata_temporary_reserve > config.temporary_ceiling
         || config.temporary_ceiling > config.spool.managed_ceiling
         || config.metadata_ceiling > config.spool.managed_ceiling
-        || config.catalog_ceiling < SQL_OPERATION_RESERVE
+        || config.catalog_ceiling < SQL_OPERATION_RESERVE + CATALOG_RECOVERY_RESERVE
         || config.catalog_ceiling > config.spool.managed_ceiling
-        || config.catalog_ceiling > 8 * GIB
+        || config.catalog_ceiling > MAX_CATALOG_BYTES
         || config.eviction_low_watermark > config.eviction_high_watermark
         || config.eviction_high_watermark > config.spool.managed_ceiling
         || config.spool.max_object_size > i64::MAX as u64

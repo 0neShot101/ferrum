@@ -515,6 +515,7 @@ impl CaptureManager {
             )?;
             Ok(())
         })?;
+        crate::gc::reconcile_collected(&self.spool)?;
         Ok(())
     }
     async fn reconcile_gc_intents(
@@ -604,7 +605,7 @@ impl CaptureManager {
             .catalog_write_reserved(8 * 1024 * 1024, move |connection| {
                 let transaction = connection.transaction()?;
                 transaction.execute(
-                    "INSERT INTO capture_proofs(generation,manifest,durable,reconciled,recovery_retention) VALUES(?1,?2,1,1,?3) ON CONFLICT(generation) DO UPDATE SET manifest=excluded.manifest,durable=1,reconciled=1,recovery_retention=MAX(recovery_retention,excluded.recovery_retention)",
+                    "INSERT INTO capture_proofs(generation,manifest,durable,reconciled,recovery_retention) VALUES(?1,?2,1,1,?3) ON CONFLICT(generation) DO UPDATE SET manifest=excluded.manifest,durable=1,reconciled=1,recovery_retention=CASE WHEN capture_proofs.recovery_retention=9223372036854775807 THEN excluded.recovery_retention ELSE MAX(capture_proofs.recovery_retention,excluded.recovery_retention) END",
                     params![generation, encoded, recovery_retention],
                 )?;
                 for artifact in artifacts {

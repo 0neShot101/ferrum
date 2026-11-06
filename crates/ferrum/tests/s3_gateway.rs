@@ -398,7 +398,7 @@ async fn production_budget_refuses_get_and_head_before_provider_or_origin_contac
     disk.temporary_ceiling = 8 * MIB;
     disk.metadata_temporary_reserve = 2 * MIB;
     disk.metadata_ceiling = 8 * MIB;
-    disk.catalog_ceiling = 8 * MIB;
+    disk.catalog_ceiling = 16 * MIB;
     disk.eviction_high_watermark = 24 * MIB;
     disk.eviction_low_watermark = 16 * MIB;
     let spool = Spool::open_durable(disk).expect("durable ledger");

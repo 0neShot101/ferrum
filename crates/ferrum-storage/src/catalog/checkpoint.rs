@@ -347,18 +347,20 @@ impl Catalog {
 }
 
 impl crate::Spool {
-    /// SQLite online backup runs on one of the four bounded read workers. Each
-    /// step copies at most 64 pages; WAL readers/writer remain live.
+    /// SQLite online backup runs on the dedicated bounded work reader. One read
+    /// transaction pins a consistent WAL snapshot for every 64-page step, so live
+    /// writes cannot restart a large copy; the caller's deadline bounds the pin.
     pub(crate) async fn online_backup<G: Send + 'static>(
         &self,
         path: std::path::PathBuf,
         maximum: u64,
         deadline: std::time::Instant,
         guard: G,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<G, crate::SpoolError> {
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = cancel.child_token();
         let _cancel = cancel.clone().drop_guard();
-        self.catalog_work_async(move |source| {
+        self.catalog_work_async(move |connection| {
             let mut destination = rusqlite::Connection::open_with_flags(
                 &path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -376,7 +378,13 @@ impl crate::Spool {
                 }),
             )?;
             {
-                let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
+                // Without a held snapshot, each step opens a new read transaction
+                // and any committed write restarts the copy from page one.
+                let source = connection.transaction()?;
+                source.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
                 loop {
                     if cancel.is_cancelled() {
                         return Err(CatalogError::Closed);
@@ -400,6 +408,8 @@ impl crate::Spool {
                         _ => return Err(CatalogError::InvalidState),
                     }
                 }
+                drop(backup);
+                source.rollback()?;
             }
             destination.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
             let integrity: String =
@@ -457,9 +467,12 @@ impl Catalog {
 }
 
 impl crate::Spool {
+    /// Full restored-catalog validation, including one integrity check, bounded
+    /// by the caller's deadline rather than a fixed size-independent timeout.
     pub(crate) async fn validate_backup(
         &self,
         object: crate::VerifiedObject,
+        deadline: std::time::Instant,
     ) -> Result<(), crate::SpoolError> {
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel = cancel.clone().drop_guard();
@@ -469,17 +482,15 @@ impl crate::Spool {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
             connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA mmap_size=0;")?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             connection.progress_handler(
                 4096,
                 Some(move || cancel.is_cancelled() || std::time::Instant::now() >= deadline),
             )?;
-            let integrity: String = connection.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))?;
-            let app: u32 = connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
             let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-            if integrity != "ok" || app != super::APPLICATION_ID || !(2..=super::SCHEMA_VERSION).contains(&version) {
+            if !(2..=super::SCHEMA_VERSION).contains(&version) {
                 return Err(CatalogError::InvalidState);
             }
+            // Checks application id, schema, page size and integrity.
             super::validate_catalog(&connection, version)?;
             Ok(())
         })
@@ -769,6 +780,7 @@ mod tests {
                 16 * 1024 * 1024,
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
                 (),
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await
             .unwrap();

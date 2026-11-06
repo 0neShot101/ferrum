@@ -11,10 +11,7 @@ use bytes::Bytes;
 use ferrum_apt::digest::{ObjectIdentity, Sha256Hasher};
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 
-use super::{
-    Entry, Reservation, ReservationClass, Spool, SpoolError, SpoolInner, VerifiedObject,
-    lock_unpoisoned,
-};
+use super::{Entry, Reservation, Spool, SpoolError, SpoolInner, VerifiedObject, lock_unpoisoned};
 
 const TEMPORARY_NAME_ATTEMPTS: u32 = 16;
 
@@ -138,9 +135,10 @@ pub(crate) struct SnapshotFile {
 }
 
 impl SnapshotFile {
+    /// Raw staging is bounded by the snapshot limit, not the package/object cap.
     pub(crate) async fn create(spool: &Spool, maximum: u64) -> Result<Self, SpoolError> {
-        let reservation = spool.reserve_class(maximum, ReservationClass::Metadata)?;
-        let step_allowance = spool.reserve_class(256 * 1024, ReservationClass::Metadata)?;
+        let reservation = spool.reserve_snapshot(maximum)?;
+        let step_allowance = spool.reserve_snapshot(256 * 1024)?;
         let permit = acquire_permit(&spool.0).await?;
         let spool = spool.clone();
         let owner = spool.clone();
@@ -207,9 +205,7 @@ impl SnapshotFile {
                     sha256: hasher.finalize(),
                     size,
                 };
-                let reservation = snapshot
-                    .spool
-                    .reserve_class(size, ReservationClass::Metadata)?;
+                let reservation = snapshot.spool.reserve_snapshot(size)?;
                 if let (Some(catalog), Some(id)) = (snapshot.spool.0.catalog(), &reservation.id) {
                     let name = snapshot
                         .path()?
