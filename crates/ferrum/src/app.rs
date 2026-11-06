@@ -24,7 +24,7 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, REPOSITORY_PREFIX};
+use crate::config::{Config, Limits, REPOSITORY_PREFIX, apply_catalog_ceiling};
 use crate::fetch::{FillRegistry, UpstreamClient};
 use crate::health::{self, HealthState, Metrics};
 use crate::server::{self, AppState};
@@ -291,27 +291,11 @@ async fn start_inner(
         };
         #[cfg(not(feature = "test-harness"))]
         let injected: Option<(Spool, Arc<S3Store>)> = None;
-        let mut disk = DurableSpoolConfig::new(spool_dir.clone());
-        disk.catalog_ceiling = disk
-            .catalog_ceiling
-            .min((limits.managed_ceiling_bytes / 4).max(16 * 1024 * 1024));
-        let backup_ceiling = disk.catalog_ceiling;
+        let backup_ceiling = limits.catalog_ceiling_bytes;
         let (spool, store) = match injected {
             Some(storage) => storage,
             None => {
-                disk.spool.managed_ceiling = limits.managed_ceiling_bytes;
-                disk.spool.max_object_size = limits.max_object_bytes;
-                disk.spool.read_chunk = limits.reader_buffer_bytes;
-                // Watermarks and sub-ceilings remain proportional when the operator
-                // lowers the hard cap; open_durable also applies physical capacity.
-                disk.eviction_high_watermark = limits.managed_ceiling_bytes / 10 * 9;
-                disk.eviction_low_watermark = limits.managed_ceiling_bytes / 5 * 4;
-                disk.metadata_ceiling = disk.metadata_ceiling.min(limits.managed_ceiling_bytes / 2);
-                disk.temporary_ceiling =
-                    disk.temporary_ceiling.min(limits.managed_ceiling_bytes / 4);
-                disk.metadata_temporary_reserve = disk
-                    .metadata_temporary_reserve
-                    .min(disk.temporary_ceiling / 2);
+                let disk = durable_disk(spool_dir.clone(), &limits);
                 let spool = tokio::task::spawn_blocking(move || Spool::open_durable(disk))
                     .await
                     .context("durable spool startup task")?
@@ -1120,21 +1104,7 @@ pub async fn sync(
         spool_dir.join("state.sqlite").is_file(),
         "existing durable catalog required; run `ferrum storage init` first"
     );
-    let limits = config.limits;
-    let mut disk = DurableSpoolConfig::new(spool_dir.clone());
-    disk.catalog_ceiling = disk
-        .catalog_ceiling
-        .min((limits.managed_ceiling_bytes / 4).max(16 * 1024 * 1024));
-    disk.spool.managed_ceiling = limits.managed_ceiling_bytes;
-    disk.spool.max_object_size = limits.max_object_bytes;
-    disk.spool.read_chunk = limits.reader_buffer_bytes;
-    disk.eviction_high_watermark = limits.managed_ceiling_bytes / 10 * 9;
-    disk.eviction_low_watermark = limits.managed_ceiling_bytes / 5 * 4;
-    disk.metadata_ceiling = disk.metadata_ceiling.min(limits.managed_ceiling_bytes / 2);
-    disk.temporary_ceiling = disk.temporary_ceiling.min(limits.managed_ceiling_bytes / 4);
-    disk.metadata_temporary_reserve = disk
-        .metadata_temporary_reserve
-        .min(disk.temporary_ceiling / 2);
+    let disk = durable_disk(spool_dir.clone(), &config.limits);
     let spool = tokio::task::spawn_blocking(move || Spool::open_durable(disk))
         .await
         .context("durable spool startup task")?
@@ -1205,6 +1175,25 @@ pub async fn sync(
     }
     spool.checkpoint().context("checkpoint durable catalog")?;
     Ok(())
+}
+
+/// Durable limits shared by the gateway and offline synchronization.
+/// Watermarks and sub-ceilings remain proportional when the operator lowers
+/// the hard cap; open_durable also applies physical capacity.
+fn durable_disk(root: std::path::PathBuf, limits: &Limits) -> DurableSpoolConfig {
+    let mut disk = DurableSpoolConfig::new(root);
+    disk.spool.managed_ceiling = limits.managed_ceiling_bytes;
+    disk.spool.max_object_size = limits.max_object_bytes;
+    disk.spool.read_chunk = limits.reader_buffer_bytes;
+    disk.eviction_high_watermark = limits.managed_ceiling_bytes / 10 * 9;
+    disk.eviction_low_watermark = limits.managed_ceiling_bytes / 5 * 4;
+    disk.metadata_ceiling = disk.metadata_ceiling.min(limits.managed_ceiling_bytes / 2);
+    disk.temporary_ceiling = disk.temporary_ceiling.min(limits.managed_ceiling_bytes / 4);
+    disk.metadata_temporary_reserve = disk
+        .metadata_temporary_reserve
+        .min(disk.temporary_ceiling / 2);
+    apply_catalog_ceiling(&mut disk, limits.catalog_ceiling_bytes);
+    disk
 }
 
 #[cfg(all(test, feature = "test-harness"))]

@@ -777,6 +777,10 @@ fn field_capabilities(config: &Config) -> Vec<Value> {
             "Spool object authority bound is offline-only.",
         ),
         (
+            "limits.catalogCeilingBytes",
+            "Catalog ceiling and snapshot staging are validated offline against the managed ceiling.",
+        ),
+        (
             "limits.syncIntervalSeconds",
             "Durable observation cadence is fixed.",
         ),

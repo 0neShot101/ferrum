@@ -4,6 +4,9 @@ state_directory = '/var/lib/ferrum/state'
 # suites = ['debian/trixie', 'ubuntu/noble']
 # Move retired identities here as well as gateway durable.retired_suites.
 retired_suites = []
+# Optional SQLite catalog ceiling (default shown; up to 34359738368 = 32 GiB).
+# Must match gateway.toml limits.catalog_ceiling_bytes.
+# catalog_ceiling_bytes = 8589934592
 
 [provider]
 # Supported S3 providers:

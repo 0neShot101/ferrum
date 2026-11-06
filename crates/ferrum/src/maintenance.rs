@@ -13,7 +13,10 @@ use ferrum_storage::{DurableSpoolConfig, Spool};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ALL_DISTRIBUTION_SUITES, resolve_suite_selection};
+use crate::config::{
+    ALL_DISTRIBUTION_SUITES, DEFAULT_CATALOG_BYTES, apply_catalog_ceiling, check_catalog_ceiling,
+    resolve_suite_selection,
+};
 
 #[derive(Clone)]
 pub enum MaintenanceCommand {
@@ -52,6 +55,13 @@ struct MaintenanceConfig {
     suites: Option<Vec<String>>,
     #[serde(default)]
     retired_suites: Vec<String>,
+    /// Same meaning as the gateway's `limits.catalog_ceiling_bytes`.
+    #[serde(default = "default_catalog_ceiling")]
+    catalog_ceiling_bytes: u64,
+}
+
+fn default_catalog_ceiling() -> u64 {
+    DEFAULT_CATALOG_BYTES
 }
 
 #[derive(Deserialize)]
@@ -121,7 +131,19 @@ impl MaintenanceConfig {
         }
         resolve_suite_selection(config.suites.as_deref(), &config.retired_suites)
             .map_err(|reason| anyhow::anyhow!("invalid maintenance suites: {reason}"))?;
+        check_catalog_ceiling(
+            config.catalog_ceiling_bytes,
+            config.disk().spool.managed_ceiling,
+        )
+        .map_err(|reason| anyhow::anyhow!("invalid maintenance catalog_ceiling_bytes: {reason}"))?;
         Ok(config)
+    }
+
+    /// Default durable limits with the configured catalog ceiling.
+    fn disk(&self) -> DurableSpoolConfig {
+        let mut disk = DurableSpoolConfig::new(self.state_directory.clone());
+        apply_catalog_ceiling(&mut disk, self.catalog_ceiling_bytes);
+        disk
     }
 }
 
@@ -144,7 +166,7 @@ pub async fn run(
             .context("trusted host clock inspection failed; maintenance operation refused")?;
     }
     let limits = config.budget.limits();
-    let disk = DurableSpoolConfig::new(config.state_directory.clone());
+    let disk = config.disk();
     match command {
         MaintenanceCommand::Status => {
             // Same exclusive process lock: status cannot reconcile under a live server.
@@ -302,6 +324,55 @@ pub async fn run(
                 report.multipart_reaped
             );
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn load(root: &Path, extra: &str) -> anyhow::Result<MaintenanceConfig> {
+        let path = root.join("maintenance.toml");
+        let text = format!(
+            "state_directory = '{}'\n{extra}\n[provider]\nregion = 'us-east-1'\nbucket = 'ferrum'\ncredentials_file = '{}'\n\
+             [budget]\nstorage_bytes = 1\nstorage_control_bytes = 1\nmonthly_download_bytes = 1\ndownload_control_bytes = 1\n",
+            root.join("state").display(),
+            root.join("provider.env").display(),
+        );
+        std::fs::write(&path, text).expect("write maintenance configuration");
+        MaintenanceConfig::load(&path, false)
+    }
+
+    #[test]
+    fn catalog_ceiling_defaults_to_eight_gib_and_accepts_thirty_two() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let defaults = DurableSpoolConfig::new(root.path().join("state"));
+        let disk = load(root.path(), "").expect("default").disk();
+        assert_eq!(disk.catalog_ceiling, 8 * GIB);
+        assert_eq!(disk.temporary_ceiling, defaults.temporary_ceiling);
+        assert_eq!(disk.metadata_ceiling, defaults.metadata_ceiling);
+
+        let disk = load(
+            root.path(),
+            &format!("catalog_ceiling_bytes = {}", 32 * GIB),
+        )
+        .expect("32 GiB opt-in")
+        .disk();
+        assert_eq!(disk.catalog_ceiling, 32 * GIB);
+        assert_eq!(disk.metadata_ceiling, 96 * GIB);
+        assert!(disk.metadata_temporary_reserve >= 64 * GIB + 256 * 1024);
+        assert!(disk.temporary_ceiling <= disk.spool.managed_ceiling);
+        assert_eq!(disk.spool.max_object_size, defaults.spool.max_object_size);
+
+        for value in [0, 16 * 1024 * 1024 - 1, 32 * GIB + 1] {
+            assert!(
+                load(root.path(), &format!("catalog_ceiling_bytes = {value}")).is_err(),
+                "{value}"
+            );
         }
     }
 }

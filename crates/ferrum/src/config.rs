@@ -40,6 +40,12 @@ pub const MAX_METADATA_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_REQUEST_PATH_BYTES: usize = 8 * 1024;
 /// Byte limit for the request head (§3.1: larger heads answer 431).
 pub const MAX_REQUEST_HEAD_BYTES: usize = 16 * 1024;
+/// Catalog ceiling when `catalog_ceiling_bytes` is omitted, before downscaling.
+pub(crate) const DEFAULT_CATALOG_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Smallest catalog ceiling; omitted values never scale below it.
+const MIN_CATALOG_BYTES: u64 = 16 * 1024 * 1024;
+/// Slack ferrum-storage reserves above the ceiling for each catalog snapshot.
+const SNAPSHOT_SLACK_BYTES: u64 = 256 * 1024;
 
 mod admin;
 mod distribution;
@@ -242,6 +248,8 @@ pub struct Verifier {
 pub struct Limits {
     pub managed_ceiling_bytes: u64,
     pub max_object_bytes: u64,
+    /// Durable SQLite catalog ceiling (database, WAL and SHM combined).
+    pub catalog_ceiling_bytes: u64,
     pub waiter_timeout: Duration,
     pub producer_deadline: Duration,
     pub concurrent_fills: usize,
@@ -267,6 +275,7 @@ impl Default for Limits {
         Self {
             managed_ceiling_bytes: 268_435_456,
             max_object_bytes: 67_108_864,
+            catalog_ceiling_bytes: default_catalog_ceiling(268_435_456),
             waiter_timeout: Duration::from_secs(30),
             producer_deadline: Duration::from_secs(600),
             concurrent_fills: 8,
@@ -389,6 +398,7 @@ fn default_verifier_timeout() -> u64 {
 struct RawLimits {
     managed_ceiling_bytes: Option<u64>,
     max_object_bytes: Option<u64>,
+    catalog_ceiling_bytes: Option<u64>,
     waiter_timeout_seconds: Option<u64>,
     producer_deadline_seconds: Option<u64>,
     concurrent_fills: Option<usize>,
@@ -1141,17 +1151,27 @@ fn positive<T: Copy + PartialOrd + Default>(
 
 fn limits_from_raw(raw: RawLimits, durable: bool) -> Result<Limits, ConfigError> {
     let defaults = mode_limits(durable);
+    let managed = positive(
+        "limits.managed_ceiling_bytes",
+        raw.managed_ceiling_bytes,
+        defaults.managed_ceiling_bytes,
+    )?;
+    let catalog = match raw.catalog_ceiling_bytes {
+        None => default_catalog_ceiling(managed),
+        Some(bytes) => {
+            check_catalog_ceiling(bytes, managed)
+                .map_err(|reason| invalid("limits.catalog_ceiling_bytes", reason))?;
+            bytes
+        }
+    };
     let limits = Limits {
-        managed_ceiling_bytes: positive(
-            "limits.managed_ceiling_bytes",
-            raw.managed_ceiling_bytes,
-            defaults.managed_ceiling_bytes,
-        )?,
+        managed_ceiling_bytes: managed,
         max_object_bytes: positive(
             "limits.max_object_bytes",
             raw.max_object_bytes,
             defaults.max_object_bytes,
         )?,
+        catalog_ceiling_bytes: catalog,
         waiter_timeout: seconds(
             "limits.waiter_timeout_seconds",
             raw.waiter_timeout_seconds,
@@ -1267,8 +1287,61 @@ fn mode_limits(durable: bool) -> Limits {
     if durable {
         limits.managed_ceiling_bytes = 200 * 1024 * 1024 * 1024;
         limits.max_object_bytes = 8 * 1024 * 1024 * 1024;
+        limits.catalog_ceiling_bytes = default_catalog_ceiling(limits.managed_ceiling_bytes);
     }
     limits
+}
+
+/// Omitted catalog ceiling: 8 GiB, scaled to a quarter of smaller managed
+/// ceilings but never below 16 MiB.
+pub(crate) fn default_catalog_ceiling(managed: u64) -> u64 {
+    DEFAULT_CATALOG_BYTES.min((managed / 4).max(MIN_CATALOG_BYTES))
+}
+
+/// Checks an explicit catalog ceiling against `managed` capacity. A value above
+/// the omitted default must leave room for the snapshot staging that
+/// [`apply_catalog_ceiling`] derives from it.
+pub(crate) fn check_catalog_ceiling(catalog: u64, managed: u64) -> Result<(), String> {
+    let maximum = ferrum_storage::disk::MAX_CATALOG_BYTES;
+    if !(MIN_CATALOG_BYTES..=maximum).contains(&catalog) {
+        return Err(format!("must be in {MIN_CATALOG_BYTES}..={maximum}"));
+    }
+    if catalog > managed {
+        return Err("must not exceed the managed ceiling".into());
+    }
+    if catalog > default_catalog_ceiling(managed)
+        && catalog.checked_mul(3).is_none_or(|bytes| bytes > managed)
+    {
+        // Snapshot staging needs three catalogs of metadata space.
+        return Err("above the default, must be at most a third of the managed ceiling".into());
+    }
+    Ok(())
+}
+
+/// Sets the catalog ceiling once every other partition of `disk` is final.
+/// Above the omitted default, the metadata partition grows to three catalogs
+/// and the metadata-only temporary reserve to the snapshot peak (reserved
+/// ceiling plus slack overlapping the exact install). Package staging keeps its
+/// share of the temporary partition; everything stays within the managed ceiling.
+pub(crate) fn apply_catalog_ceiling(disk: &mut ferrum_storage::DurableSpoolConfig, catalog: u64) {
+    disk.catalog_ceiling = catalog;
+    let managed = disk.spool.managed_ceiling;
+    if catalog <= default_catalog_ceiling(managed) {
+        return;
+    }
+    let peak = catalog
+        .saturating_mul(2)
+        .saturating_add(SNAPSHOT_SLACK_BYTES);
+    let reserve = disk.metadata_temporary_reserve.max(peak);
+    let packages = disk
+        .temporary_ceiling
+        .saturating_sub(disk.metadata_temporary_reserve);
+    disk.temporary_ceiling = packages.saturating_add(reserve).min(managed);
+    disk.metadata_temporary_reserve = reserve.min(disk.temporary_ceiling);
+    disk.metadata_ceiling = disk
+        .metadata_ceiling
+        .max(catalog.saturating_mul(3))
+        .min(managed);
 }
 
 fn validate_limits(limits: &Limits, durable: bool) -> Result<(), ConfigError> {
@@ -1289,6 +1362,11 @@ fn validate_limits(limits: &Limits, durable: bool) -> Result<(), ConfigError> {
             "max_object_bytes",
             limits.max_object_bytes,
             defaults.max_object_bytes,
+        ),
+        (
+            "catalog_ceiling_bytes",
+            limits.catalog_ceiling_bytes,
+            ferrum_storage::disk::MAX_CATALOG_BYTES,
         ),
         ("concurrent_fills", limits.concurrent_fills as u64, 64),
         ("waiters_per_object", limits.waiters_per_object as u64, 64),
@@ -1576,6 +1654,87 @@ work_dir = "run"
         let config = Config::parse(&text, Path::new(".")).expect("admission limits");
         assert_eq!(config.limits.concurrent_fills, 64);
         assert_eq!(config.limits.admission_wait, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn catalog_ceiling_defaults_scale_and_explicit_bounds() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let base = std::env::temp_dir();
+        let config = Config::parse(DURABLE, &base).expect("default catalog");
+        assert_eq!(config.limits.catalog_ceiling_bytes, 8 * GIB);
+        let text = format!(
+            "{DURABLE}\n[limits]\nmanaged_ceiling_bytes = {}\nmax_object_bytes = {GIB}\n",
+            16 * GIB
+        );
+        let config = Config::parse(&text, &base).expect("scaled default");
+        assert_eq!(config.limits.catalog_ceiling_bytes, 4 * GIB);
+        let fixture = Config::parse(MINIMAL, Path::new(".")).expect("fixture default");
+        assert_eq!(fixture.limits.catalog_ceiling_bytes, 64 * 1024 * 1024);
+
+        let text = format!(
+            "{DURABLE}\n[limits]\ncatalog_ceiling_bytes = {}\n",
+            32 * GIB
+        );
+        let config = Config::parse(&text, &base).expect("32 GiB opt-in");
+        assert_eq!(config.limits.catalog_ceiling_bytes, 32 * GIB);
+        assert_eq!(config.limits.max_object_bytes, 8 * GIB);
+        let text = format!(
+            "{DURABLE}\n[limits]\nmanaged_ceiling_bytes = {}\ncatalog_ceiling_bytes = {}\n",
+            96 * GIB,
+            32 * GIB
+        );
+        Config::parse(&text, &base).expect("three catalogs fit exactly");
+
+        for limits in [
+            format!("catalog_ceiling_bytes = {}", 32 * GIB + 1),
+            "catalog_ceiling_bytes = 0".to_owned(),
+            format!("catalog_ceiling_bytes = {}", 16 * 1024 * 1024 - 1),
+            format!(
+                "managed_ceiling_bytes = {}\ncatalog_ceiling_bytes = {}",
+                96 * GIB - 1,
+                32 * GIB
+            ),
+            format!(
+                "managed_ceiling_bytes = {}\nmax_object_bytes = {GIB}\ncatalog_ceiling_bytes = {}",
+                4 * GIB,
+                8 * GIB
+            ),
+        ] {
+            match Config::parse(&format!("{DURABLE}\n[limits]\n{limits}\n"), &base) {
+                Err(ConfigError::Invalid { field, .. }) => {
+                    assert_eq!(field, "limits.catalog_ceiling_bytes", "{limits}");
+                }
+                other => panic!("expected invalid catalog ceiling for {limits}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_catalog_budgets_snapshot_partitions_without_widening_packages() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let defaults = ferrum_storage::DurableSpoolConfig::new(PathBuf::from("state"));
+        let mut disk = defaults.clone();
+        apply_catalog_ceiling(&mut disk, 8 * GIB);
+        assert_eq!(disk.catalog_ceiling, 8 * GIB);
+        assert_eq!(disk.temporary_ceiling, defaults.temporary_ceiling);
+        assert_eq!(
+            disk.metadata_temporary_reserve,
+            defaults.metadata_temporary_reserve
+        );
+        assert_eq!(disk.metadata_ceiling, defaults.metadata_ceiling);
+
+        let mut disk = defaults.clone();
+        apply_catalog_ceiling(&mut disk, 32 * GIB);
+        assert_eq!(disk.catalog_ceiling, 32 * GIB);
+        assert_eq!(disk.metadata_temporary_reserve, 64 * GIB + 256 * 1024);
+        assert_eq!(
+            disk.temporary_ceiling - disk.metadata_temporary_reserve,
+            defaults.temporary_ceiling - defaults.metadata_temporary_reserve
+        );
+        assert_eq!(disk.metadata_ceiling, 96 * GIB);
+        assert!(disk.temporary_ceiling <= disk.spool.managed_ceiling);
+        assert_eq!(disk.spool.managed_ceiling, defaults.spool.managed_ceiling);
+        assert_eq!(disk.spool.max_object_size, defaults.spool.max_object_size);
     }
     const DURABLE: &str = r#"
 mode = "private-durable"

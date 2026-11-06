@@ -82,3 +82,7 @@ download_control_bytes = 107374182400
 [limits]
 concurrent_fills = 32
 admission_wait_seconds = 2
+# Optional SQLite catalog ceiling (default 8589934592 = 8 GiB, scaled to a quarter
+# of a smaller managed_ceiling_bytes; up to 34359738368 = 32 GiB).
+# Must match deploy/maintenance.toml catalog_ceiling_bytes.
+# catalog_ceiling_bytes = 8589934592

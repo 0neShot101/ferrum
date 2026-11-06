@@ -822,6 +822,7 @@ pub(crate) fn config_projection(config: &Config) -> Value {
         "admin":{"origin":config.admin.origin,"managedConfigEnabled":config.admin.managed_config},
         "suites":suites,"retiredSuites":retired,"provider":remote,"budget":budget,"credentials":"redacted","keyrings":"paths_and_contents_redacted","statePaths":"redacted",
         "limits":{"managedCeilingBytes":limits.managed_ceiling_bytes.to_string(),"maxObjectBytes":limits.max_object_bytes.to_string(),
+            "catalogCeilingBytes":limits.catalog_ceiling_bytes.to_string(),
             "concurrentFills":limits.concurrent_fills,"waitersPerObject":limits.waiters_per_object,"activeBodies":limits.active_bodies,"requestSlots":limits.request_slots,
             "readerBufferBytes":limits.reader_buffer_bytes.to_string(),"sourceAttempts":limits.source_attempts,"failureMapEntries":limits.failure_map_entries,
             "waiterTimeoutSeconds":limits.waiter_timeout.as_secs(),"producerDeadlineSeconds":limits.producer_deadline.as_secs(),
